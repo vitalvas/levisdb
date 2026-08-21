@@ -1,0 +1,261 @@
+package levisdb
+
+import (
+	"bytes"
+	"fmt"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// TestCodecConstants pins the exported codec-name constants to their string
+// values: they are stored in the manifest/table format indirectly and are part
+// of the public API, so a rename must be deliberate, not accidental.
+func TestCodecConstants(t *testing.T) {
+	t.Parallel()
+	assert.Equal(t, "none", CodecNone)
+	assert.Equal(t, "s2", CodecS2)
+	assert.Equal(t, "zstd", CodecZstd)
+}
+
+func TestCodecFromName(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name   string
+		id     codecID
+		codecN string
+	}{
+		{CodecNone, codecNone, CodecNone},
+		{CodecS2, codecS2, CodecS2},
+		{CodecZstd, codecZstd, CodecZstd},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c, err := codecFromName(tc.name)
+			require.NoError(t, err)
+			assert.Equal(t, tc.id, c.id())
+			assert.Equal(t, tc.codecN, c.Name())
+		})
+	}
+
+	t.Run("unknown", func(t *testing.T) {
+		c, err := codecFromName("bogus")
+		require.Error(t, err)
+		assert.Nil(t, c)
+	})
+}
+
+func TestCodecFromID(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		id   codecID
+	}{
+		{"none", codecNone},
+		{"s2", codecS2},
+		{"zstd", codecZstd},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c, err := codecFromID(tc.id)
+			require.NoError(t, err)
+			assert.Equal(t, tc.id, c.id())
+		})
+	}
+
+	t.Run("unknown", func(t *testing.T) {
+		c, err := codecFromID(codecID(99))
+		require.Error(t, err)
+		assert.Nil(t, c)
+	})
+}
+
+func TestResolveLevelCodec(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name        string
+		levelCodecs []string
+		depth       int
+		bottomTier  bool
+		want        string
+	}{
+		{"nil falls back to fresh", nil, 0, false, CodecS2},
+		{"nil falls back to bottom", nil, 3, true, CodecZstd},
+		{"override wins over fresh", []string{CodecZstd}, 0, false, CodecZstd},
+		{"override wins over bottom", []string{"", "", CodecS2}, 2, true, CodecS2},
+		{"empty entry falls back to fresh", []string{""}, 0, false, CodecS2},
+		{"empty entry falls back to bottom", []string{"", ""}, 1, true, CodecZstd},
+		{"depth past slice falls back", []string{CodecNone}, 5, false, CodecS2},
+		{"none override honored", []string{CodecNone}, 0, false, CodecNone},
+		{"negative depth falls back", []string{CodecNone}, -1, true, CodecZstd},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := resolveLevelCodec(tc.levelCodecs, tc.depth, CodecS2, CodecZstd, tc.bottomTier)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}
+
+// TestLevelCodecsAppliedToFlushedTable writes a compressible workload with a
+// per-level override for depth 0 and checks the flushed L0 table's blocks were
+// encoded with that codec, proving LevelCodecs threads through the flush path.
+func TestLevelCodecsAppliedToFlushedTable(t *testing.T) {
+	t.Parallel()
+	db := openTestDB(t, func(o *Options) {
+		o.ShardCount = 1
+		// Large memtable so the workload lands in one or two L0 tables and is not
+		// immediately compacted down to a deeper (non-overridden) depth.
+		o.MemtableSize = 64 << 10
+		// Default fresh codec is none in the test helper; force depth 0 to zstd so a
+		// match proves the override took effect rather than a default.
+		o.FreshCodec = CodecNone
+		o.LevelCodecs = []string{CodecZstd}
+	})
+
+	// Highly compressible values so the entropy-skip and size-fallback in
+	// finishBlock do not downgrade the block to none.
+	val := bytes.Repeat([]byte("levisdb"), 128)
+	for i := 0; i < 200; i++ {
+		require.NoError(t, db.Put(PutOptions{Key: []byte(fmt.Sprintf("k%05d", i)), Value: val}))
+	}
+	db.sched.drain()
+
+	ids := depth0BlockCodecIDs(t, db.shards[0])
+	require.NotEmpty(t, ids, "expected at least one flushed L0 table")
+	assert.Contains(t, ids, codecZstd, "L0 blocks should use the depth-0 override (zstd)")
+	assert.NotContains(t, ids, codecS2, "no L0 block should use s2")
+}
+
+// depth0BlockCodecIDs reads the first data block of every live depth-0 table in
+// the shard raw (bypassing decodeBlock) and returns the set of codec ids from
+// their trailers. Trailer layout from finishBlock: [payload][codec id][crc32].
+func depth0BlockCodecIDs(t *testing.T, s *shardT) map[codecID]bool {
+	t.Helper()
+	s.mu.RLock()
+	var metas []*tableMeta
+	for _, tbl := range s.tables {
+		if tbl.depth == 0 {
+			metas = append(metas, tbl)
+		}
+	}
+	s.mu.RUnlock()
+
+	ids := map[codecID]bool{}
+	for _, tbl := range metas {
+		m, err := tbl.reader.ensureMeta()
+		require.NoError(t, err)
+		h := m.blockHandleAt(0)
+		buf := make([]byte, h.length)
+		_, err = tbl.reader.r.ReadAt(buf, int64(h.offset))
+		require.NoError(t, err)
+		body := buf[:len(buf)-4]
+		ids[codecID(body[len(body)-1])] = true
+	}
+	return ids
+}
+
+func TestCodecRoundTrip(t *testing.T) {
+	t.Parallel()
+	src := bytes.Repeat([]byte("levisdb block payload "), 64)
+	for _, name := range []string{"none", "s2", "zstd"} {
+		t.Run(name, func(t *testing.T) {
+			c, err := codecFromName(name)
+			require.NoError(t, err)
+
+			enc := c.compress(nil, src)
+			dec, err := c.decompress(nil, enc)
+			require.NoError(t, err)
+			assert.Equal(t, src, dec)
+		})
+	}
+}
+
+func TestCodecCompressAppendsToDst(t *testing.T) {
+	t.Parallel()
+	c, err := codecFromName("none")
+	require.NoError(t, err)
+	prefix := []byte("keep")
+	out := c.compress(prefix, []byte("more"))
+	assert.Equal(t, []byte("keepmore"), out)
+
+	dec, err := c.decompress([]byte("head"), []byte("tail"))
+	require.NoError(t, err)
+	assert.Equal(t, []byte("headtail"), dec)
+}
+
+func TestCodecDecompressError(t *testing.T) {
+	t.Parallel()
+	t.Run("s2", func(t *testing.T) {
+		c, err := codecFromName("s2")
+		require.NoError(t, err)
+		_, err = c.decompress(nil, []byte("not valid s2 stream"))
+		require.Error(t, err)
+	})
+
+	t.Run("zstd", func(t *testing.T) {
+		c, err := codecFromName("zstd")
+		require.NoError(t, err)
+		_, err = c.decompress(nil, []byte("not valid zstd stream"))
+		require.Error(t, err)
+	})
+}
+
+func FuzzCodecRoundTrip(f *testing.F) {
+	f.Add([]byte("levisdb block payload"))
+	f.Add([]byte{})
+	f.Add([]byte{0x00, 0xff, 0x00, 0xff})
+	f.Fuzz(func(t *testing.T, data []byte) {
+		for _, name := range []string{"none", "s2", "zstd"} {
+			c, err := codecFromName(name)
+			require.NoError(t, err)
+
+			comp := c.compress(nil, data)
+			dec, err := c.decompress(nil, comp)
+			require.NoError(t, err)
+			assert.True(t, bytes.Equal(data, dec), "%s round trip mismatch", name)
+
+			// Decompressing arbitrary bytes must not panic; errors are fine.
+			_, _ = c.decompress(nil, data)
+		}
+	})
+}
+
+func benchBlock() []byte {
+	// A realistic ~4 KiB block: semi-compressible key/value-ish bytes.
+	out := make([]byte, 0, 4096)
+	for len(out) < 4096 {
+		out = append(out, []byte("key000123value-some-payload-data;")...)
+	}
+	return out[:4096]
+}
+
+func BenchmarkCodecCompress(b *testing.B) {
+	src := benchBlock()
+	for _, name := range []string{"none", "s2", "zstd"} {
+		c, _ := codecFromName(name)
+		b.Run(name, func(b *testing.B) {
+			b.SetBytes(int64(len(src)))
+			var dst []byte
+			for i := 0; i < b.N; i++ {
+				dst = c.compress(dst[:0], src)
+			}
+		})
+	}
+}
+
+func BenchmarkCodecDecompress(b *testing.B) {
+	src := benchBlock()
+	for _, name := range []string{"none", "s2", "zstd"} {
+		c, _ := codecFromName(name)
+		comp := c.compress(nil, src)
+		b.Run(name, func(b *testing.B) {
+			b.SetBytes(int64(len(src)))
+			var dst []byte
+			for i := 0; i < b.N; i++ {
+				dst, _ = c.decompress(dst[:0], comp)
+			}
+		})
+	}
+}

@@ -1,0 +1,162 @@
+package levisdb
+
+import (
+	"bytes"
+	"fmt"
+	"time"
+)
+
+// ShardIterator yields the live user key/value pairs of a shard at a snapshot
+// sequence, in ascending user-key order. It merges the memtable, the flushing
+// memtable, and all tables, keeps the newest version at or below seq for each
+// user key, and skips tombstones.
+type shardIterator struct {
+	merge    *mergeIter
+	seq      uint64
+	readTime int64
+	start    []byte // inclusive lower bound, nil for unbounded
+	end      []byte // exclusive upper bound, nil for unbounded
+	key      []byte
+	value    []byte
+	lastKey  []byte
+	primed   bool
+	refs     []*tableMeta
+	err      error
+	closed   bool
+}
+
+// NewIterator returns an iterator over the shard at snapshot seq.
+func (s *shardT) NewIterator(seq uint64) *shardIterator {
+	return s.NewRangeIterator(seq, nil, nil)
+}
+
+// NewRangeIterator returns an iterator over [start, end) at snapshot seq. A nil
+// bound is unbounded on that side.
+func (s *shardT) NewRangeIterator(seq uint64, start, end []byte) *shardIterator {
+	return s.newRangeIteratorAt(seq, start, end, time.Now().UnixNano())
+}
+
+func (s *shardT) newRangeIteratorAt(seq uint64, start, end []byte, readTime int64) *shardIterator {
+	s.mu.RLock()
+	sources := make([]entrySource, 0, len(s.tables)+len(s.recoveryMems)+2)
+	refs := make([]*tableMeta, 0, len(s.tables))
+	sources = append(sources, s.mem.newSnapshotIterator())
+	if s.imm != nil {
+		sources = append(sources, s.imm.newIterator())
+	}
+	for _, recovered := range s.recoveryMems {
+		sources = append(sources, recovered.newIterator())
+	}
+	for _, t := range s.tables {
+		// Skip a table whose key range does not intersect [start, end); end is
+		// treated inclusively here, which is conservative (never wrongly skipped).
+		if !t.overlapsRange(start, end) {
+			continue
+		}
+		if t.acquire() {
+			refs = append(refs, t)
+			sources = append(sources, t.reader.newIterator())
+		}
+	}
+	s.mu.RUnlock()
+	// bytes.Clone preserves the nil/non-nil distinction: a non-nil empty end
+	// bound stays non-nil (an exclusive upper bound of "" matching nothing),
+	// whereas append([]byte(nil), end...) would collapse it to nil (unbounded).
+	return &shardIterator{
+		merge:    newMergeIter(sources...),
+		seq:      seq,
+		readTime: readTime,
+		start:    bytes.Clone(start),
+		end:      bytes.Clone(end),
+		refs:     refs,
+	}
+}
+
+// Next advances to the next live user key and reports whether one exists.
+func (it *shardIterator) Next() bool {
+	if it.closed || it.err != nil {
+		return false
+	}
+	for it.merge.Next() {
+		ik := it.merge.internalKey()
+		user := ikeyUserKey(ik)
+
+		// Range bounds on the user key.
+		if it.start != nil && bytes.Compare(user, it.start) < 0 {
+			continue
+		}
+		if it.end != nil && bytes.Compare(user, it.end) >= 0 {
+			_ = it.Close()
+			return false // past the upper bound; keys only increase from here
+		}
+
+		if it.primed && bytes.Equal(user, it.lastKey) {
+			continue // an older version of a key already decided
+		}
+
+		kseq, kind := ikeySeqKind(ik)
+		if !validIKeyKind(kind) {
+			it.err = fmt.Errorf("iterator: unknown internal-key kind %d", kind)
+			_ = it.Close()
+			return false
+		}
+		if kseq > it.seq {
+			// Version newer than the snapshot: skip without marking the key
+			// decided, so an older visible version can still surface.
+			continue
+		}
+
+		// This is the newest visible version of user; it decides the key.
+		it.primed = true
+		it.lastKey = append(it.lastKey[:0], user...)
+
+		if kind == ikeyKindDelete {
+			continue // deleted at this snapshot; move on
+		}
+		value := it.merge.Value()
+		if kind == ikeyKindSetTTL {
+			var expiresAt int64
+			var err error
+			value, expiresAt, err = decodeExpiringValue(value)
+			if err != nil {
+				it.err = fmt.Errorf("iterator: %w", err)
+				_ = it.Close()
+				return false
+			}
+			if expiresAt <= it.readTime {
+				continue
+			}
+		}
+		it.key = append(it.key[:0], user...)
+		it.value = append(it.value[:0], value...)
+		return true
+	}
+	it.err = it.merge.Error()
+	_ = it.Close()
+	return false
+}
+
+// Key returns the current user key.
+func (it *shardIterator) Key() []byte { return it.key }
+
+// Value returns the current value.
+func (it *shardIterator) Value() []byte { return it.value }
+
+func (it *shardIterator) Error() error { return it.err }
+
+func (it *shardIterator) Close() error {
+	if it.closed {
+		return it.err
+	}
+	it.closed = true
+	for _, t := range it.refs {
+		if err := t.releaseRef(); err != nil && it.err == nil {
+			it.err = err
+		}
+	}
+	it.refs = nil
+	return it.err
+}
+
+// *memtableIterator satisfies entrySource directly (Next/internalKey/Value), so
+// no adapter is needed to merge a memtable alongside table iterators.
