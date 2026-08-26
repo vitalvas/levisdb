@@ -30,19 +30,34 @@ func TestWalKindMapping(t *testing.T) {
 	assert.Equal(t, walKindDelete, walKind(EntryDelete))
 }
 
-func TestBatchOwnsInputSlices(t *testing.T) {
+func TestBatchRetainsInputSlicesByReference(t *testing.T) {
 	t.Parallel()
+	// Batch keeps the caller's slices by reference (no copy). The contract is that
+	// the caller must not mutate them until Write returns.
 	key := []byte("key")
 	value := []byte("value")
 	var b Batch
 	b.Put(PutOptions{Key: key, Value: value})
-	b.Delete(key)
-	key[0] = 'X'
-	value[0] = 'X'
+	assert.Same(t, &key[0], &b.ops[0].key[0], "key retained by reference, not copied")
+	assert.Same(t, &value[0], &b.ops[0].value[0], "value retained by reference, not copied")
+}
 
-	assert.Equal(t, []byte("key"), b.ops[0].key)
-	assert.Equal(t, []byte("value"), b.ops[0].value)
-	assert.Equal(t, []byte("key"), b.ops[1].key)
+func TestBatchWriteThenCallerMayMutate(t *testing.T) {
+	t.Parallel()
+	// The durable contract: after Write returns, the key/value have been copied
+	// into the WAL and memtable, so the caller may reuse or mutate its buffers
+	// without affecting stored data.
+	db := openTestDB(t, nil)
+	key := []byte("key")
+	value := append([]byte(nil), "value"...)
+	var b Batch
+	b.Put(PutOptions{Key: key, Value: value})
+	require.NoError(t, db.Write(&b))
+
+	value[0] = 'X' // mutate after Write; stored value must be unaffected
+	got, err := db.Get(key)
+	require.NoError(t, err)
+	assert.Equal(t, []byte("value"), got)
 }
 
 func TestBatchRetainsPutTTL(t *testing.T) {

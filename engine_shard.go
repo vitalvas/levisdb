@@ -115,6 +115,7 @@ type shardConfigT struct {
 	BlockSize      int
 	FreshCodecName string
 	LevelCodecs    []string
+	EntropySkip    bool         // enable the per-block entropy pre-check when writing tables
 	Cache          *blockCacheT // shared block cache; nil disables caching
 	FDs            *fdPool      // shared open-descriptor pool; nil keeps files open
 	// Commit durably records a table-set replacement, invokes install while the
@@ -436,7 +437,12 @@ func (s *shardT) writeTable(num uint32, depth int, path string, it *memtableIter
 	if err != nil {
 		return nil, err
 	}
-	w := newTableWriter(f, c, s.cfg.BloomBits, s.cfg.BlockSize)
+	w := newTableWriter(f, tableWriterConfig{
+		codec:       c,
+		bloomBits:   s.cfg.BloomBits,
+		blockSize:   s.cfg.BlockSize,
+		entropySkip: s.cfg.EntropySkip,
+	})
 	for it.Next() {
 		if err := w.Add(it.internalKey(), it.Value()); err != nil {
 			return nil, err

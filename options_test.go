@@ -32,6 +32,7 @@ func TestDefaultOptions(t *testing.T) {
 	assert.Equal(t, DefaultCompactionConcurrency, o.CompactionConcurrency)
 	assert.Equal(t, DefaultFreshCodec, o.FreshCodec)
 	assert.Equal(t, DefaultBottomCodec, o.BottomCodec)
+	assert.False(t, o.EntropyCompression, "entropy pre-check defaults off")
 
 	require.NoError(t, o.validate())
 }

@@ -16,7 +16,6 @@ func TestOpenStorageCreatesLayout(t *testing.T) {
 	require.NoError(t, err)
 	defer s.Close()
 
-	assert.DirExists(t, filepath.Join(dir, walDir))
 	assert.DirExists(t, filepath.Join(dir, shardsDir))
 	assert.FileExists(t, filepath.Join(dir, lockName))
 }
@@ -42,7 +41,9 @@ func TestStoragePaths(t *testing.T) {
 	})
 
 	t.Run("logPath", func(t *testing.T) {
-		assert.Equal(t, filepath.Join(dir, walDir, "00000001.log"), s.logPath(1))
+		p, err := s.logPath(0, 1)
+		require.NoError(t, err)
+		assert.Equal(t, filepath.Join(dir, shardsDir, "00", "00000001.log"), p)
 	})
 
 	t.Run("manifestPath", func(t *testing.T) {
@@ -57,21 +58,25 @@ func TestStorageListAndRemoveLogs(t *testing.T) {
 	require.NoError(t, err)
 	defer s.Close()
 
+	shardDir, err := s.shardDir(0)
+	require.NoError(t, err)
 	for _, n := range []uint32{5, 1, 3} {
-		require.NoError(t, os.WriteFile(s.logPath(n), []byte("x"), 0o644))
+		p, perr := s.logPath(0, n)
+		require.NoError(t, perr)
+		require.NoError(t, os.WriteFile(p, []byte("x"), 0o644))
 	}
 	// A non-log file and a bad name must be ignored.
-	require.NoError(t, os.WriteFile(filepath.Join(dir, walDir, "notes.txt"), []byte("x"), 0o644))
-	require.NoError(t, os.WriteFile(filepath.Join(dir, walDir, "zz.log"), []byte("x"), 0o644))
-	require.NoError(t, os.WriteFile(filepath.Join(dir, walDir, "1.log"), []byte("x"), 0o644))
-	require.NoError(t, os.WriteFile(filepath.Join(dir, walDir, "0000000A.log"), []byte("x"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(shardDir, "notes.txt"), []byte("x"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(shardDir, "zz.log"), []byte("x"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(shardDir, "1.log"), []byte("x"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(shardDir, "0000000A.log"), []byte("x"), 0o644))
 
-	logs, err := s.listLogs()
+	logs, err := s.listLogs(0)
 	require.NoError(t, err)
 	assert.Equal(t, []uint32{1, 3, 5}, logs)
 
-	require.NoError(t, s.removeLog(3))
-	logs, err = s.listLogs()
+	require.NoError(t, s.removeLog(0, 3))
+	logs, err = s.listLogs(0)
 	require.NoError(t, err)
 	assert.Equal(t, []uint32{1, 5}, logs)
 }

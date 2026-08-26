@@ -41,18 +41,20 @@ func openWALFile(t *testing.T) (*os.File, string) {
 	return f, path
 }
 
-func TestWALAppendAssignsSeqAndObserves(t *testing.T) {
+func TestWALPersistsCallerSeqAndObserves(t *testing.T) {
 	t.Parallel()
 	f, _ := openWALFile(t)
 	obs := &recordingObserver{}
-	w := newWAL(f, obs, 0, true)
+	w := newWAL(f, obs, walConfig{sync: true})
 
+	// The caller (the DB's global sequence) assigns Seq; the WAL persists and
+	// observes the entries with those sequences unchanged.
 	require.NoError(t, w.append([]walEntry{
-		{Shard: 0, Kind: walKindPut, Key: []byte("a"), Value: []byte("1")},
-		{Shard: 0, Kind: walKindPut, Key: []byte("b"), Value: []byte("2")},
+		{Shard: 0, Kind: walKindPut, Key: []byte("a"), Value: []byte("1"), Seq: 1},
+		{Shard: 0, Kind: walKindPut, Key: []byte("b"), Value: []byte("2"), Seq: 2},
 	}))
 	require.NoError(t, w.append([]walEntry{
-		{Shard: 1, Kind: walKindDelete, Key: []byte("c")},
+		{Shard: 0, Kind: walKindDelete, Key: []byte("c"), Seq: 3},
 	}))
 	require.NoError(t, w.Close())
 
@@ -63,24 +65,11 @@ func TestWALAppendAssignsSeqAndObserves(t *testing.T) {
 	assert.Equal(t, uint64(3), got[2].Seq)
 }
 
-func TestWALStartSeqSeedsCounter(t *testing.T) {
-	t.Parallel()
-	f, _ := openWALFile(t)
-	obs := &recordingObserver{}
-	w := newWAL(f, obs, 100, true)
-	require.NoError(t, w.append([]walEntry{{Kind: walKindPut, Key: []byte("k"), Value: []byte("v")}}))
-	require.NoError(t, w.Close())
-
-	got := obs.all()
-	require.Len(t, got, 1)
-	assert.Equal(t, uint64(101), got[0].Seq)
-}
-
 func TestWALConcurrentAppend(t *testing.T) {
 	t.Parallel()
 	f, _ := openWALFile(t)
 	obs := &recordingObserver{}
-	w := newWAL(f, nil, 0, true)
+	w := newWAL(f, nil, walConfig{sync: true})
 	w.obs = obs
 
 	const n = 100
@@ -89,8 +78,9 @@ func TestWALConcurrentAppend(t *testing.T) {
 	for i := 0; i < n; i++ {
 		go func(i int) {
 			defer wg.Done()
+			// Each goroutine supplies a unique caller-assigned seq (1..n).
 			assert.NoError(t, w.append([]walEntry{
-				{Shard: i, Kind: walKindPut, Key: []byte{byte(i)}, Value: []byte("v")},
+				{Shard: 0, Kind: walKindPut, Key: []byte{byte(i)}, Value: []byte("v"), Seq: uint64(i + 1)},
 			}))
 		}(i)
 	}
@@ -99,7 +89,7 @@ func TestWALConcurrentAppend(t *testing.T) {
 
 	got := obs.all()
 	require.Len(t, got, n)
-	// Every assigned sequence number is unique and within range.
+	// Every caller-assigned sequence number is preserved, unique, and in range.
 	seen := map[uint64]bool{}
 	for _, e := range got {
 		assert.False(t, seen[e.Seq], "duplicate seq %d", e.Seq)
@@ -111,7 +101,7 @@ func TestWALConcurrentAppend(t *testing.T) {
 func TestWALAppendAfterClose(t *testing.T) {
 	t.Parallel()
 	f, _ := openWALFile(t)
-	w := newWAL(f, nil, 0, true)
+	w := newWAL(f, nil, walConfig{sync: true})
 	require.NoError(t, w.Close())
 	err := w.append([]walEntry{{Kind: walKindPut, Key: []byte("k")}})
 	assert.ErrorIs(t, err, os.ErrClosed)
@@ -120,13 +110,13 @@ func TestWALAppendAfterClose(t *testing.T) {
 func TestReplayWALFile(t *testing.T) {
 	t.Parallel()
 	f, path := openWALFile(t)
-	w := newWAL(f, nil, 0, true)
+	w := newWAL(f, nil, walConfig{sync: true})
 	require.NoError(t, w.append([]walEntry{
-		{Shard: 0, Kind: walKindPut, Key: []byte("a"), Value: []byte("1")},
-		{Shard: 2, Kind: walKindDelete, Key: []byte("b")},
+		{Shard: 0, Kind: walKindPut, Key: []byte("a"), Value: []byte("1"), Seq: 1},
+		{Shard: 2, Kind: walKindDelete, Key: []byte("b"), Seq: 2},
 	}))
 	require.NoError(t, w.append([]walEntry{
-		{Shard: 1, Kind: walKindPut, Key: []byte("c"), Value: []byte("3")},
+		{Shard: 1, Kind: walKindPut, Key: []byte("c"), Value: []byte("3"), Seq: 3},
 	}))
 	require.NoError(t, w.Close())
 
@@ -146,7 +136,7 @@ func TestReplayWALFile(t *testing.T) {
 func TestReplayWALFileEmpty(t *testing.T) {
 	t.Parallel()
 	f, path := openWALFile(t)
-	require.NoError(t, newWAL(f, nil, 0, true).Close())
+	require.NoError(t, newWAL(f, nil, walConfig{sync: true}).Close())
 
 	rf, err := os.Open(path)
 	require.NoError(t, err)
@@ -162,7 +152,7 @@ func TestWALAppendEmptyBatch(t *testing.T) {
 	t.Parallel()
 	f, _ := openWALFile(t)
 	obs := &recordingObserver{}
-	w := newWAL(f, obs, 0, true)
+	w := newWAL(f, obs, walConfig{sync: true})
 
 	// An empty batch hits the len(pb.entries)==0 continue in writeGroup and
 	// commits with no error and no observed entries.
@@ -174,7 +164,7 @@ func TestWALAppendEmptyBatch(t *testing.T) {
 func TestWALCloseAfterFileClosed(t *testing.T) {
 	t.Parallel()
 	f, _ := openWALFile(t)
-	w := newWAL(f, nil, 0, true)
+	w := newWAL(f, nil, walConfig{sync: true})
 	require.NoError(t, w.append([]walEntry{{Kind: walKindPut, Key: []byte("k"), Value: []byte("v")}}))
 
 	// Close the underlying file out from under the WAL so Close's Sync fails.
@@ -196,15 +186,15 @@ func TestWALObserverPanicDoesNotStrandDurableGroup(t *testing.T) {
 	t.Parallel()
 	f, _ := openWALFile(t)
 	// Only the second batch's observer panics.
-	w := newWAL(f, keyPanicObserver{panicKey: "b"}, 0, false)
+	w := newWAL(f, keyPanicObserver{panicKey: "b"}, walConfig{sync: false})
 	var applied []uint64
 	w.apply = func(entries []walEntry) {
 		for _, entry := range entries {
 			applied = append(applied, entry.Seq)
 		}
 	}
-	first := &pendingBatch{entries: []walEntry{{Kind: walKindPut, Key: []byte("a")}}, done: make(chan error, 1)}
-	second := &pendingBatch{entries: []walEntry{{Kind: walKindPut, Key: []byte("b")}}, done: make(chan error, 1)}
+	first := &pendingBatch{entries: []walEntry{{Kind: walKindPut, Key: []byte("a"), Seq: 1}}, done: make(chan error, 1)}
+	second := &pendingBatch{entries: []walEntry{{Kind: walKindPut, Key: []byte("b"), Seq: 2}}, done: make(chan error, 1)}
 	w.mu.Lock()
 	w.pending = []*pendingBatch{first, second}
 	w.writing = true
@@ -226,7 +216,7 @@ func BenchmarkWALAppend(b *testing.B) {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
 	require.NoError(b, err)
 	// sync=false so the benchmark measures encode+write throughput, not fsync.
-	w := newWAL(f, nil, 0, false)
+	w := newWAL(f, nil, walConfig{sync: false})
 	entry := walEntry{Shard: 0, Kind: walKindPut, Key: []byte("key"), Value: []byte("value")}
 
 	b.ResetTimer()

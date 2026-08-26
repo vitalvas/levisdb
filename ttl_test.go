@@ -53,6 +53,7 @@ func TestTTLIsPersistedAcrossReopen(t *testing.T) {
 }
 
 func TestWALRecoveryDoesNotRestartTTL(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	opts := DefaultOptions(dir)
 	opts.ShardCount = 1
@@ -71,6 +72,7 @@ func TestWALRecoveryDoesNotRestartTTL(t *testing.T) {
 }
 
 func TestTTLIteratorUsesCreationTime(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t, func(o *Options) {
 		o.ShardCount = 1
 		o.MemtableSize = 1 << 30
@@ -136,6 +138,7 @@ func TestCompactionPreservesTTLForLiveIteratorTime(t *testing.T) {
 }
 
 func TestIteratorPinsTTLWhileAcquiringLaterShards(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t, func(o *Options) {
 		o.ShardCount = 2
 		o.MemtableSize = 1 << 30

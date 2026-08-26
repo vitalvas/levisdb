@@ -403,6 +403,53 @@ type tableIterator struct {
 	loaded  bool // whether inner points at a loaded block
 	err     error
 	lastKey []byte
+
+	// win is a read-ahead window over the contiguous data region. A sequential
+	// scan (compaction, range iteration) reads many blocks in offset order, so
+	// one large ReadAt per window replaces one pread per block; large values that
+	// fill a block each would otherwise cost a syscall apiece.
+	win    []byte
+	winOff uint64 // file offset of win[0]
+}
+
+// tableReadAheadSize is the read-ahead window for iterator scans. It matches the
+// table write buffer so a table written in one buffered pass is read back in a
+// comparable number of syscalls.
+const tableReadAheadSize = 256 << 10
+
+// blockRaw returns a private copy of the on-disk bytes for the data block at
+// handle h, filling a read-ahead window with one ReadAt and refilling when h
+// falls outside it. A block larger than the window is read directly. The copy is
+// required because decodeBlock returns the input subslice for uncompressed
+// blocks, and the caller (a merge scan) may retain that block's keys while a
+// later block refills and overwrites the shared window.
+func (it *tableIterator) blockRaw(h blockHandle) ([]byte, error) {
+	if h.length > tableReadAheadSize {
+		buf := make([]byte, h.length)
+		if _, err := it.tr.r.ReadAt(buf, int64(h.offset)); err != nil {
+			return nil, err
+		}
+		return buf, nil
+	}
+	if it.win == nil || h.offset < it.winOff || h.offset+h.length > it.winOff+uint64(len(it.win)) {
+		if cap(it.win) < tableReadAheadSize {
+			it.win = make([]byte, tableReadAheadSize)
+		}
+		// Fill from h.offset, clamped to the file so the final window is not padded
+		// with a short read past EOF.
+		end := h.offset + tableReadAheadSize
+		if end > uint64(it.tr.size) {
+			end = uint64(it.tr.size)
+		}
+		buf := it.win[:end-h.offset]
+		if _, err := it.tr.r.ReadAt(buf, int64(h.offset)); err != nil {
+			return nil, err
+		}
+		it.win = buf
+		it.winOff = h.offset
+	}
+	start := h.offset - it.winOff
+	return append([]byte(nil), it.win[start:start+h.length]...), nil
 }
 
 // NewIterator returns an iterator positioned before the first entry.
@@ -451,7 +498,12 @@ func (it *tableIterator) Next() bool {
 		if it.blk >= len(it.meta.indexEnt) {
 			return false
 		}
-		payload, err := it.tr.readBlock(it.meta.blockHandleAt(it.blk))
+		raw, err := it.blockRaw(it.meta.blockHandleAt(it.blk))
+		if err != nil {
+			it.err = err
+			return false
+		}
+		payload, err := decodeBlock(raw)
 		if err != nil {
 			it.err = err
 			return false

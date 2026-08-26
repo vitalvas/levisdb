@@ -10,7 +10,7 @@ import (
 
 func TestStats(t *testing.T) {
 	t.Parallel()
-	db := openTestDB(t, func(o *Options) { o.MemtableSize = 256 })
+	db := openTestDB(t, func(o *Options) { o.ShardCount = 4; o.MemtableSize = 256 })
 
 	// Fresh DB: no tables yet.
 	st, err := db.Stats()

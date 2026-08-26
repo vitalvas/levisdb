@@ -15,7 +15,7 @@ import (
 func openTestDB(t *testing.T, mutate func(*Options)) *DB {
 	t.Helper()
 	o := DefaultOptions(t.TempDir())
-	o.ShardCount = 4
+	o.ShardCount = 2      // 2 exercises multi-shard paths while keeping per-shard WAL open/flush cost low in the shared test helper
 	o.MemtableSize = 1024 // small, to exercise flush
 	o.NoSync = true       // logical tests do not need durable fsyncs; keeps them fast
 	// Skip compression by default: logic tests do not need it and zstd/s2 CPU
@@ -356,6 +356,36 @@ func BenchmarkPutSequential(b *testing.B) {
 		if err := db.Put(PutOptions{Key: seqKey(i), Value: val}); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+// BenchmarkPutBatchedShardCount isolates the per-key partitioner cost on the
+// write path across shard counts. With ShardCount==1 the partitioner is skipped
+// entirely (every key maps to shard 0), so this quantifies that fast path.
+func BenchmarkPutBatchedShardCount(b *testing.B) {
+	val := make([]byte, 100)
+	const batchSize = 100
+	for _, shards := range []int{1, 8, 32} {
+		b.Run(fmt.Sprintf("shards=%d", shards), func(b *testing.B) {
+			o := DefaultOptions(b.TempDir())
+			o.ShardCount = shards
+			o.MemtableSize = 4 << 20
+			o.NoSync = true
+			db, err := Open(o)
+			require.NoError(b, err)
+			b.Cleanup(func() { db.Close() })
+
+			b.ResetTimer()
+			for i := 0; i < b.N; i += batchSize {
+				var batch Batch
+				for j := 0; j < batchSize && i+j < b.N; j++ {
+					batch.Put(PutOptions{Key: seqKey(i + j), Value: val})
+				}
+				if err := db.Write(&batch); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
 	}
 }
 

@@ -18,7 +18,7 @@ func FuzzTableReaderOpen(f *testing.F) {
 	// A valid table so the corpus mutates from real bytes.
 	c, _ := codecFromName("none")
 	var buf bytes.Buffer
-	w := newTableWriter(&buf, c, 10, 128)
+	w := newTableWriter(&buf, tableWriterConfig{codec: c, bloomBits: 10, blockSize: 128})
 	_ = w.Add(ikeyEncode(nil, []byte("k"), 1, ikeyKindSet), []byte("v"))
 	_, _ = w.finish()
 	f.Add(buf.Bytes())
@@ -42,7 +42,7 @@ func TestTableReaderRejectsInvalidMetadataLayout(t *testing.T) {
 	c, err := codecFromName("none")
 	require.NoError(t, err)
 	var buf bytes.Buffer
-	w := newTableWriter(&buf, c, 10, 128)
+	w := newTableWriter(&buf, tableWriterConfig{codec: c, bloomBits: 10, blockSize: 128})
 	require.NoError(t, w.Add(ikeyEncode(nil, []byte("k"), 1, ikeyKindSet), []byte("v")))
 	_, err = w.finish()
 	require.NoError(t, err)
@@ -79,7 +79,7 @@ func TestTableReaderRejectsInvalidBloomEncoding(t *testing.T) {
 	c, err := codecFromName("none")
 	require.NoError(t, err)
 	var buf bytes.Buffer
-	w := newTableWriter(&buf, c, 10, 128)
+	w := newTableWriter(&buf, tableWriterConfig{codec: c, bloomBits: 10, blockSize: 128})
 	require.NoError(t, w.Add(ikeyEncode(nil, []byte("k"), 1, ikeyKindSet), []byte("v")))
 	_, err = w.finish()
 	require.NoError(t, err)
@@ -118,7 +118,7 @@ func FuzzTableRoundTrip(f *testing.F) {
 
 		c, _ := codecFromName("s2")
 		var buf bytes.Buffer
-		w := newTableWriter(&buf, c, 10, 64) // tiny blocks -> exercise multi-block
+		w := newTableWriter(&buf, tableWriterConfig{codec: c, bloomBits: 10, blockSize: 64}) // tiny blocks -> exercise multi-block
 		for _, k := range keys {
 			require.NoError(t, w.Add(ikeyEncode(nil, []byte(k), 1, ikeyKindSet), val))
 		}
@@ -160,7 +160,7 @@ func buildTable(t *testing.T, blockSize int, cache *blockCacheT, entries []table
 	require.NoError(t, err)
 
 	var buf bytes.Buffer
-	tw := newTableWriter(&buf, c, 10, blockSize)
+	tw := newTableWriter(&buf, tableWriterConfig{codec: c, bloomBits: 10, blockSize: blockSize})
 	for _, e := range entries {
 		ikey := ikeyEncode(nil, []byte(e.user), e.seq, e.kind)
 		require.NoError(t, tw.Add(ikey, []byte(e.value)))
@@ -395,7 +395,7 @@ func buildBenchTable(b *testing.B, n int) *tableReader {
 	b.Helper()
 	c, _ := codecFromName("s2")
 	var buf bytes.Buffer
-	tw := newTableWriter(&buf, c, 10, 4096)
+	tw := newTableWriter(&buf, tableWriterConfig{codec: c, bloomBits: 10, blockSize: 4096})
 	val := make([]byte, 100)
 	for i := 0; i < n; i++ {
 		var uk [8]byte

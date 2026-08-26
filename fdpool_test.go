@@ -19,6 +19,7 @@ func writeTempFile(t *testing.T, dir, name string, data []byte) string {
 }
 
 func TestFDPoolBoundsOpenDescriptors(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	const files = 50
 	const limit = 4
@@ -58,6 +59,7 @@ func TestFDPoolBoundsOpenDescriptors(t *testing.T) {
 }
 
 func TestFDPoolConcurrentReads(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	const files = 30
 	pool := newFDPool(3)
@@ -90,6 +92,7 @@ func TestFDPoolConcurrentReads(t *testing.T) {
 }
 
 func TestFDPoolUnbounded(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	pool := newFDPool(-1) // disabled bounding
 	data := []byte("hello")
@@ -108,6 +111,7 @@ func TestFDPoolUnbounded(t *testing.T) {
 }
 
 func TestFDPoolReadError(t *testing.T) {
+	t.Parallel()
 	pool := newFDPool(2)
 	h := pool.newHandle(filepath.Join(t.TempDir(), "does-not-exist"))
 	_, err := h.ReadAt(make([]byte, 4), 0)
@@ -197,6 +201,7 @@ func BenchmarkFDPoolReadParallel(b *testing.B) {
 }
 
 func TestFDPoolDoesNotEvictInflightHandle(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	const limit = 2
 	pool := newFDPool(limit)

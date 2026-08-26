@@ -57,8 +57,8 @@ func (db *DB) Stats() (Stats, error) {
 
 	hits, misses := db.cache.stats()
 	var walBytes int64
-	if db.wal != nil { // nil in read-only mode
-		walBytes = db.wal.bytesWritten()
+	for _, sw := range db.wals { // empty in read-only mode
+		walBytes += sw.wal.bytesWritten()
 	}
 	st := Stats{
 		Shards:                 db.opts.ShardCount,

@@ -11,22 +11,27 @@ import (
 
 // DB is an open levisdb database.
 type DB struct {
-	opts        Options
-	part        Partitioner
-	store       *storageT
-	alloc       *allocatorT
-	man         *manifestWriter
-	manNum      uint32 // file number of the live manifest, for rotation cleanup
-	wal         *walT
-	walFile     *os.File
-	walNum      uint32
-	retiredLogs []uint32
+	opts   Options
+	part   Partitioner
+	store  *storageT
+	alloc  *allocatorT
+	man    *manifestWriter
+	manNum uint32 // file number of the live manifest, for rotation cleanup
+	// wals holds one WAL per shard: each shard's writes go to its own log, so
+	// writes to different shards do not serialize on a single committer. Indexed
+	// by shard.
+	wals []*shardWAL
 	// startupOutputs are tables produced by WAL recovery but not yet protected
 	// by a CURRENT-selected manifest. A failed Open removes only these tables,
 	// never tables restored from the previous manifest.
 	startupOutputs []*tableMeta
 	shards         []*shardT
 
+	// walSeq is the global monotonic sequence assigned to every mutation as it is
+	// fanned out to per-shard WALs (under each shard WAL's lock). readSeq is
+	// published only after a whole batch applies, so cross-shard snapshot isolation
+	// holds even though each shard logs independently.
+	walSeq  atomic.Uint64
 	readSeq atomic.Uint64 // highest committed sequence, for snapshot reads
 	// filterSafeSeq is the highest sequence whose WAL segment has been retired
 	// after every shard was flushed. A compaction filter may physically discard
@@ -44,14 +49,48 @@ type DB struct {
 	walSyncStop chan struct{}
 	walSyncWG   sync.WaitGroup
 
+	// checkpointWG tracks the at-most-one background WAL checkpoint launched from
+	// the write path (maybeCheckpoint), so Close and crash can wait for it to
+	// finish before they touch the WAL fields it mutates. checkpointRunning is a
+	// single-flight guard: writes trigger a checkpoint often, but only one runs at
+	// a time and later triggers are dropped while it is in flight.
+	checkpointWG      sync.WaitGroup
+	checkpointRunning atomic.Bool
+
 	closeMu      sync.Mutex // serializes Close/crash teardown
 	manMu        sync.Mutex // guards manifest appends from concurrent scheduler workers
 	checkpointMu sync.Mutex
 	bgMu         sync.Mutex
 	bgErr        error
 
+	// seqMu orders sequence assignment with WAL enqueue: a batch reserves its
+	// contiguous global seq range and enqueues each shard's slice into that shard's
+	// WAL while holding it, so a shard's records are enqueued (and thus written and
+	// recovered) in ascending seq order, and no concurrent write's seq can split a
+	// multi-shard batch (which would let a snapshot see it half-applied). Only the
+	// in-memory reserve+enqueue is serialized; the WAL fsync/commit runs outside it,
+	// so different shards still persist in parallel.
+	seqMu sync.Mutex
+
+	// seqPublishMu guards readSeq's contiguous-prefix advance (publishRange).
+	// pendingRanges buffers applied seq ranges that completed out of order, keyed by
+	// their first seq, until the gap before them fills. ponytail: a single mutex +
+	// map; upgrade only if publish contention shows up in profiling.
+	seqPublishMu  sync.Mutex
+	pendingRanges map[uint64]uint64
+
 	mu     sync.RWMutex
 	closed bool
+}
+
+// shardWAL is one shard's write-ahead log and the segment bookkeeping the
+// checkpoint uses to rotate and retire it independently of other shards.
+type shardWAL struct {
+	shard   int
+	wal     *walT
+	file    *os.File
+	num     uint32   // live segment file number
+	retired []uint32 // rotated-out segments awaiting removal after their flush
 }
 
 func (db *DB) setBackgroundError(err error) {
@@ -120,12 +159,13 @@ func Open(opts Options) (*DB, error) {
 		cacheSize = 0
 	}
 	db := &DB{
-		opts:  opts,
-		part:  opts.resolvePartitioner(),
-		store: store,
-		snaps: newSnapshots(),
-		cache: newBlockCache(cacheSize),
-		fds:   newFDPool(opts.MaxOpenFiles),
+		opts:          opts,
+		part:          opts.resolvePartitioner(),
+		store:         store,
+		snaps:         newSnapshots(),
+		cache:         newBlockCache(cacheSize),
+		fds:           newFDPool(opts.MaxOpenFiles),
+		pendingRanges: map[uint64]uint64{},
 	}
 
 	if err := db.load(); err != nil {
@@ -141,7 +181,7 @@ func Open(opts Options) (*DB, error) {
 // crash-loss window. It is a no-op for read-only, durable (sync), or disabled
 // (negative interval) configurations.
 func (db *DB) startWALSyncLoop() {
-	if db.opts.ReadOnly || !db.opts.NoSync || db.opts.WALSyncInterval <= 0 || db.wal == nil {
+	if db.opts.ReadOnly || !db.opts.NoSync || db.opts.WALSyncInterval <= 0 || len(db.wals) == 0 {
 		return
 	}
 	stop := make(chan struct{})
@@ -159,9 +199,14 @@ func (db *DB) startWALSyncLoop() {
 			case <-stop:
 				return
 			case <-t.C:
-				if _, err := db.wal.syncNow(); err != nil && err != os.ErrClosed {
-					db.setBackgroundError(err)
-					return
+				// Fsync every shard WAL to bound the NoSync loss window. One shard's
+				// error must not stop syncing the others: record it and keep going, so
+				// a transient failure on one segment does not silently widen the
+				// crash-loss window for every shard.
+				for _, sw := range db.wals {
+					if _, err := sw.wal.syncNow(); err != nil && err != os.ErrClosed {
+						db.setBackgroundError(err)
+					}
 				}
 			}
 		}
@@ -184,10 +229,13 @@ func (db *DB) closeAfterOpenError() {
 	if db.sched != nil {
 		db.sched.Close()
 	}
-	if db.walFile != nil {
-		_ = db.walFile.Close()
-		if db.walNum != 0 {
-			_ = db.store.removeLog(db.walNum)
+	for _, sw := range db.wals {
+		if sw == nil {
+			continue
+		}
+		_ = sw.file.Close()
+		if sw.num != 0 {
+			_ = db.store.removeLog(sw.shard, sw.num)
 		}
 	}
 	if db.man != nil {
@@ -246,17 +294,22 @@ func (db *DB) load() error {
 		startSeq = state.LastSeq
 	}
 
-	// Existing WAL segments (from a crash) and the current manifest number also
-	// come from the shared counter; start the allocator above all of them so no
-	// file number is reused.
-	logs, err := db.store.listLogs()
-	if err != nil {
-		return err
-	}
+	// Existing WAL segments (from a crash, now one set per shard) and the current
+	// manifest number also come from the shared counter; start the allocator above
+	// all of them so no file number is reused. shardLogs[i] holds shard i's leftover
+	// segment numbers, ascending.
+	shardLogs := make([][]uint32, db.opts.ShardCount)
 	start := db.highestFileNum(state)
-	for _, n := range logs {
-		if n > start {
-			start = n
+	for i := 0; i < db.opts.ShardCount; i++ {
+		logs, lerr := db.store.listLogs(i)
+		if lerr != nil {
+			return lerr
+		}
+		shardLogs[i] = logs
+		for _, n := range logs {
+			if n > start {
+				start = n
+			}
 		}
 	}
 	if ok && manNum > start {
@@ -275,9 +328,9 @@ func (db *DB) load() error {
 	}
 	originalTables := db.liveTableSet()
 
-	// Replay any leftover WAL segments into the shard memtables. This recovers
+	// Replay each shard's leftover WAL segments into its memtable. This recovers
 	// writes committed since the last flush that a crash left only in the WAL.
-	recoveredSeq, err := db.recoverWALMode(logs, startSeq, !db.opts.ReadOnly)
+	recoveredSeq, err := db.recoverWALMode(shardLogs, startSeq, !db.opts.ReadOnly)
 	if !db.opts.ReadOnly {
 		db.startupOutputs = db.tablesAddedSince(originalTables)
 	}
@@ -301,10 +354,13 @@ func (db *DB) load() error {
 	}
 	db.startupOutputs = nil // CURRENT now protects every recovery output
 	// CURRENT now durably names a baseline containing every table produced by
-	// recovery. Only at this point is it safe to retire the old WAL segments.
-	for _, num := range logs {
-		if err := db.store.removeLog(num); err != nil {
-			return err
+	// recovery. Only at this point is it safe to retire the old per-shard WAL
+	// segments.
+	for shard, nums := range shardLogs {
+		for _, num := range nums {
+			if err := db.store.removeLog(shard, num); err != nil {
+				return err
+			}
 		}
 	}
 	db.filterSafeSeq.Store(startSeq)
@@ -398,6 +454,7 @@ func (db *DB) shardConfig(i int) shardConfigT {
 		BlockSize:      db.opts.BlockSize,
 		FreshCodecName: db.opts.FreshCodec,
 		LevelCodecs:    db.opts.LevelCodecs,
+		EntropySkip:    db.opts.EntropyCompression,
 		Cache:          db.cache,
 		FDs:            db.fds,
 		Commit: func(inputs, outputs []*tableMeta, install func()) error {
@@ -429,6 +486,7 @@ func (db *DB) compactionConfig() compactionConfigT {
 		FreshCodecName:     db.opts.FreshCodec,
 		BottomCodecName:    db.opts.BottomCodec,
 		LevelCodecs:        db.opts.LevelCodecs,
+		EntropySkip:        db.opts.EntropyCompression,
 		FileSizeBase:       db.opts.FileSizeBase,
 		FileSizeMultiplier: db.opts.FileSizeMultiplier,
 		FileSizeMax:        db.opts.FileSizeMax,
@@ -461,27 +519,45 @@ func (db *DB) compactionRunConfig(forceCheckpoint bool) (retain uint64, cc compa
 	return db.snaps.oldest(db.readSeq.Load()), cc, func() {}, nil
 }
 
-// openWAL creates a fresh WAL segment for this session.
+// openWAL creates a fresh WAL segment per shard for this session. The global
+// sequence and readSeq are seeded from startSeq (the highest recovered seq);
+// per-shard WALs assign no sequences of their own (see writeBatch).
 func (db *DB) openWAL(startSeq uint64) error {
+	db.walSeq.Store(startSeq)
+	db.readSeq.Store(startSeq)
+	db.wals = make([]*shardWAL, len(db.shards))
+	for i := range db.shards {
+		sw, err := db.openShardWAL(i)
+		if err != nil {
+			return err
+		}
+		db.wals[i] = sw
+	}
+	return nil
+}
+
+// openShardWAL creates a fresh WAL segment for one shard.
+func (db *DB) openShardWAL(shard int) (*shardWAL, error) {
 	num := db.alloc.Next()
 	if num == 0 {
-		return ErrFileNumberExhausted
+		return nil, ErrFileNumberExhausted
 	}
-	f, err := os.OpenFile(db.store.logPath(num), os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o644)
+	path, err := db.store.logPath(shard, num)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if err := syncDir(filepath.Dir(db.store.logPath(num))); err != nil {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	if err := syncDir(filepath.Dir(path)); err != nil {
 		_ = f.Close()
-		_ = db.store.removeLog(num)
-		return err
+		_ = db.store.removeLog(shard, num)
+		return nil, err
 	}
-	db.walFile = f
-	db.walNum = num
-	db.wal = newWAL(f, db.walBridge(), startSeq, !db.opts.NoSync)
-	db.wal.apply = db.applyCommitted
-	db.readSeq.Store(startSeq)
-	return nil
+	w := newWAL(f, db.walBridge(), walConfig{sync: !db.opts.NoSync})
+	w.apply = db.applyCommitted
+	return &shardWAL{shard: shard, wal: w, file: f, num: num}, nil
 }
 
 // openManifest creates a fresh manifest for this session and records the
@@ -588,8 +664,20 @@ func (db *DB) maybeRotateManifest() {
 var manifestRotateEdits = 4096
 
 // walSegmentBytes bounds a live WAL segment. Rotation checkpoints every shard
-// before retiring old segments; it is a var so tests can exercise rotation.
-var walSegmentBytes int64 = 64 << 20
+// before retiring old segments; it is a var so tests can exercise rotation. At
+// 256 MiB the barrier checkpoint (which flushes every shard) fires rarely enough
+// that a bulk writer is not stalled by it; the WAL-size cap still bounds the live
+// WAL at walCheckpointStallMultiple x this.
+var walSegmentBytes int64 = 256 << 20
+
+// walCheckpointStallMultiple caps how far the live WAL may outgrow
+// walSegmentBytes before a writer stops firing checkpoints asynchronously and
+// instead blocks until the in-flight checkpoint drains. Checkpointing is normally
+// async so writes do not stall on the flush barrier, but a sustained writer can
+// outrun a single background checkpoint and grow the WAL without bound (and with
+// it, crash-recovery cost). Once the segment reaches this multiple of
+// walSegmentBytes, the writer waits, bounding the live WAL at roughly this size.
+var walCheckpointStallMultiple int64 = 2
 
 // Close flushes and releases the database. It is safe to call more than once.
 func (db *DB) Close() error {
@@ -611,6 +699,10 @@ func (db *DB) Close() error {
 	db.mu.Unlock()
 	db.checkpointMu.Unlock()
 	deregisterMetrics(db)
+	// Wait for any background WAL checkpoint to finish before touching the WAL
+	// fields it mutates. closed is now set, so no new checkpoint will start (it
+	// returns ErrClosed), and this drains the at-most-one already in flight.
+	db.checkpointWG.Wait()
 	// Stop the background WAL syncer before closing the WAL so it cannot fsync a
 	// closed file. It holds no db locks, so this is safe here.
 	db.stopWALSyncLoop()
@@ -665,12 +757,15 @@ func (db *DB) Close() error {
 	if db.man != nil {
 		setErr(db.man.Close())
 	}
-	if db.wal != nil {
-		setErr(db.wal.Close())
-		if firstErr == nil {
-			for _, num := range append(db.retiredLogs, db.walNum) {
+	for _, sw := range db.wals {
+		setErr(sw.wal.Close())
+	}
+	if firstErr == nil {
+		// Every shard flushed above; retire each shard's live + retired segments.
+		for _, sw := range db.wals {
+			for _, num := range append(sw.retired, sw.num) {
 				if num != 0 {
-					setErr(db.store.removeLog(num))
+					setErr(db.store.removeLog(sw.shard, num))
 				}
 			}
 		}
@@ -700,6 +795,10 @@ func (db *DB) crash() {
 	db.mu.Unlock()
 	db.checkpointMu.Unlock()
 	deregisterMetrics(db)
+	// Drain any in-flight background checkpoint before touching WAL fields, as in
+	// Close: a real crash cannot corrupt these, but the test harness must not race
+	// the checkpoint goroutine against walFile.Close.
+	db.checkpointWG.Wait()
 	db.stopWALSyncLoop()
 	if db.sched != nil {
 		db.sched.Close()
@@ -709,9 +808,13 @@ func (db *DB) crash() {
 	defer db.checkpointMu.Unlock()
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	if db.walFile != nil {
-		db.walFile.Sync()
-		db.walFile.Close()
+	// Close every shard WAL WITHOUT fsync: a real crash never fsyncs, and the
+	// records already reached the OS page cache in writeGroup, which survives
+	// process exit. No segment is removed, so recovery replays them.
+	for _, sw := range db.wals {
+		if sw.file != nil {
+			sw.file.Close()
+		}
 	}
 	if db.man != nil {
 		db.man.Close()
@@ -824,6 +927,12 @@ func (db *DB) hasAt(seq uint64, key []byte) (bool, error) {
 // always return an in-range index, but a broken custom implementation should
 // produce an ordinary error rather than an index-out-of-range panic on reads.
 func (db *DB) shardForKey(key []byte) (int, error) {
+	// With one shard and a built-in partitioner every key maps to shard 0; skip
+	// the partitioner entirely. A custom partitioner is still always consulted:
+	// callers may rely on Shard being invoked, and it must be validated.
+	if db.opts.ShardCount == 1 && db.opts.CustomPartitioner == nil {
+		return 0, nil
+	}
 	shard := db.part.Shard(key, db.opts.ShardCount)
 	if shard < 0 || shard >= db.opts.ShardCount {
 		return 0, fmt.Errorf("levisdb: partitioner returned shard %d outside [0,%d)", shard, db.opts.ShardCount)
@@ -865,6 +974,17 @@ func (db *DB) resolveBatchShards(b *Batch) ([]int, error) {
 		return nil, nil
 	}
 	shards := make([]int, len(b.ops))
+	// With one shard and a built-in partitioner every op maps to shard 0 (the zero
+	// value make already gave), so skip the partitioner and only validate keys. A
+	// custom partitioner is still consulted per op below.
+	if db.opts.ShardCount == 1 && db.opts.CustomPartitioner == nil {
+		for _, op := range b.ops {
+			if len(op.key) == 0 {
+				return nil, ErrEmptyKey
+			}
+		}
+		return shards, nil
+	}
 	for i, op := range b.ops {
 		if len(op.key) == 0 {
 			return nil, ErrEmptyKey
@@ -996,36 +1116,219 @@ func (db *DB) writeBatch(b *Batch, shards []int) error {
 		}
 	}
 
-	if err := db.wal.append(entries); err != nil {
+	// Fan out to per-shard WALs. appendToShardWALs assigns the contiguous global
+	// seq range and enqueues every shard under db.seqMu, so a shard's records are
+	// ordered by seq (crash recovery depends on this) and no concurrent write's seq
+	// can split this batch (which would let a snapshot see it half-applied). The
+	// per-shard fsync/commit runs outside seqMu, so shards persist in parallel.
+	if err := db.appendToShardWALs(entries); err != nil {
 		db.setBackgroundError(err)
 		return err
 	}
 	return nil
 }
 
+// maxWALSegmentSize returns the largest current-segment byte count across all
+// shard WALs, the checkpoint trigger.
+func (db *DB) maxWALSegmentSize() int64 {
+	var m int64
+	for _, sw := range db.wals {
+		if s := sw.wal.currentSize(); s > m {
+			m = s
+		}
+	}
+	return m
+}
+
+// reserveSeq atomically reserves n consecutive global sequence numbers and
+// returns the first. It fails rather than wrap the 56-bit ikey sequence space.
+func (db *DB) reserveSeq(n uint64) (uint64, error) {
+	for {
+		cur := db.walSeq.Load()
+		if cur > maxIKeySeq || n > maxIKeySeq-cur {
+			return 0, fmt.Errorf("levisdb: sequence number exhausted")
+		}
+		if db.walSeq.CompareAndSwap(cur, cur+n) {
+			return cur + 1, nil
+		}
+	}
+}
+
+// appendToShardWALs groups entries by shard and appends each group to its shard
+// WAL. It assigns the batch one contiguous global seq range and enqueues every
+// shard's slice under db.seqMu, so (a) a shard's records are enqueued - and thus
+// written and recovered - in ascending seq order, and (b) no concurrent write's
+// seq lands between this batch's shards, so a snapshot never sees it half-applied.
+// The per-shard fsync/commit and the readSeq publish happen after seqMu is
+// released, so shards persist in parallel and readSeq advances only once the whole
+// batch is applied.
+func (db *DB) appendToShardWALs(entries []walEntry) error {
+	// Fast path: all entries in one shard. Still ordered under seqMu so this shard's
+	// records stay seq-ordered against any other batch that also touches it.
+	oneShard := true
+	for i := 1; i < len(entries); i++ {
+		if entries[i].Shard != entries[0].Shard {
+			oneShard = false
+			break
+		}
+	}
+	if oneShard {
+		shard := entries[0].Shard
+		db.seqMu.Lock()
+		if err := db.assignSeq(entries); err != nil {
+			db.seqMu.Unlock()
+			return err // no seqs reserved: nothing to publish
+		}
+		pb, mustCommit, err := db.wals[shard].wal.enqueue(entries)
+		db.seqMu.Unlock()
+		lo, hi := entries[0].Seq, entries[len(entries)-1].Seq
+		if err == nil {
+			err = db.wals[shard].wal.runCommit(pb, mustCommit)
+		}
+		// The reserved range has exactly one publisher; publish it even on error so a
+		// concurrent writer's higher range is not blocked forever in the watermark.
+		// On error the DB is poisoned by the caller, so exposing this batch's data is
+		// moot; the point is that readSeq must not stall for other writers.
+		db.publishRange(lo, hi)
+		return err
+	}
+	// Multi-shard: assign the contiguous seq range, split preserving per-shard order,
+	// then enqueue every shard - all under seqMu, before committing any - so the whole
+	// batch occupies a contiguous seq range no concurrent write can split. Seqs are
+	// stamped BEFORE grouping so each per-shard copy carries its assigned seq.
+	type shardCommit struct {
+		wal        *walT
+		pb         *pendingBatch
+		mustCommit bool
+	}
+	var commits []shardCommit
+
+	db.seqMu.Lock()
+	err := db.assignSeq(entries)
+	if err != nil {
+		db.seqMu.Unlock()
+		return err // no seqs reserved: nothing to publish
+	}
+	byShard := make(map[int][]walEntry, len(db.shards))
+	for _, e := range entries {
+		byShard[e.Shard] = append(byShard[e.Shard], e)
+	}
+	commits = make([]shardCommit, 0, len(byShard))
+	for shard, es := range byShard {
+		w := db.wals[shard].wal
+		pb, mustCommit, eerr := w.enqueue(es)
+		if eerr != nil {
+			err = eerr
+			break
+		}
+		commits = append(commits, shardCommit{wal: w, pb: pb, mustCommit: mustCommit})
+	}
+	db.seqMu.Unlock()
+
+	// Drive each shard's commit (outside seqMu, so shards fsync in parallel with
+	// other writers) and wait. A mid-fan-out error leaves already-committed shards
+	// durable but the whole batch un-atomic across shards; the caller latches a
+	// background error that fails the DB, matching the "atomic within a shard, not
+	// across" durability contract.
+	firstErr := err
+	for _, c := range commits {
+		if cerr := c.wal.runCommit(c.pb, c.mustCommit); cerr != nil && firstErr == nil {
+			firstErr = cerr
+		}
+	}
+	// Publish the whole reserved range once every shard is applied - and also on
+	// error, so a stranded range never blocks the readSeq watermark for concurrent
+	// writers (assignSeq succeeded here, so the range [entries[0], entries[last]] is
+	// reserved and has this call as its sole publisher).
+	db.publishRange(entries[0].Seq, entries[len(entries)-1].Seq)
+	return firstErr
+}
+
+// assignSeq reserves one contiguous global sequence range for the whole batch and
+// stamps each entry in order, so the batch's seqs are contiguous and ascending. It
+// is called under db.seqMu together with the WAL enqueue, so reservation order
+// equals enqueue order per shard.
+func (db *DB) assignSeq(entries []walEntry) error {
+	base, err := db.reserveSeq(uint64(len(entries)))
+	if err != nil {
+		return err
+	}
+	for i := range entries {
+		entries[i].Seq = base + uint64(i)
+	}
+	return nil
+}
+
+// maybeCheckpoint rotates and retires the shared WAL once it grows past
+// walSegmentBytes. It runs the checkpoint on a background goroutine so a writer
+// never blocks on the flush-all-shards barrier; write backpressure
+// (throttleWrite) already bounds how far ahead writes can get. Only one
+// checkpoint runs at a time (checkpointRunning), and Close/crash wait for an
+// in-flight one via checkpointWG. The synchronous force path
+// (prepareCompactionFilter) still calls checkpointWALMode directly.
 func (db *DB) maybeCheckpoint() {
 	if walSegmentBytes <= 0 || db.opts.ReadOnly {
 		return
 	}
-	db.mu.RLock()
-	closed := db.closed
-	db.mu.RUnlock()
-	if closed {
-		return
-	}
-	size, err := db.wal.size()
-	if err != nil {
-		db.setBackgroundError(err)
-		return
+	// Poll every shard's current-segment byte counter (atomic, no Stat syscall)
+	// after a write; checkpoint once any shard crosses the threshold. size is the
+	// largest shard segment, used for the hard-cap stall decision below.
+	var size int64
+	for _, sw := range db.wals {
+		if s := sw.wal.currentSize(); s > size {
+			size = s
+		}
 	}
 	if size < walSegmentBytes {
 		return
 	}
-	if err := db.checkpointWAL(); err != nil {
-		if err != ErrClosed {
+	// Single-flight: at most one checkpoint runs at a time. If one is already
+	// running, the write normally proceeds without blocking (async) - but if the
+	// live WAL has grown past the hard cap, the writer has outrun the background
+	// checkpoint, so stall here until it drains rather than let the WAL grow
+	// without bound. This bounds the live WAL (and crash-recovery cost) at roughly
+	// walCheckpointStallMultiple * walSegmentBytes.
+	if !db.checkpointRunning.CompareAndSwap(false, true) {
+		// The write outran the background checkpoint past the hard cap: stall until it
+		// drains. Poll checkpointRunning rather than checkpointWG.Wait(): that WaitGroup
+		// is reused per checkpoint, and a Wait here (holding no lock) can run concurrently
+		// with another writer's Add(1) below when a checkpoint finishes between the two,
+		// which panics. Polling also lets the stall bail on close/failure, like the L0
+		// hard-stop loop above.
+		for size >= walSegmentBytes*walCheckpointStallMultiple {
+			db.mu.RLock()
+			closed := db.closed
+			db.mu.RUnlock()
+			if closed || db.backgroundError() != nil {
+				return
+			}
+			if !db.checkpointRunning.Load() {
+				return
+			}
+			time.Sleep(writeStopPoll)
+			size = db.maxWALSegmentSize()
+		}
+		return
+	}
+	// Register the checkpoint under db.mu with the closed check, so Close/crash
+	// (which set closed under db.mu.Lock before calling checkpointWG.Wait) never
+	// race a WaitGroup.Add against their Wait: either we add before closed is set,
+	// or we observe closed and do not add.
+	db.mu.RLock()
+	if db.closed {
+		db.mu.RUnlock()
+		db.checkpointRunning.Store(false)
+		return
+	}
+	db.checkpointWG.Add(1)
+	db.mu.RUnlock()
+	go func() {
+		defer db.checkpointWG.Done()
+		defer db.checkpointRunning.Store(false)
+		if err := db.checkpointWAL(); err != nil && err != ErrClosed {
 			db.setBackgroundError(err)
 		}
-	}
+	}()
 }
 
 func (db *DB) checkpointWAL() error {
@@ -1055,42 +1358,64 @@ func (db *DB) checkpointWALMode(force bool) (uint64, error) {
 	if db.opts.ReadOnly {
 		return db.filterSafeSeq.Load(), ErrReadOnly
 	}
-	size, err := db.wal.size()
-	if err != nil {
-		return db.filterSafeSeq.Load(), err
-	}
-	if !force && size < walSegmentBytes {
+	if !force && db.maxWALSegmentSize() < walSegmentBytes {
 		return db.filterSafeSeq.Load(), nil
 	}
 	if force && db.readSeq.Load() <= db.filterSafeSeq.Load() {
 		return db.filterSafeSeq.Load(), nil
 	}
-	num := db.alloc.Next()
-	if num == 0 {
-		return db.filterSafeSeq.Load(), ErrFileNumberExhausted
+	// Rotate every shard's WAL to a fresh segment, recording each shard's retired
+	// segment. A per-shard WAL means writes to other shards continue during this.
+	for _, sw := range db.wals {
+		num := db.alloc.Next()
+		if num == 0 {
+			return db.filterSafeSeq.Load(), ErrFileNumberExhausted
+		}
+		path, err := db.store.logPath(sw.shard, num)
+		if err != nil {
+			return db.filterSafeSeq.Load(), err
+		}
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o644)
+		if err != nil {
+			return db.filterSafeSeq.Load(), err
+		}
+		if err := syncDir(filepath.Dir(path)); err != nil {
+			_ = f.Close()
+			_ = db.store.removeLog(sw.shard, num)
+			return db.filterSafeSeq.Load(), err
+		}
+		oldNum := sw.num
+		oldFile, err := sw.wal.rotate(f)
+		if err != nil {
+			_ = f.Close()
+			_ = removeFileDurable(path)
+			return db.filterSafeSeq.Load(), err
+		}
+		sw.file = f
+		sw.num = num
+		sw.retired = append(sw.retired, oldNum)
+		if err := oldFile.Close(); err != nil {
+			return db.filterSafeSeq.Load(), err
+		}
 	}
-	f, err := os.OpenFile(db.store.logPath(num), os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o644)
-	if err != nil {
-		return db.filterSafeSeq.Load(), err
-	}
-	if err := syncDir(filepath.Dir(db.store.logPath(num))); err != nil {
-		_ = f.Close()
-		_ = db.store.removeLog(num)
-		return db.filterSafeSeq.Load(), err
-	}
-	oldNum := db.walNum
-	oldFile, cutoff, err := db.wal.rotate(f)
-	if err != nil {
-		_ = f.Close()
-		_ = removeFileDurable(db.store.logPath(num))
-		return db.filterSafeSeq.Load(), err
-	}
-	db.walFile = f
-	db.walNum = num
-	db.retiredLogs = append(db.retiredLogs, oldNum)
-	if err := oldFile.Close(); err != nil {
-		return db.filterSafeSeq.Load(), err
-	}
+
+	// Capture the cutoff so every seq <= cutoff is provably applied to a memtable.
+	// readSeq is published (CAS-max) only after a batch applies, but a lower-seq
+	// batch can still be mid-apply (un-published) while a higher-seq batch has
+	// already published - so readSeq alone can exceed an un-applied lower seq. A
+	// writer holds db.mu.RLock across its whole batch (apply then publish), so take
+	// db.mu exclusively for the instant of the read: it drains every in-flight writer
+	// past apply, making readSeq a true contiguous watermark. Without this barrier a
+	// crash could replay a value a compaction filter dropped from a table
+	// (resurrection). Holding it only for the Load keeps writers unblocked during the
+	// slow double-Flush below.
+	//
+	// A failed multi-shard append can leave some shards applied but unpublished; that
+	// path sets a background error, which the check after the flushes below returns on
+	// before filterSafeSeq advances, so the gap never reaches the cutoff.
+	db.mu.Lock()
+	cutoff := db.readSeq.Load()
+	db.mu.Unlock()
 
 	// Two passes cover a shard that already had an immutable memtable when the
 	// checkpoint began: the first drains it, the second captures the active table
@@ -1106,23 +1431,39 @@ func (db *DB) checkpointWALMode(force bool) (uint64, error) {
 	if err := db.backgroundError(); err != nil {
 		return db.filterSafeSeq.Load(), err
 	}
-	for len(db.retiredLogs) > 0 {
-		if err := db.store.removeLog(db.retiredLogs[0]); err != nil {
-			return db.filterSafeSeq.Load(), err
+	// Every shard is flushed through cutoff; retire each shard's old segments.
+	for _, sw := range db.wals {
+		for len(sw.retired) > 0 {
+			if err := db.store.removeLog(sw.shard, sw.retired[0]); err != nil {
+				return db.filterSafeSeq.Load(), err
+			}
+			sw.retired = sw.retired[1:]
 		}
-		db.retiredLogs = db.retiredLogs[1:]
 	}
-	db.filterSafeSeq.Store(cutoff)
-	return cutoff, nil
+	// Advance filterSafeSeq only forward: a concurrent force checkpoint may already
+	// have stored a higher cutoff, so never move it backward.
+	safe := db.filterSafeSeq.Load()
+	if cutoff > safe {
+		db.filterSafeSeq.Store(cutoff)
+		safe = cutoff
+	}
+	return safe, nil
 }
 
-// applyCommitted installs one durable WAL batch and publishes its sequence only
-// after every mutation is present. walT invokes it serially in commit order.
+// applyCommitted installs one durable WAL batch into its shard's memtable. It
+// does NOT advance readSeq: the writer publishes the sequence via publishSeq once
+// every shard of its (possibly multi-shard) batch is applied, so a snapshot never
+// observes a batch half-applied across shards. Each shard WAL's committer invokes
+// this in that shard's commit order; with per-shard WALs several run concurrently,
+// and a batch carries entries for a single shard (writeBatch fans out per shard).
 func (db *DB) applyCommitted(entries []walEntry) {
-	var maxSeq uint64
+	if len(entries) == 0 {
+		return
+	}
+	shard := entries[0].Shard
+	s := db.shards[shard]
 	for i := range entries {
 		e := &entries[i]
-		s := db.shards[e.Shard]
 		switch e.Kind {
 		case walKindDelete:
 			s.del(e.Seq, e.Key)
@@ -1131,21 +1472,45 @@ func (db *DB) applyCommitted(entries []walEntry) {
 		default:
 			s.Put(e.Seq, e.Key, e.Value)
 		}
-		if e.Seq > maxSeq {
-			maxSeq = e.Seq
-		}
 	}
-	if maxSeq > 0 {
-		db.readSeq.Store(maxSeq)
+	// Signal this shard if it reached the flush threshold; the scheduler drains it
+	// off this goroutine so writes are not blocked by flush or compaction.
+	if s.needFlush() {
+		db.sched.Signal(shard)
 	}
+}
 
-	// Signal any shard that reached its flush threshold; the scheduler drains
-	// it off this goroutine so writes are not blocked by flush or compaction.
-	for i, s := range db.shards {
-		if s.needFlush() {
-			db.sched.Signal(i)
+// publishRange marks the batch's contiguous seq range [lo, hi] applied and
+// advances readSeq over the fully-applied contiguous prefix. A plain CAS-max on hi
+// would expose seqs that a still-in-flight lower-seq batch has not applied: a
+// concurrent writer that reserved a higher range and finished first would publish
+// its hi, making a snapshot see a lower batch half-applied. Because every batch
+// now owns a contiguous range (assigned under seqMu) and every reserved seq is
+// eventually applied, advancing only the contiguous prefix keeps readSeq a true
+// "all seqs <= readSeq are applied" watermark, so no batch is ever seen partially.
+//
+// Out-of-order completions are buffered in pendingRanges and merged when the gap
+// before them fills. The common case (the next expected range completes) merges
+// nothing and just advances readSeq.
+func (db *DB) publishRange(lo, hi uint64) {
+	db.seqPublishMu.Lock()
+	if lo == db.readSeq.Load()+1 {
+		next := hi
+		// Drain any buffered ranges now contiguous with the advanced watermark.
+		for {
+			r, ok := db.pendingRanges[next+1]
+			if !ok {
+				break
+			}
+			delete(db.pendingRanges, next+1)
+			next = r
 		}
+		db.readSeq.Store(next)
+	} else {
+		// A lower range is still outstanding; buffer this one until the gap fills.
+		db.pendingRanges[lo] = hi
 	}
+	db.seqPublishMu.Unlock()
 }
 
 // flushShard flushes one shard and runs any ready compaction, recording each

@@ -185,8 +185,8 @@ func TestRecoverWALSkipsOutOfRangeShard(t *testing.T) {
 	db := openTestDB(t, nil)
 	// Shard index out of range and negative are guarded and skipped; in-range
 	// entries still apply.
-	logs := []uint32{}
-	seq, err := db.recoverWAL(logs, 0)
+	shardLogs := [][]uint32{}
+	seq, err := db.recoverWAL(shardLogs, 0)
 	require.NoError(t, err)
 	assert.Equal(t, uint64(0), seq)
 }
@@ -249,6 +249,35 @@ func mustCreate(t *testing.T, path string) *os.File {
 	return f
 }
 
+// firstShardLog scans shards [0,count) for exactly one leftover WAL segment and
+// returns its shard index and segment number. Recovery tests write a single key
+// then need to locate the WAL segment it landed in, wherever the key hashed.
+func firstShardLog(t *testing.T, s *storageT, count int) (int, uint32) {
+	t.Helper()
+	for shard := 0; shard < count; shard++ {
+		logs, err := s.listLogs(shard)
+		require.NoError(t, err)
+		if len(logs) > 0 {
+			return shard, logs[0]
+		}
+	}
+	t.Fatal("no leftover WAL segment found")
+	return 0, 0
+}
+
+// allShardLogs collects every shard's leftover WAL segment numbers. WAL
+// retirement is now per shard, so retention tests assert against the union.
+func allShardLogs(t *testing.T, s *storageT, count int) []uint32 {
+	t.Helper()
+	var all []uint32
+	for shard := 0; shard < count; shard++ {
+		logs, err := s.listLogs(shard)
+		require.NoError(t, err)
+		all = append(all, logs...)
+	}
+	return all
+}
+
 func TestRecoverWALDecodeErrorPropagates(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
@@ -261,10 +290,9 @@ func TestRecoverWALDecodeErrorPropagates(t *testing.T) {
 	// (too short) to the leftover WAL, so recoverWAL's decode fails on reopen.
 	s, err := openStorage(dir)
 	require.NoError(t, err)
-	logs, err := s.listLogs()
+	shard, num := firstShardLog(t, s, 4)
+	logPath, err := s.logPath(shard, num)
 	require.NoError(t, err)
-	require.NotEmpty(t, logs)
-	logPath := s.logPath(logs[0])
 	require.NoError(t, s.Close())
 
 	f, err := os.OpenFile(logPath, os.O_RDWR|os.O_APPEND, 0o644)
@@ -294,10 +322,9 @@ func TestLenientRecoveryKeepsPrefixBeforeCorruption(t *testing.T) {
 	// Append an undecodable (well-framed, bad payload) record after the good one.
 	s, err := openStorage(dir)
 	require.NoError(t, err)
-	logs, err := s.listLogs()
+	shard, num := firstShardLog(t, s, 4)
+	logPath, err := s.logPath(shard, num)
 	require.NoError(t, err)
-	require.NotEmpty(t, logs)
-	logPath := s.logPath(logs[0])
 	require.NoError(t, s.Close())
 	f, err := os.OpenFile(logPath, os.O_RDWR|os.O_APPEND, 0o644)
 	require.NoError(t, err)
@@ -328,7 +355,7 @@ func TestRecoverWALRejectsSequenceRegressionAcrossSegments(t *testing.T) {
 
 	s, err := openStorage(dir)
 	require.NoError(t, err)
-	logs, err := s.listLogs()
+	logs, err := s.listLogs(0)
 	require.NoError(t, err)
 	require.Len(t, logs, 1)
 	writeSegment := func(path string, seq uint64) {
@@ -345,8 +372,12 @@ func TestRecoverWALRejectsSequenceRegressionAcrossSegments(t *testing.T) {
 		require.NoError(t, f.Sync())
 		require.NoError(t, f.Close())
 	}
-	writeSegment(s.logPath(logs[0]), 2)
-	writeSegment(s.logPath(logs[0]+1), 1)
+	seg0, err := s.logPath(0, logs[0])
+	require.NoError(t, err)
+	seg1, err := s.logPath(0, logs[0]+1)
+	require.NoError(t, err)
+	writeSegment(seg0, 2)
+	writeSegment(seg1, 1)
 	require.NoError(t, s.Close())
 
 	_, err = Open(opts)
@@ -371,9 +402,12 @@ func TestRecoverWALRejectsImpossibleKeyMetadata(t *testing.T) {
 			want:  "key belongs to shard",
 		},
 		{
+			// A record naming a shard other than the one that owns the segment is
+			// rejected by the per-shard ownership check (shard 99 does not match the
+			// shard-0 segment it was written into).
 			name:  "out-of-range shard",
 			entry: walEntry{Shard: 99, Kind: walKindPut, Key: []byte("a"), Value: []byte("v")},
-			want:  "outside",
+			want:  "segment holds record for shard",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -386,10 +420,13 @@ func TestRecoverWALRejectsImpossibleKeyMetadata(t *testing.T) {
 
 			s, err := openStorage(dir)
 			require.NoError(t, err)
-			logs, err := s.listLogs()
+			// The crafted batch names shard 0, so overwrite shard 0's segment.
+			logs, err := s.listLogs(0)
 			require.NoError(t, err)
 			require.Len(t, logs, 1)
-			f, err := os.OpenFile(s.logPath(logs[0]), os.O_RDWR|os.O_TRUNC, 0o644)
+			logPath, err := s.logPath(0, logs[0])
+			require.NoError(t, err)
+			f, err := os.OpenFile(logPath, os.O_RDWR|os.O_TRUNC, 0o644)
 			require.NoError(t, err)
 			jw := newJournalWriter(f)
 			require.NoError(t, jw.Write(encodeBatch(nil, 1, []walEntry{tc.entry})))
@@ -475,6 +512,7 @@ func countManifests(t *testing.T, dir string) int {
 }
 
 func TestManifestNoAccumulationAcrossRestarts(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	o := DefaultOptions(dir)
 	o.ShardCount = 2
@@ -537,6 +575,7 @@ func TestManifestRotationBoundsGrowth(t *testing.T) {
 }
 
 func TestOpenManifestKeepsPostRenameStateOnSyncFailure(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	store, err := openStorage(dir)
 	require.NoError(t, err)
@@ -617,12 +656,12 @@ func TestCloseRetainsWALWhenManifestRotationSyncFails(t *testing.T) {
 	db.store.currentSyncDir = func(string) error { return sentinel }
 	err = db.Close()
 	assert.ErrorIs(t, err, sentinel)
-	logs, listErr := db.store.listLogs()
-	require.NoError(t, listErr)
+	logs := allShardLogs(t, db.store, opts.ShardCount)
 	assert.NotEmpty(t, logs, "a late manifest durability failure must prevent WAL retirement")
 }
 
 func TestManifestSyncFailurePreservesReferencedFlushOutput(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	opts := DefaultOptions(dir)
 	opts.ShardCount = 1
@@ -649,6 +688,7 @@ func TestManifestSyncFailurePreservesReferencedFlushOutput(t *testing.T) {
 }
 
 func TestCloseRetainsWALWhenManifestCloseFails(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	opts := DefaultOptions(dir)
 	opts.ShardCount = 1
@@ -664,12 +704,12 @@ func TestCloseRetainsWALWhenManifestCloseFails(t *testing.T) {
 	}
 	err = db.Close()
 	assert.ErrorIs(t, err, sentinel)
-	logs, listErr := db.store.listLogs()
-	require.NoError(t, listErr)
+	logs := allShardLogs(t, db.store, opts.ShardCount)
 	assert.NotEmpty(t, logs, "manifest close failure must be known before WAL retirement")
 }
 
 func TestNoSyncBackgroundWALSyncPersistsBeforeCrash(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	o := DefaultOptions(dir)
 	o.ShardCount = 2
@@ -700,7 +740,7 @@ func TestWALSyncSkipsWhileCommitterActive(t *testing.T) {
 	t.Parallel()
 	f, err := os.CreateTemp(t.TempDir(), "wal")
 	require.NoError(t, err)
-	w := newWAL(f, nil, 0, false)
+	w := newWAL(f, nil, walConfig{sync: false})
 	defer w.Close()
 
 	// No committer running: Sync performs the fsync.
@@ -737,12 +777,13 @@ func TestLenientRecoveryStopsAtCorruptionAcrossSegments(t *testing.T) {
 
 	s, err := openStorage(dir)
 	require.NoError(t, err)
-	logs, err := s.listLogs()
+	logs, err := s.listLogs(0)
 	require.NoError(t, err)
 	require.Len(t, logs, 1)
 
 	// Segment 1: one valid record (seq 1, key "a") then a corrupt tail record.
-	seg1 := s.logPath(logs[0])
+	seg1, err := s.logPath(0, logs[0])
+	require.NoError(t, err)
 	f, err := os.OpenFile(seg1, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o644)
 	require.NoError(t, err)
 	jw := newJournalWriter(f)
@@ -758,7 +799,8 @@ func TestLenientRecoveryStopsAtCorruptionAcrossSegments(t *testing.T) {
 	require.NoError(t, f.Close())
 
 	// Segment 2: a valid record (seq 5, key "b") that lives PAST the corruption.
-	seg2 := s.logPath(logs[0] + 1)
+	seg2, err := s.logPath(0, logs[0]+1)
+	require.NoError(t, err)
 	f2, err := os.OpenFile(seg2, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o644)
 	require.NoError(t, err)
 	jw2 := newJournalWriter(f2)
@@ -802,7 +844,8 @@ func TestRecoveryFlushesMidReplay(t *testing.T) {
 	o.BottomCodec = CodecNone
 	db, err := Open(o)
 	require.NoError(t, err)
-	for i := 0; i < 200; i++ {
+	const n = 60 // enough for several 512-byte-memtable flushes on replay
+	for i := 0; i < n; i++ {
 		require.NoError(t, db.Put(PutOptions{Key: []byte(fmt.Sprintf("key%04d", i)), Value: []byte("value-payload")}))
 	}
 	db.crash() // leave the WAL for replay; nothing flushed on crash
@@ -812,7 +855,7 @@ func TestRecoveryFlushesMidReplay(t *testing.T) {
 	defer db2.Close()
 
 	// All data recovered.
-	for i := 0; i < 200; i++ {
+	for i := 0; i < n; i++ {
 		v, err := db2.Get([]byte(fmt.Sprintf("key%04d", i)))
 		require.NoError(t, err, i)
 		assert.Equal(t, []byte("value-payload"), v)

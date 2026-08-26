@@ -24,7 +24,6 @@ import (
 const (
 	lockName     = "LOCK"
 	currentName  = "CURRENT"
-	walDir       = "wal"
 	shardsDir    = "shards"
 	manifestName = "MANIFEST"
 	// tableSuffix is the on-disk extension for sorted-string tables. Its 4-byte
@@ -74,9 +73,6 @@ func openStorageMode(dir string, readOnly bool) (*storageT, error) {
 			return nil, err
 		}
 		return &storageT{dir: dir, lock: lock, readOnly: true}, nil
-	}
-	if err := os.MkdirAll(filepath.Join(dir, walDir), 0o755); err != nil {
-		return nil, err
 	}
 	if err := os.MkdirAll(filepath.Join(dir, shardsDir), 0o755); err != nil {
 		return nil, err
@@ -163,15 +159,28 @@ func (s *storageT) listTables(shard int) ([]uint32, error) {
 	return nums, nil
 }
 
-// LogPath returns the path to a WAL segment.
-func (s *storageT) logPath(num uint32) string {
-	return filepath.Join(s.dir, walDir, fmt.Sprintf("%08x.log", num))
+// logPath returns the path to a WAL segment for a shard. Each shard owns its own
+// WAL, colocated with the shard's tables (the LevelDB model of one log per
+// memtable, applied per shard), so writes to different shards hit different files
+// and do not serialize on one log. The file number comes from the global
+// allocator, so segment numbers are unique across all shards.
+func (s *storageT) logPath(shard int, num uint32) (string, error) {
+	dir, err := s.shardDir(shard)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, fmt.Sprintf("%08x.log", num)), nil
 }
 
-// ListLogs returns the file numbers of existing WAL segments, ascending. On a
-// clean shutdown none remain; after a crash the leftover segments are replayed.
-func (s *storageT) listLogs() ([]uint32, error) {
-	entries, err := os.ReadDir(filepath.Join(s.dir, walDir))
+// listLogs returns the WAL segment numbers present in shard, ascending. On a
+// clean shutdown none remain; after a crash the leftover segments are replayed
+// into that shard's memtable.
+func (s *storageT) listLogs(shard int) ([]uint32, error) {
+	dir := filepath.Join(s.dir, shardsDir, fmt.Sprintf("%02x", shard))
+	entries, err := os.ReadDir(dir)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -191,9 +200,13 @@ func (s *storageT) listLogs() ([]uint32, error) {
 	return nums, nil
 }
 
-// RemoveLog deletes a WAL segment after its entries have been recovered.
-func (s *storageT) removeLog(num uint32) error {
-	return removeFileDurable(s.logPath(num))
+// removeLog deletes a shard's WAL segment after its entries have been recovered.
+func (s *storageT) removeLog(shard int, num uint32) error {
+	path, err := s.logPath(shard, num)
+	if err != nil {
+		return err
+	}
+	return removeFileDurable(path)
 }
 
 // ManifestPath returns the path to a manifest file.

@@ -26,7 +26,6 @@ type walT struct {
 
 	mu      sync.Mutex
 	cond    *sync.Cond
-	seq     uint64          // last assigned sequence number
 	pending []*pendingBatch // batches awaiting commit
 	writing bool            // a committer is currently draining
 	recbuf  []byte          // reusable record buffer
@@ -36,6 +35,10 @@ type walT struct {
 	// written is the cumulative count of record bytes appended, a WAL-volume
 	// health signal. It survives rotation because rotate keeps the same walT.
 	written atomic.Int64
+	// segBytes is the record bytes appended to the CURRENT segment; it resets on
+	// rotate. maybeCheckpoint polls it after every write to decide rotation, so it
+	// is an atomic read rather than a per-write file Stat syscall.
+	segBytes atomic.Int64
 }
 
 type pendingBatch struct {
@@ -43,57 +46,91 @@ type pendingBatch struct {
 	done    chan error
 }
 
-// New opens a WAL appending to file. When sync is true group commit fsyncs once
-// per drained group (durable); when false the data is left to the OS page cache
-// (faster, larger crash window). obs may be nil. startSeq seeds the sequence
-// counter (from replay).
-func newWAL(file *os.File, obs walObserver, startSeq uint64, syncEach bool) *walT {
+// walConfig carries the tunables for a new WAL.
+type walConfig struct {
+	// sync fsyncs each committed group when true; false relies on the OS page
+	// cache.
+	sync bool
+}
+
+// newWAL opens a WAL appending to file. When cfg.sync is true group commit
+// fsyncs once per drained group (durable); when false the data is left to the OS
+// page cache (faster, larger crash window). obs may be nil. Sequence numbers are
+// assigned by the caller before append.
+func newWAL(file *os.File, obs walObserver, cfg walConfig) *walT {
 	w := &walT{
 		file: file,
 		jw:   newJournalWriter(file),
 		obs:  obs,
-		sync: syncEach,
-		seq:  startSeq,
+		sync: cfg.sync,
 	}
 	w.cond = sync.NewCond(&w.mu)
 	return w
 }
 
-// Append durably logs a batch of entries and returns once they are fsync'd and
-// the observer (if any) has been notified. Entry Seq and the batch order are
-// assigned here. It is safe for concurrent use.
+// append durably logs a batch of entries and returns once they are fsync'd and
+// the observer (if any) has been notified. Entries must already carry ascending
+// Seqs. It is safe for concurrent use. Used by recovery replay and tests; the
+// live write path uses enqueue + runCommit so it can order enqueue across shards
+// under the DB's seqMu (see appendToShardWALs).
 func (w *walT) append(entries []walEntry) error {
-	if len(entries) == 0 {
-		return nil
+	pb, mustCommit, err := w.enqueue(entries)
+	if err != nil {
+		return err
 	}
-	pb := &pendingBatch{entries: entries, done: make(chan error, 1)}
+	return w.runCommit(pb, mustCommit)
+}
+
+// enqueue adds a pre-sequenced batch to this WAL's pending queue and reports
+// whether the caller must drive the commit (it is the first writer in) or another
+// in-flight committer will drain it. Entries must already carry their Seq. The
+// caller enqueues under the DB's seqMu so a shard's records are queued in
+// ascending seq order (recovery treats a regressing seq within a shard as
+// corruption). commit/fsync happens after enqueue returns and outside seqMu, so
+// shards persist in parallel. w.apply installs the batch into the memtable but
+// does NOT advance readSeq; the caller publishes readSeq once the whole batch is
+// applied, keeping a multi-shard batch atomic to concurrent snapshots.
+func (w *walT) enqueue(entries []walEntry) (pb *pendingBatch, mustCommit bool, err error) {
+	if len(entries) == 0 {
+		return nil, false, nil
+	}
+	pb = &pendingBatch{entries: entries, done: make(chan error, 1)}
 
 	w.mu.Lock()
+	defer w.mu.Unlock()
 	if w.closed {
-		w.mu.Unlock()
-		return os.ErrClosed
+		return nil, false, os.ErrClosed
 	}
 	if w.err != nil {
-		err := w.err
-		w.mu.Unlock()
-		return err
+		return nil, false, w.err
 	}
 	w.pending = append(w.pending, pb)
 	if w.writing {
 		// Another goroutine is committing; it will drain our batch too.
-		w.mu.Unlock()
-		return <-pb.done
+		return pb, false, nil
 	}
 	w.writing = true
-	w.mu.Unlock()
+	return pb, true, nil
+}
 
-	w.commit()
+// runCommit drives the group commit for a batch this WAL made the caller
+// responsible for (enqueue returned mustCommit), then waits for it to be durable
+// and applied.
+func (w *walT) runCommit(pb *pendingBatch, mustCommit bool) error {
+	if pb == nil {
+		return nil
+	}
+	if mustCommit {
+		w.commit()
+	}
 	return <-pb.done
 }
 
-// commit drains all pending batches: assigns sequence numbers, writes them to
-// the journal as one group, fsyncs once, then fires the observer and wakes
-// waiters. It loops until no batches remain so late arrivals are not stranded.
+// commit drains all pending batches, writes them to the journal as one group,
+// fsyncs once, then fires the observer and wakes waiters. It loops until no
+// batches remain so late arrivals are not stranded. Entry sequence numbers are
+// assigned by the caller (the DB's global sequence) before append, so a per-shard
+// WAL preserves cross-shard ordering; the WAL only persists them.
 func (w *walT) commit() {
 	for {
 		w.mu.Lock()
@@ -112,27 +149,6 @@ func (w *walT) commit() {
 				pending.done <- err
 			}
 			continue
-		}
-		// Assign sequence numbers under the lock so order is stable.
-		var total uint64
-		for _, pb := range batch {
-			total += uint64(len(pb.entries))
-		}
-		if w.seq > maxIKeySeq || total > maxIKeySeq-w.seq {
-			err := fmt.Errorf("wal: sequence number exhausted")
-			w.err = err
-			w.mu.Unlock()
-			for _, pending := range batch {
-				pending.done <- err
-			}
-			continue
-		}
-		for _, pb := range batch {
-			base := w.seq + 1
-			for i := range pb.entries {
-				pb.entries[i].Seq = base + uint64(i)
-			}
-			w.seq = base + uint64(len(pb.entries)) - 1
 		}
 		w.mu.Unlock()
 
@@ -198,6 +214,7 @@ func (w *walT) writeGroup(batch []*pendingBatch) error {
 			return err
 		}
 		w.written.Add(int64(len(w.recbuf)))
+		w.segBytes.Add(int64(len(w.recbuf)))
 	}
 	if err := w.jw.Flush(); err != nil {
 		return err
@@ -205,8 +222,7 @@ func (w *walT) writeGroup(batch []*pendingBatch) error {
 	if !w.sync {
 		// NoSync: skip the per-group fsync and leave durability to the OS page
 		// cache. The crash-loss window is every write since the last fsync, which
-		// the database bounds with a periodic background Sync (WALSyncInterval),
-		// not just the in-flight group.
+		// the database bounds with the background WALSyncInterval sync.
 		return nil
 	}
 	// Group commit fsyncs once per drained group: durable by default with a
@@ -232,41 +248,54 @@ func (w *walT) Close() error {
 		w.file.Close()
 		return err
 	}
-	if err := w.file.Sync(); err != nil {
-		w.file.Close()
-		return err
+	// Under NoSync the WAL never promised an fsync; a clean Close leaves the
+	// buffered bytes in the OS page cache (which survives process exit) instead of
+	// forcing a per-segment fsync. Durable mode still fsyncs on Close.
+	if w.sync {
+		if err := w.file.Sync(); err != nil {
+			w.file.Close()
+			return err
+		}
 	}
 	return w.file.Close()
 }
 
 // rotate atomically switches future appends to file after making the old
-// segment durable. It waits for the active group committer so no record is split
-// across segments.
-func (w *walT) rotate(file *os.File) (*os.File, uint64, error) {
+// segment durable, returning the old file for the caller to close. It waits for
+// the active group committer so no record is split across segments. It settles
+// this shard's in-flight commits, but the checkpoint's cutoff still needs a
+// db.mu barrier: a writer can hold a reserved seq below readSeq without having
+// appended to any shard yet, which rotate cannot see.
+func (w *walT) rotate(file *os.File) (*os.File, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	for w.writing {
 		w.cond.Wait()
 	}
 	if w.closed {
-		return nil, 0, os.ErrClosed
+		return nil, os.ErrClosed
 	}
 	if w.err != nil {
-		return nil, 0, w.err
+		return nil, w.err
 	}
 	if err := w.jw.Flush(); err != nil {
 		w.err = err
-		return nil, 0, err
+		return nil, err
 	}
 	if err := w.file.Sync(); err != nil {
 		w.err = err
-		return nil, 0, err
+		return nil, err
 	}
 	old := w.file
 	w.file = file
 	w.jw = newJournalWriter(file)
-	return old, w.seq, nil
+	w.segBytes.Store(0) // new segment starts empty
+	return old, nil
 }
+
+// currentSize returns the record bytes appended to the current segment, without
+// a file Stat syscall, so the write path can poll it after every batch.
+func (w *walT) currentSize() int64 { return w.segBytes.Load() }
 
 // bytesWritten returns the cumulative record bytes appended since the WAL opened.
 func (w *walT) bytesWritten() int64 { return w.written.Load() }
@@ -291,16 +320,6 @@ func (w *walT) syncNow() (skipped bool, err error) {
 		return false, err
 	}
 	return false, w.file.Sync()
-}
-
-func (w *walT) size() (int64, error) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	info, err := w.file.Stat()
-	if err != nil {
-		return 0, err
-	}
-	return info.Size(), nil
 }
 
 // Replay reads all committed entries from a WAL segment file and returns them

@@ -1,10 +1,18 @@
 package levisdb
 
 import (
+	"bufio"
 	"encoding/binary"
 	"fmt"
 	"io"
 )
+
+// tableWriteBufferSize batches SSTable block writes into one syscall each. The
+// writer emits one block per data/index/filter block; without buffering, a value
+// at or above BlockSize becomes its own os.File.Write syscall, so a large-value
+// table degrades to one write() per entry. 256 KiB collapses that to a few
+// syscalls per table.
+const tableWriteBufferSize = 256 << 10
 
 // footer is a fixed-size trailer at the end of every table:
 //
@@ -20,10 +28,11 @@ const (
 // order. It writes data blocks with the given codec, an index block, an
 // embedded bloom filter, and a footer.
 type tableWriter struct {
-	w         io.Writer
-	c         blockCodec
-	bloom     *bloomFilter
-	blockSize int
+	w           *bufio.Writer
+	c           blockCodec
+	bloom       *bloomFilter
+	blockSize   int
+	entropySkip bool // gate the per-block entropy pre-check in finishBlock
 
 	offset     uint64
 	data       dataBlockBuilder
@@ -60,14 +69,25 @@ func (tw *tableWriter) maxUserKey() []byte {
 	return ikeyUserKey(tw.lastKey)
 }
 
-// NewWriter returns a table Writer over w using codec c, bloom bits per key,
-// and a target uncompressed block size.
-func newTableWriter(w io.Writer, c blockCodec, bloomBits, blockSize int) *tableWriter {
+// tableWriterConfig carries the tuning for a new table writer. It is a struct so
+// the writer can grow options without widening newTableWriter past the signature
+// limit.
+type tableWriterConfig struct {
+	codec       blockCodec
+	bloomBits   int
+	blockSize   int
+	entropySkip bool
+}
+
+// NewWriter returns a table Writer over w using the given codec, bloom bits per
+// key, target uncompressed block size, and entropy pre-check setting.
+func newTableWriter(w io.Writer, cfg tableWriterConfig) *tableWriter {
 	return &tableWriter{
-		w:         w,
-		c:         c,
-		bloom:     newBloom(bloomBits),
-		blockSize: blockSize,
+		w:           bufio.NewWriterSize(w, tableWriteBufferSize),
+		c:           cfg.codec,
+		bloom:       newBloom(cfg.bloomBits),
+		blockSize:   cfg.blockSize,
+		entropySkip: cfg.entropySkip,
 	}
 }
 
@@ -129,7 +149,7 @@ func (tw *tableWriter) writeBlock(payload []byte, c blockCodec) blockHandle {
 	if tw.err != nil {
 		return blockHandle{}
 	}
-	block := finishBlock(payload, c)
+	block := finishBlock(payload, c, tw.entropySkip)
 	if err := writeAll(tw.w, block); err != nil {
 		tw.err = err
 	}
@@ -169,6 +189,11 @@ func (tw *tableWriter) finish() (int64, error) {
 		return 0, err
 	}
 	tw.offset += uint64(len(footer))
+	// Flush the buffer to the file so the caller's f.Sync makes the whole table
+	// durable.
+	if err := tw.w.Flush(); err != nil {
+		return 0, err
+	}
 	return int64(tw.offset), nil
 }
 
@@ -179,7 +204,8 @@ func (tw *tableWriter) writeRawBlock(payload []byte) blockHandle {
 		return blockHandle{}
 	}
 	none, _ := codecFromID(codecNone)
-	block := finishBlock(payload, none)
+	// The none codec never triggers the entropy pre-check, so its setting is moot.
+	block := finishBlock(payload, none, false)
 	if err := writeAll(tw.w, block); err != nil {
 		tw.err = err
 	}

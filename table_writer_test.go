@@ -35,7 +35,7 @@ func TestTableWriter(t *testing.T) {
 
 	t.Run("finish_reports_size", func(t *testing.T) {
 		var buf bytes.Buffer
-		tw := newTableWriter(&buf, c, 10, 4096)
+		tw := newTableWriter(&buf, tableWriterConfig{codec: c, bloomBits: 10, blockSize: 4096})
 		require.NoError(t, tw.Add(ikeyEncode(nil, []byte("a"), 1, ikeyKindSet), []byte("va")))
 		require.NoError(t, tw.Add(ikeyEncode(nil, []byte("b"), 1, ikeyKindSet), []byte("vb")))
 
@@ -47,7 +47,7 @@ func TestTableWriter(t *testing.T) {
 
 	t.Run("out_of_order_rejected", func(t *testing.T) {
 		var buf bytes.Buffer
-		tw := newTableWriter(&buf, c, 10, 4096)
+		tw := newTableWriter(&buf, tableWriterConfig{codec: c, bloomBits: 10, blockSize: 4096})
 		require.NoError(t, tw.Add(ikeyEncode(nil, []byte("b"), 1, ikeyKindSet), []byte("vb")))
 
 		err := tw.Add(ikeyEncode(nil, []byte("a"), 1, ikeyKindSet), []byte("va"))
@@ -60,7 +60,7 @@ func TestTableWriter(t *testing.T) {
 
 	t.Run("empty_table", func(t *testing.T) {
 		var buf bytes.Buffer
-		tw := newTableWriter(&buf, c, 10, 4096)
+		tw := newTableWriter(&buf, tableWriterConfig{codec: c, bloomBits: 10, blockSize: 4096})
 		size, err := tw.finish()
 		require.NoError(t, err)
 		assert.Equal(t, int64(buf.Len()), size)
@@ -69,7 +69,7 @@ func TestTableWriter(t *testing.T) {
 	t.Run("multi_block", func(t *testing.T) {
 		var buf bytes.Buffer
 		// Small block size forces multiple data blocks.
-		tw := newTableWriter(&buf, c, 10, 64)
+		tw := newTableWriter(&buf, tableWriterConfig{codec: c, bloomBits: 10, blockSize: 64})
 		for i := 0; i < 50; i++ {
 			k := ikeyEncode(nil, []byte{byte(i)}, 1, ikeyKindSet)
 			require.NoError(t, tw.Add(k, bytes.Repeat([]byte("x"), 16)))
@@ -99,7 +99,7 @@ func BenchmarkTableWriterAdd(b *testing.B) {
 	for n := 0; n < b.N; n++ {
 		b.StopTimer()
 		buf.Reset()
-		tw := newTableWriter(&buf, c, 10, 4096)
+		tw := newTableWriter(&buf, tableWriterConfig{codec: c, bloomBits: 10, blockSize: 4096})
 		b.StartTimer()
 
 		for _, k := range keys {
@@ -119,24 +119,29 @@ func TestTableWriterWriteErrors(t *testing.T) {
 	require.NoError(t, err)
 
 	t.Run("data block write fails and Add is sticky", func(t *testing.T) {
-		// Fail immediately; a small block size forces a data-block flush inside Add.
+		// The table writer buffers block writes, so a failure surfaces once the
+		// buffer flushes to the underlying writer. Write enough to exceed the
+		// buffer and force a flush inside Add, then assert Add reports it and stays
+		// sticky.
 		w := &failWriter{n: 0}
-		tw := newTableWriter(w, c, 10, 8)
-		for i := 0; i < 20; i++ {
-			k := ikeyEncode(nil, []byte{byte(i)}, 1, ikeyKindSet)
-			if err := tw.Add(k, bytes.Repeat([]byte("x"), 16)); err != nil {
-				assert.ErrorIs(t, err, errFailWrite)
-				// Subsequent Add returns the sticky error too.
-				assert.ErrorIs(t, tw.Add(ikeyEncode(nil, []byte{99}, 1, ikeyKindSet), []byte("y")), errFailWrite)
-				return
+		tw := newTableWriter(w, tableWriterConfig{codec: c, bloomBits: 10, blockSize: 8})
+		val := bytes.Repeat([]byte("x"), 1024)
+		var got error
+		for i := 0; i < tableWriteBufferSize/1024+16; i++ {
+			k := ikeyEncode(nil, []byte{byte(i >> 8), byte(i)}, 1, ikeyKindSet)
+			if err := tw.Add(k, val); err != nil {
+				got = err
+				break
 			}
 		}
-		t.Fatal("expected a write failure")
+		require.ErrorIs(t, got, errFailWrite, "a flush inside Add must surface the write error")
+		// Subsequent Add returns the sticky error too.
+		assert.ErrorIs(t, tw.Add(ikeyEncode(nil, []byte{0xff, 0xff}, 1, ikeyKindSet), []byte("y")), errFailWrite)
 	})
 
 	t.Run("finish returns sticky error", func(t *testing.T) {
 		w := &failWriter{n: 0}
-		tw := newTableWriter(w, c, 10, 8)
+		tw := newTableWriter(w, tableWriterConfig{codec: c, bloomBits: 10, blockSize: 8})
 		for i := 0; i < 20; i++ {
 			k := ikeyEncode(nil, []byte{byte(i)}, 1, ikeyKindSet)
 			_ = tw.Add(k, bytes.Repeat([]byte("x"), 16))
@@ -147,7 +152,7 @@ func TestTableWriterWriteErrors(t *testing.T) {
 
 	t.Run("filter block write fails in finish", func(t *testing.T) {
 		var probe bytes.Buffer
-		ptw := newTableWriter(&probe, c, 10, 4096)
+		ptw := newTableWriter(&probe, tableWriterConfig{codec: c, bloomBits: 10, blockSize: 4096})
 		require.NoError(t, ptw.Add(ikeyEncode(nil, []byte("a"), 1, ikeyKindSet), []byte("va")))
 		_, err := ptw.finish()
 		require.NoError(t, err)
@@ -155,7 +160,7 @@ func TestTableWriterWriteErrors(t *testing.T) {
 		// Allow every byte through until just before the filter block, so the
 		// last-data-block write in finish succeeds but writeRawBlock fails.
 		w := &failWriter{n: 30}
-		tw := newTableWriter(w, c, 10, 4096)
+		tw := newTableWriter(w, tableWriterConfig{codec: c, bloomBits: 10, blockSize: 4096})
 		require.NoError(t, tw.Add(ikeyEncode(nil, []byte("a"), 1, ikeyKindSet), []byte("va")))
 		_, err = tw.finish()
 		assert.ErrorIs(t, err, errFailWrite)
@@ -164,13 +169,13 @@ func TestTableWriterWriteErrors(t *testing.T) {
 	t.Run("footer write fails in finish", func(t *testing.T) {
 		// Allow all block writes but fail on the fixed-size footer at the end.
 		var full bytes.Buffer
-		ftw := newTableWriter(&full, c, 10, 4096)
+		ftw := newTableWriter(&full, tableWriterConfig{codec: c, bloomBits: 10, blockSize: 4096})
 		require.NoError(t, ftw.Add(ikeyEncode(nil, []byte("a"), 1, ikeyKindSet), []byte("va")))
 		_, err := ftw.finish()
 		require.NoError(t, err)
 
 		w := &failWriter{n: full.Len() - footerLen}
-		tw := newTableWriter(w, c, 10, 4096)
+		tw := newTableWriter(w, tableWriterConfig{codec: c, bloomBits: 10, blockSize: 4096})
 		require.NoError(t, tw.Add(ikeyEncode(nil, []byte("a"), 1, ikeyKindSet), []byte("va")))
 		_, err = tw.finish()
 		assert.ErrorIs(t, err, errFailWrite)

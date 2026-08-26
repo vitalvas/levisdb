@@ -17,109 +17,120 @@ import (
 // internal key (user key + seq + kind) is identical, so no version is
 // duplicated. A torn tail from the crash is ignored by the WAL reader, so
 // replay stops at the last intact record.
-func (db *DB) recoverWAL(logs []uint32, startSeq uint64) (uint64, error) {
-	return db.recoverWALMode(logs, startSeq, true)
+func (db *DB) recoverWAL(shardLogs [][]uint32, startSeq uint64) (uint64, error) {
+	return db.recoverWALMode(shardLogs, startSeq, true)
 }
 
 // errWALStop signals a recoverable stop point during lenient WAL replay: the
 // intact prefix up to here is kept and no further segments are replayed.
 var errWALStop = fmt.Errorf("wal: recoverable stop")
 
-func (db *DB) recoverWALMode(logs []uint32, startSeq uint64, flush bool) (uint64, error) {
+// recoverWALMode replays each shard's leftover WAL segments into that shard's
+// memtable. shardLogs[i] is shard i's segment numbers, ascending. Sequence
+// numbers are global (assigned by the DB), but each shard's own segments carry
+// ascending seqs, so the monotonicity check is per shard; across shards seqs
+// interleave and are not comparable.
+func (db *DB) recoverWALMode(shardLogs [][]uint32, startSeq uint64, flush bool) (uint64, error) {
 	maxSeq := startSeq
-	var lastWALSeq uint64
 	lenient := !db.opts.StrictWALRecovery
-	for _, num := range logs {
-		f, err := os.Open(db.store.logPath(num))
-		if err != nil {
-			return maxSeq, err
-		}
-		seq, err := replayWALFileVisit(f, startSeq, lenient, func(entries []walEntry) error {
-			for i := range entries {
-				e := &entries[i]
-				if e.Seq <= lastWALSeq {
-					// A regressing sequence across segments is a corruption signal.
-					// Lenient recovery stops and keeps the prefix; strict fails.
-					if lenient {
-						return errWALStop
-					}
-					return fmt.Errorf("wal: non-increasing sequence %d after %d across segments", e.Seq, lastWALSeq)
-				}
-				lastWALSeq = e.Seq
-				// The shard-bounds, empty-key, and shard-ownership checks below are
-				// SEMANTIC: a valid-CRC record whose contents are logically
-				// impossible signals a format/logic problem or tampering, not bit
-				// rot, so they always fail Open even in lenient mode.
-				if e.Shard < 0 || e.Shard >= len(db.shards) {
-					return fmt.Errorf("wal: shard %d outside [0,%d)", e.Shard, len(db.shards))
-				}
-				if len(e.Key) == 0 {
-					return fmt.Errorf("wal: empty key")
-				}
-				expectedShard, err := db.shardForKey(e.Key)
-				if err != nil {
-					return fmt.Errorf("wal: %w", err)
-				}
-				if expectedShard != e.Shard {
-					return fmt.Errorf("wal: key belongs to shard %d, record names shard %d", expectedShard, e.Shard)
-				}
-				if e.Seq > maxIKeySeq {
-					return fmt.Errorf("wal: sequence %d exceeds internal-key limit", e.Seq)
-				}
-				// An entry past the size limit would corrupt the skiplist arena or a
-				// data block on apply; reject it like the other semantic checks. A
-				// TTL entry re-encodes the expiry prefix, so count it.
-				entrySize := len(e.Key) + len(e.Value)
-				if e.Kind == walKindPutTTL {
-					entrySize += expiryPrefixLen
-				}
-				if entrySize > maxEntrySize {
-					return fmt.Errorf("wal: entry size %d exceeds limit %d", entrySize, maxEntrySize)
-				}
-				s := db.shards[e.Shard]
-				switch e.Kind {
-				case walKindDelete:
-					s.del(e.Seq, e.Key)
-				case walKindPutTTL:
-					s.putTTL(e.Seq, e.Key, e.Value, e.ExpiresAt)
-				default:
-					s.Put(e.Seq, e.Key, e.Value)
-				}
-				// Bound skiplist arena growth once a shard reaches its threshold.
-				// Writable recovery flushes to an SSTable; read-only recovery seals
-				// the memtable in memory so Open preserves its non-mutation contract.
-				if s.needFlush() {
-					if flush {
-						if ferr := s.Flush(); ferr != nil {
-							return ferr
-						}
-					} else {
-						s.sealReadOnlyRecoveryMemtable()
-					}
-				}
+	for shard := 0; shard < len(shardLogs); shard++ {
+		var lastWALSeq uint64
+		s := db.shards[shard]
+		stopped := false
+		for _, num := range shardLogs[shard] {
+			path, perr := db.store.logPath(shard, num)
+			if perr != nil {
+				return maxSeq, perr
 			}
-			return nil
-		})
-		closeErr := f.Close()
-		if err == errWALStop {
-			// Recoverable stop: keep what we replayed, ignore later segments.
+			f, err := os.Open(path)
+			if err != nil {
+				return maxSeq, err
+			}
+			seq, err := replayWALFileVisit(f, startSeq, lenient, func(entries []walEntry) error {
+				for i := range entries {
+					e := &entries[i]
+					if e.Seq <= lastWALSeq {
+						// A regressing sequence within a shard's segments is a corruption
+						// signal. Lenient recovery stops and keeps the prefix; strict fails.
+						if lenient {
+							return errWALStop
+						}
+						return fmt.Errorf("wal: non-increasing sequence %d after %d in shard %d", e.Seq, lastWALSeq, shard)
+					}
+					lastWALSeq = e.Seq
+					// The shard-ownership, empty-key, and bounds checks below are
+					// SEMANTIC: a valid-CRC record whose contents are logically
+					// impossible signals a format/logic problem or tampering, not bit
+					// rot, so they always fail Open even in lenient mode.
+					if e.Shard != shard {
+						return fmt.Errorf("wal: shard %d segment holds record for shard %d", shard, e.Shard)
+					}
+					if len(e.Key) == 0 {
+						return fmt.Errorf("wal: empty key")
+					}
+					expectedShard, err := db.shardForKey(e.Key)
+					if err != nil {
+						return fmt.Errorf("wal: %w", err)
+					}
+					if expectedShard != e.Shard {
+						return fmt.Errorf("wal: key belongs to shard %d, record names shard %d", expectedShard, e.Shard)
+					}
+					if e.Seq > maxIKeySeq {
+						return fmt.Errorf("wal: sequence %d exceeds internal-key limit", e.Seq)
+					}
+					// An entry past the size limit would corrupt the skiplist arena or a
+					// data block on apply; reject it like the other semantic checks. A
+					// TTL entry re-encodes the expiry prefix, so count it.
+					entrySize := len(e.Key) + len(e.Value)
+					if e.Kind == walKindPutTTL {
+						entrySize += expiryPrefixLen
+					}
+					if entrySize > maxEntrySize {
+						return fmt.Errorf("wal: entry size %d exceeds limit %d", entrySize, maxEntrySize)
+					}
+					switch e.Kind {
+					case walKindDelete:
+						s.del(e.Seq, e.Key)
+					case walKindPutTTL:
+						s.putTTL(e.Seq, e.Key, e.Value, e.ExpiresAt)
+					default:
+						s.Put(e.Seq, e.Key, e.Value)
+					}
+					// Bound skiplist arena growth once a shard reaches its threshold.
+					// Writable recovery flushes to an SSTable; read-only recovery seals
+					// the memtable in memory so Open preserves its non-mutation contract.
+					if s.needFlush() {
+						if flush {
+							if ferr := s.Flush(); ferr != nil {
+								return ferr
+							}
+						} else {
+							s.sealReadOnlyRecoveryMemtable()
+						}
+					}
+				}
+				return nil
+			})
+			closeErr := f.Close()
 			if seq > maxSeq {
 				maxSeq = seq
+			}
+			if err == errWALStop {
+				// Recoverable stop: keep this shard's prefix, skip its later segments.
+				if closeErr != nil {
+					return maxSeq, closeErr
+				}
+				stopped = true
+				break
+			}
+			if err != nil {
+				return maxSeq, err
 			}
 			if closeErr != nil {
 				return maxSeq, closeErr
 			}
-			break
 		}
-		if err != nil {
-			return maxSeq, err
-		}
-		if closeErr != nil {
-			return maxSeq, closeErr
-		}
-		if seq > maxSeq {
-			maxSeq = seq
-		}
+		_ = stopped
 	}
 
 	// Flush the recovered memtables to tables so the data is durable before we

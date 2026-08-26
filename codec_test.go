@@ -98,6 +98,52 @@ func TestResolveLevelCodec(t *testing.T) {
 	}
 }
 
+// TestEntropyCompressionOption exercises both the default (entropy pre-check
+// off) and enabled paths end to end: each round-trips high-entropy values
+// through flush and compaction unchanged, since the size-check fallback keeps a
+// block correct whether or not the entropy check runs.
+func TestEntropyCompressionOption(t *testing.T) {
+	t.Parallel()
+	for _, entropy := range []bool{false, true} {
+		name := "disabled"
+		if entropy {
+			name = "enabled"
+		}
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			db := openTestDB(t, func(o *Options) {
+				o.ShardCount = 1
+				o.MemtableSize = 4 << 10
+				o.FreshCodec = CodecS2
+				o.BottomCodec = CodecZstd
+				o.EntropyCompression = entropy
+			})
+			// High-entropy (near-random, deterministic) values: the entropy check
+			// would skip compression, the disabled path relies on the size fallback.
+			mkVal := func(i int) []byte {
+				v := make([]byte, 256)
+				x := uint64(i)*0x9e3779b97f4a7c15 + 1
+				for j := range v {
+					x = x*6364136223846793005 + 1442695040888963407
+					v[j] = byte(x >> 56)
+				}
+				return v
+			}
+			const n = 400
+			for i := 0; i < n; i++ {
+				require.NoError(t, db.Put(PutOptions{Key: []byte(fmt.Sprintf("k%05d", i)), Value: mkVal(i)}))
+			}
+			db.sched.drain()
+			require.NoError(t, db.CompactRange(nil, nil)) // force flush + compaction
+			for i := 0; i < n; i++ {
+				got, err := db.Get([]byte(fmt.Sprintf("k%05d", i)))
+				require.NoError(t, err, "i=%d", i)
+				assert.Equal(t, mkVal(i), got, "i=%d round-trips with entropy=%v", i, entropy)
+			}
+		})
+	}
+}
+
 // TestLevelCodecsAppliedToFlushedTable writes a compressible workload with a
 // per-level override for depth 0 and checks the flushed L0 table's blocks were
 // encoded with that codec, proving LevelCodecs threads through the flush path.

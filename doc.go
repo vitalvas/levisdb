@@ -1,8 +1,9 @@
 // Package levisdb is an embedded, sharded key-value storage engine for Go,
-// modeled on LevelDB and tuned for large, slow spinning disks. Writes share one
-// sequential write-ahead log, the keyspace is split into independent shards that
-// flush and compact on their own, and a global scheduler keeps compaction
-// concurrency bounded so a single spindle sees mostly sequential I/O.
+// modeled on LevelDB. The keyspace is split into independent shards that each
+// have their own write-ahead log and flush and compact on their own, so
+// concurrent writes to different shards do not serialize on a single committer.
+// A global scheduler keeps compaction concurrency bounded (default one), so a
+// single spinning disk sees mostly sequential I/O while fast storage can raise it.
 //
 // # Basic use
 //
@@ -67,19 +68,21 @@
 // FreshCodec (default CodecS2) compresses upper tiers and flushed L0 tables;
 // BottomCodec (default CodecZstd) compresses the deepest tier. LevelCodecs
 // overrides the codec per depth, falling back to that split for empty entries and
-// depths past its length. Compression is per block and conditional: a
-// near-random or non-shrinking block is stored raw, so incompressible data pays
-// no compression tax. Each block records its own codec id, so changing these
-// options affects only tables written afterward.
+// depths past its length. Compression is per block: a block that would not shrink
+// is stored raw, so incompressible data is never stored larger than raw.
+// EntropyCompression (default off) additionally skips the codec entirely on
+// blocks whose sampled entropy looks incompressible. Each block records its own
+// codec id, so changing these options affects only tables written afterward.
 //
 // # Durability and recovery
 //
-// Every mutation is appended to the shared WAL before it is visible. Concurrent
-// writes are coalesced into one grouped journal write and one fsync (group
-// commit). By default a returned write is crash-durable. NoSync trades that for
-// speed, leaving durability to the OS page cache; a background goroutine then
-// fsyncs every WALSyncInterval to bound the loss window. On open the WAL replays
-// into memtables. A torn crash tail is always tolerated, and by default recovery
+// Every mutation is appended to its shard's WAL before it is visible. Concurrent
+// writes to one shard are coalesced into one grouped journal write and one fsync
+// (group commit); writes to different shards commit in parallel. By default a
+// returned write is crash-durable. NoSync trades that for speed, leaving
+// durability to the OS page cache; a background goroutine then fsyncs every
+// WALSyncInterval to bound the loss window. On open each shard's WAL replays into
+// its memtable. A torn crash tail is always tolerated, and by default recovery
 // is lenient about deeper corruption, keeping the intact prefix; set
 // StrictWALRecovery to fail the open instead. A WALObserver taps the committed
 // stream in order for replication or change-data capture.

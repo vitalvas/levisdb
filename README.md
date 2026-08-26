@@ -1,9 +1,10 @@
 # levisdb
 
-levisdb is an embedded, sharded LSM key-value store for Go. It is designed for
-large, seek-sensitive disks: writes share one sequential WAL, shards flush and
-compact independently, and a global scheduler keeps compaction concurrency
-bounded.
+levisdb is an embedded, sharded LSM key-value store for Go. The keyspace is split
+into independent shards that each have their own write-ahead log and flush and
+compact independently, so concurrent writes to different shards do not serialize
+on a single committer. A global scheduler keeps compaction concurrency bounded
+(default one, tuned for a single spinning disk; raise it for fast storage).
 
 ## Platform support
 
@@ -110,6 +111,7 @@ target a single slow spinning disk.
 | `MaxCompactionBytes` | `10 x FileSizeMax` | Input byte cap per non-bottom compaction; negative disables. |
 | `FileSizeBase` / `FileSizeMultiplier` / `FileSizeMax` | `2 MiB` / `2` / `16 MiB` | Per-depth output size curve. |
 | `FreshCodec` / `BottomCodec` / `LevelCodecs` | `CodecS2` / `CodecZstd` / nil | Compression. See [Compression](#compression). |
+| `EntropyCompression` | `false` | Skip the codec on incompressible blocks via an entropy pre-check. |
 | `BloomBits` | `10` | Bloom filter bits per key. |
 | `BlockSize` | `4 KiB` | SSTable data block size in bytes. |
 | `BlockCacheSize` / `DisableBlockCache` | `256 MiB` / `false` | Decoded-block cache capacity; or turn it off. |
@@ -123,8 +125,10 @@ target a single slow spinning disk.
 
 ## Examples
 
-Atomic batch. Every op in a batch is one WAL append: all become durable
-together or none do.
+Atomic batch. A batch commits atomically: it becomes visible to reads and
+snapshots all-or-nothing. Ops within one shard are one WAL record (durable
+together or not at all); a batch spanning shards is atomic within each shard for
+durability. See [Write-ahead log](#write-ahead-log).
 
 ```go
 var b levisdb.Batch
@@ -361,14 +365,19 @@ opts.FreshCodec = levisdb.CodecNone
 opts.BottomCodec = levisdb.CodecNone
 ```
 
-Whichever codec a block is assigned, compression is per block and conditional: a
-block whose sampled entropy is near random (already-compressed or encrypted
-data) is stored uncompressed to avoid wasting CPU, and any block that would not
-shrink is stored raw as well. So the codec choice is a ceiling, not a guarantee,
-and incompressible data pays no compression tax. Because each block records its
-own codec id, changing these options only affects tables written afterward;
-existing tables keep decoding with the codec they were written with, and a later
-compaction re-encodes them under the new setting.
+Whichever codec a block is assigned, any block that would not shrink is stored
+raw, so the codec choice is a ceiling and incompressible data is never stored
+larger than raw. Because each block records its own codec id, changing these
+options only affects tables written afterward; existing tables keep decoding with
+the codec they were written with, and a later compaction re-encodes them under
+the new setting.
+
+`EntropyCompression` (default off) adds a per-block entropy pre-check: a block
+whose sampled Shannon entropy looks incompressible (already-compressed,
+encrypted, or random data) is stored raw *without* attempting the codec, saving
+that CPU. With it off, the codec is always attempted and the size fallback above
+decides. Enable it when much of your data is already compressed and the wasted
+compression attempts cost more than the entropy sampling.
 
 ## Monitoring
 
@@ -395,14 +404,24 @@ Sentinel errors returned by the API, all matchable with `errors.Is`:
 
 ## Write-ahead log
 
-Every mutation is first appended to one shared WAL, so a committed write survives
-a crash even before its shard's memtable is flushed to a table.
+Every mutation is first appended to a WAL, so a committed write survives a crash
+even before its shard's memtable is flushed to a table. Each shard has its own WAL
+(`shards/<xx>/<num>.log`), so writes to different shards do not serialize on a
+single committer.
 
-**Group commit.** Concurrent `Put`/`Delete`/`Write` calls are coalesced by a
-single committer into one grouped journal write and one fsync, so the disk sees
-one sequential stream no matter how many goroutines write. Each call returns only
-after its batch is durable and any `WALObserver` has run. A whole `Batch` is one
-record: all of its ops become durable together or none do.
+**Group commit.** Concurrent `Put`/`Delete`/`Write` calls to the same shard are
+coalesced by that shard's single committer into one grouped journal write and one
+fsync, so each shard's WAL sees one sequential stream no matter how many goroutines
+write to it; writes to different shards commit in parallel. Each call returns only
+after its batch is durable and any `WALObserver` has run.
+
+**Batch atomicity.** A single-shard `Batch` is one record: all of its ops become
+durable together or none do. A `Batch` spanning shards writes one record per shard
+and is atomic *within* each shard (a crash may persist some shards' slices and not
+others). Regardless, the whole batch becomes visible to reads and snapshots
+atomically: a global sequence number is assigned to the batch as a contiguous
+range, and the read sequence advances past the batch only once every shard has
+applied, so a concurrent reader never sees a batch half-applied across shards.
 
 **Durability modes.** By default (`NoSync` false) the committer fsyncs once per
 group, so a returned write is crash-durable and the loss window is just the
@@ -411,19 +430,22 @@ cache: faster, but a crash can lose everything written since the last sync. Unde
 `NoSync` a background goroutine still fsyncs every `WALSyncInterval` (default one
 second; negative disables it) to bound that window.
 
-**Rotation and checkpoint.** When the live segment grows past its size bound the
-WAL rotates to a new segment and checkpoints: it flushes the shard memtables the
-old segment covered, then retires that segment. So the on-disk WAL only ever
-holds records not yet captured in a table, and recovery work stays bounded.
-Enabling a `CompactionFilter` can force an extra checkpoint before filtering so a
-crash cannot replay a value the filter discarded.
+**Rotation and checkpoint.** When any shard's live segment grows past its size
+bound the WALs rotate to fresh segments and checkpoint: the shard memtables the
+old segments covered are flushed, then those segments are retired. So the on-disk
+WAL only ever holds records not yet captured in a table, and recovery work stays
+bounded. The checkpoint runs on a background goroutine, so a write never blocks on
+the flush-all-shards barrier (backpressure already bounds how far writes get
+ahead); `Close` waits for an in-flight checkpoint before it returns. Enabling a
+`CompactionFilter` can force an extra checkpoint before filtering so a crash
+cannot replay a value the filter discarded.
 
-**Recovery.** On open, levisdb replays the WAL back into memtables, then resumes.
-A torn tail from a crash (a half-written final record) is always tolerated. By
-default recovery is also lenient about deeper damage: it stops at the first
-corrupt record and keeps the intact prefix, so one bit-rotted record does not
-make the database unopenable. Set `StrictWALRecovery` to fail the open on any
-corruption instead. `ReadOnly` opens replay a crash WAL in memory only, changing
+**Recovery.** On open, levisdb replays each shard's WAL segments back into that
+shard's memtable, then resumes. A torn tail from a crash (a half-written final
+record) is always tolerated. By default recovery is also lenient about deeper
+damage: it stops a shard at its first corrupt record and keeps the intact prefix,
+so one bit-rotted record does not make the database unopenable. Set
+`StrictWALRecovery` to fail the open on any corruption instead. `ReadOnly` opens replay a crash WAL in memory only, changing
 nothing on disk.
 
 **Observation.** A `WALObserver` taps the committed stream in order, after fsync,
@@ -435,10 +457,10 @@ cumulative record volume.
 
 ## On-disk layout
 
-Under `Dir`: a shared write-ahead log in segmented, checksummed journal blocks
-(see [Write-ahead log](#write-ahead-log)); an append-only manifest recording
-every flush and compaction, with a `CURRENT` file naming the live manifest; and
-per-shard `.sst` tables. Tables use LevelDB-style prefix-compressed data blocks
+Under `Dir`: per-shard write-ahead logs in segmented, checksummed journal blocks
+at `shards/<xx>/<num>.log` (see [Write-ahead log](#write-ahead-log)); an
+append-only manifest recording every flush and compaction, with a `CURRENT` file
+naming the live manifest; and per-shard `.sst` tables. Tables use LevelDB-style prefix-compressed data blocks
 with restart points, a flat index, an embedded bloom filter, and per-block
 CRC32C.
 
