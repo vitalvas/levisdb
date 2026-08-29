@@ -61,3 +61,40 @@ after the load has settled.
 | --- | --- | --- |
 | on (default) | **17.7 ms** | **74 KB** |
 | off | 82.6 ms | 444 KB |
+
+## Block codecs
+
+Ratio and per-block compress/decompress time for the four codecs on a 4 KiB
+block, across three data shapes: highly repetitive, moderately compressible
+structured data (mixed), and incompressible (random). All codecs are zero-alloc
+at steady state.
+
+### Moderately compressible (mixed structured data)
+
+| Codec | Ratio | Compress | Decompress |
+| --- | --- | --- | --- |
+| none | 1.00x | 0.18 µs | 0.18 µs |
+| s2 | 1.86x | 4.5 µs | 1.1 µs |
+| flate | **3.11x** | 13.1 µs | 6.7 µs |
+| zstd | 3.08x | 13.9 µs | 6.0 µs |
+
+### Highly repetitive
+
+| Codec | Ratio | Compress | Decompress |
+| --- | --- | --- | --- |
+| s2 | **89x** | 1.3 µs | 1.4 µs |
+| zstd | 72x | 2.2 µs | 1.4 µs |
+| flate | 64x | 2.1 µs | 1.9 µs |
+
+### Incompressible (random)
+
+All codecs fall back to storing the block raw (~1.00x); the size-check fallback
+never ships a block larger than its payload.
+
+Takeaways: s2 is fastest and wins on highly repetitive data; zstd and flate reach
+a much higher ratio on moderately compressible structured data, where flate edges
+zstd on ratio at comparable speed. flate fills the gap between s2's speed and
+zstd's ratio for that mid-compressibility case; it is not the right choice for
+highly repetitive data (s2 wins) or incompressible data (all tie at raw). Both
+`FreshCodec` and `BottomCodec` default to s2; select flate or zstd per tier via
+`BottomCodec` or `LevelCodecs` when the ratio is worth the extra CPU.

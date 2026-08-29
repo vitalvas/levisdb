@@ -108,7 +108,7 @@ target a single slow spinning disk.
 | `MaxCompactionBytes` | `10 x FileSizeMax` | Input byte cap per non-bottom compaction; negative disables. |
 | `DisableOverlapSelection` | `false` | Merge the whole tier instead of only the largest key-overlapping group. |
 | `FileSizeBase` / `FileSizeMultiplier` / `FileSizeMax` | `2 MiB` / `2` / `16 MiB` | Per-depth output size curve. |
-| `FreshCodec` / `BottomCodec` / `LevelCodecs` | `CodecS2` / `CodecZstd` / nil | Compression. See [Compression](#compression). |
+| `FreshCodec` / `BottomCodec` / `LevelCodecs` | `CodecS2` / `CodecS2` / nil | Compression (`none`/`s2`/`flate`/`zstd`). See [Compression](#compression). |
 | `EntropyCompression` | `false` | Skip the codec on incompressible blocks via an entropy pre-check. |
 | `BloomBits` | `10` | Bloom filter bits per key. |
 | `BlockSize` | `4 KiB` | SSTable data block size in bytes. |
@@ -225,8 +225,8 @@ the `*DB` reads, fixed to the snapshot's sequence), `Seq() uint64`, `Release()`.
 `Error() error`, `Close() error`. Key and value slices are valid only until the
 next `Next`; copy to retain.
 
-Codec constants `CodecNone`, `CodecS2`, and `CodecZstd` name the built-in
-compression codecs in `Options`.
+Codec constants `CodecNone`, `CodecS2`, `CodecZstd`, and `CodecFlate` name the
+built-in compression codecs in `Options`.
 
 ## Size limits
 
@@ -297,16 +297,19 @@ compaction filter without waiting for automatic tier selection.
 
 ## Compression
 
-By default compression is a two-way split by depth, with two knobs:
+Compression is a split by depth, with two knobs:
 
 | Option | Default | Applies to |
 | --- | --- | --- |
 | `FreshCodec` | `CodecS2` (fast) | flushed L0 tables and every compaction output except the deepest tier |
-| `BottomCodec` | `CodecZstd` (high ratio) | only the deepest tier, where data is coldest and rewritten least |
+| `BottomCodec` | `CodecS2` | only the deepest tier, where data is coldest and rewritten least |
 
-Each accepts `CodecS2`, `CodecZstd`, or `CodecNone`. The split exists because
-fresh data is rewritten often (favor CPU-cheap S2) while bottom data is written
-once and read for a long time (favor Zstd's ratio).
+Each accepts `CodecNone`, `CodecS2`, `CodecFlate`, or `CodecZstd`. Both default to
+S2 (fast, moderate ratio) because Zstd's encode cost dominated compaction on large
+compressible values; set `BottomCodec = CodecZstd` for a higher-ratio cold tier
+when the extra encode cost is acceptable. `CodecFlate` (DEFLATE) is a middle
+point: a better ratio than S2 at a higher CPU cost, for a mid tier that wants
+more compression than S2 without Zstd's encode cost.
 
 For finer control, `LevelCodecs []string` overrides the codec per tier depth:
 `LevelCodecs[d]` names the codec for tables written at depth `d`. Depths past

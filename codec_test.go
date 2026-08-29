@@ -17,6 +17,7 @@ func TestCodecConstants(t *testing.T) {
 	assert.Equal(t, "none", CodecNone)
 	assert.Equal(t, "s2", CodecS2)
 	assert.Equal(t, "zstd", CodecZstd)
+	assert.Equal(t, "flate", CodecFlate)
 }
 
 func TestCodecFromName(t *testing.T) {
@@ -29,6 +30,7 @@ func TestCodecFromName(t *testing.T) {
 		{CodecNone, codecNone, CodecNone},
 		{CodecS2, codecS2, CodecS2},
 		{CodecZstd, codecZstd, CodecZstd},
+		{CodecFlate, codecFlate, CodecFlate},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -55,6 +57,7 @@ func TestCodecFromID(t *testing.T) {
 		{"none", codecNone},
 		{"s2", codecS2},
 		{"zstd", codecZstd},
+		{"flate", codecFlate},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -172,6 +175,37 @@ func TestLevelCodecsAppliedToFlushedTable(t *testing.T) {
 	assert.NotContains(t, ids, codecS2, "no L0 block should use s2")
 }
 
+// TestFlateCodecEndToEnd proves the flate codec threads through the on-disk path:
+// a flate-configured DB writes compressible data, the flushed L0 blocks carry the
+// flate codec id, and every value reads back correctly after flush and a forced
+// compaction (which re-encodes through the codec).
+func TestFlateCodecEndToEnd(t *testing.T) {
+	t.Parallel()
+	db := openTestDB(t, func(o *Options) {
+		o.MemtableSize = 64 << 10
+		o.FreshCodec = CodecFlate
+		o.BottomCodec = CodecFlate
+	})
+
+	val := bytes.Repeat([]byte("levisdb-flate"), 128) // compressible so flate is kept
+	const n = 300
+	for i := 0; i < n; i++ {
+		require.NoError(t, db.Put(PutOptions{Key: []byte(fmt.Sprintf("k%05d", i)), Value: val}))
+	}
+	db.sched.drain()
+
+	ids := depth0BlockCodecIDs(t, db.eng)
+	require.NotEmpty(t, ids, "expected at least one flushed L0 table")
+	assert.Contains(t, ids, codecFlate, "flushed blocks should use the flate codec")
+
+	require.NoError(t, db.CompactRange(nil, nil)) // re-encode through flate on compaction
+	for i := 0; i < n; i++ {
+		got, err := db.Get([]byte(fmt.Sprintf("k%05d", i)))
+		require.NoError(t, err, "i=%d", i)
+		assert.Equal(t, val, got, "i=%d round-trips through flate on disk", i)
+	}
+}
+
 // depth0BlockCodecIDs reads the first data block of every live depth-0 table in
 // the engine raw (bypassing decodeBlock) and returns the set of codec ids from
 // their trailers. Trailer layout from finishBlock: [payload][codec id][crc32].
@@ -203,7 +237,7 @@ func depth0BlockCodecIDs(t *testing.T, s *engineT) map[codecID]bool {
 func TestCodecRoundTrip(t *testing.T) {
 	t.Parallel()
 	src := bytes.Repeat([]byte("levisdb block payload "), 64)
-	for _, name := range []string{"none", "s2", "zstd"} {
+	for _, name := range []string{"none", "s2", "zstd", "flate"} {
 		t.Run(name, func(t *testing.T) {
 			c, err := codecFromName(name)
 			require.NoError(t, err)
@@ -244,6 +278,13 @@ func TestCodecDecompressError(t *testing.T) {
 		_, err = c.decompress(nil, []byte("not valid zstd stream"))
 		require.Error(t, err)
 	})
+
+	t.Run("flate", func(t *testing.T) {
+		c, err := codecFromName("flate")
+		require.NoError(t, err)
+		_, err = c.decompress(nil, []byte("not valid flate stream"))
+		require.Error(t, err)
+	})
 }
 
 func FuzzCodecRoundTrip(f *testing.F) {
@@ -251,7 +292,7 @@ func FuzzCodecRoundTrip(f *testing.F) {
 	f.Add([]byte{})
 	f.Add([]byte{0x00, 0xff, 0x00, 0xff})
 	f.Fuzz(func(t *testing.T, data []byte) {
-		for _, name := range []string{"none", "s2", "zstd"} {
+		for _, name := range []string{"none", "s2", "zstd", "flate"} {
 			c, err := codecFromName(name)
 			require.NoError(t, err)
 
@@ -277,7 +318,7 @@ func benchBlock() []byte {
 
 func BenchmarkCodecCompress(b *testing.B) {
 	src := benchBlock()
-	for _, name := range []string{"none", "s2", "zstd"} {
+	for _, name := range []string{"none", "s2", "zstd", "flate"} {
 		c, _ := codecFromName(name)
 		b.Run(name, func(b *testing.B) {
 			b.SetBytes(int64(len(src)))
@@ -291,7 +332,7 @@ func BenchmarkCodecCompress(b *testing.B) {
 
 func BenchmarkCodecDecompress(b *testing.B) {
 	src := benchBlock()
-	for _, name := range []string{"none", "s2", "zstd"} {
+	for _, name := range []string{"none", "s2", "zstd", "flate"} {
 		c, _ := codecFromName(name)
 		comp := c.compress(nil, src)
 		b.Run(name, func(b *testing.B) {

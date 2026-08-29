@@ -185,13 +185,15 @@ type Options struct {
 	// default; a negative value keeps every table open (unbounded).
 	MaxOpenFiles int
 
-	// FreshCodec compresses fresh (upper) tiers: CodecS2, CodecZstd, or CodecNone.
+	// FreshCodec compresses fresh (upper) tiers: CodecS2, CodecFlate, CodecZstd,
+	// or CodecNone.
 	FreshCodec string
-	// BottomCodec compresses the bottom (oldest) tier: CodecZstd, CodecS2, or
-	// CodecNone.
+	// BottomCodec compresses the bottom (oldest) tier: CodecS2, CodecFlate,
+	// CodecZstd, or CodecNone.
 	BottomCodec string
 	// LevelCodecs overrides the codec per tier depth: LevelCodecs[d] names the
-	// codec (CodecS2, CodecZstd, or CodecNone) for tables written at depth d.
+	// codec (CodecS2, CodecFlate, CodecZstd, or CodecNone) for tables written at
+	// depth d.
 	// Depths past the end of the slice, and empty entries, fall back to the
 	// FreshCodec/BottomCodec split (BottomCodec for the deepest tier, FreshCodec
 	// otherwise). Nil leaves that split unchanged. A block records its own codec
@@ -326,7 +328,7 @@ func (o *Options) fillDefaults() {
 }
 
 // validCodecs are the codec names accepted for FreshCodec and BottomCodec.
-var validCodecs = map[string]bool{CodecNone: true, CodecS2: true, CodecZstd: true}
+var validCodecs = map[string]bool{CodecNone: true, CodecS2: true, CodecZstd: true, CodecFlate: true}
 
 // validate checks that the options are internally consistent. It assumes
 // fillDefaults has already run.

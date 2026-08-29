@@ -52,10 +52,12 @@
 // # Compression
 //
 // FreshCodec (default CodecS2) compresses upper tiers and flushed L0 tables;
-// BottomCodec (default CodecZstd) compresses the deepest tier. LevelCodecs
-// overrides the codec per depth, falling back to that split for empty entries and
-// depths past its length. Compression is per block: a block that would not shrink
-// is stored raw, so incompressible data is never stored larger than raw.
+// BottomCodec (default CodecS2) compresses the deepest tier. Each accepts
+// CodecNone, CodecS2, CodecFlate, or CodecZstd, from fastest to highest ratio.
+// LevelCodecs overrides the codec per depth, falling back to that split for empty
+// entries and depths past its length. Compression is per block: a block that
+// would not shrink is stored raw, so incompressible data is never stored larger
+// than raw.
 // EntropyCompression (default off) additionally skips the codec entirely on
 // blocks whose sampled entropy looks incompressible. Each block records its own
 // codec id, so changing these options affects only tables written afterward.
