@@ -6,10 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -17,27 +15,13 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-type blockingSecondShardCall struct {
-	mu      sync.Mutex
-	calls   int
-	blocked chan struct{}
-	release chan struct{}
-}
-
-func (p *blockingSecondShardCall) Shard([]byte, int) int {
-	p.mu.Lock()
-	p.calls++
-	call := p.calls
-	p.mu.Unlock()
-	if call == 2 {
-		close(p.blocked)
-		<-p.release
-	}
-	return 0
-}
-
-func (*blockingSecondShardCall) Name() string { return "blocking-second-shard-call" }
-
+// TestPointReadPinsCapturedSequenceAgainstCompaction guards that a point read
+// pins the sequence it captured: the version it must return survives a
+// concurrent compaction that reclaims older versions, and the pin is released
+// when the read completes. Ported to the single engine by gating the
+// engine's compaction commit (instead of a routing call) so the read runs
+// while a compaction is in flight; the crash/consistency assertions are
+// unchanged.
 func TestPointReadPinsCapturedSequenceAgainstCompaction(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -65,34 +49,47 @@ func TestPointReadPinsCapturedSequenceAgainstCompaction(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			part := &blockingSecondShardCall{
-				blocked: make(chan struct{}),
-				release: make(chan struct{}),
-			}
 			db := openTestDB(t, func(o *Options) {
-				o.ShardCount = 1
 				o.MemtableSize = 1 << 30
-				o.CustomPartitioner = part
 			})
-			released := false
-			defer func() {
-				if !released {
-					close(part.release)
-				}
-			}()
 			require.NoError(t, db.Put(PutOptions{Key: []byte("key"), Value: []byte("old")}))
-			require.NoError(t, db.shards[0].Flush())
+			require.NoError(t, db.eng.Flush())
+			require.NoError(t, db.Put(PutOptions{Key: []byte("key2"), Value: []byte("v")}))
+			require.NoError(t, db.eng.Flush())
+
+			// Gate the compaction install (non-nil inputs) so the point read runs
+			// while a compaction is in flight but has not yet swapped its output
+			// tables in. The engine compaction is driven directly (not via
+			// CompactRange, which holds db.mu for its whole run and would deadlock
+			// the concurrent read behind a pending writer). The read must observe a
+			// consistent table set - its captured version is pinned, so the input
+			// tables it reads cannot be physically removed until it finishes.
+			originalCommit := db.eng.cfg.Commit
+			entered := make(chan struct{})
+			release := make(chan struct{})
+			var once sync.Once
+			db.eng.cfg.Commit = func(inputs, outputs []*tableMeta, install func()) error {
+				if len(inputs) > 0 {
+					once.Do(func() {
+						close(entered)
+						<-release
+					})
+				}
+				return originalCommit(inputs, outputs, install)
+			}
+
+			retain := db.readSeq.Load()
+			cc := db.compactionConfig()
+			compactDone := make(chan error, 1)
+			go func() { compactDone <- db.eng.CompactAll(retain, cc) }()
+			<-entered // compaction is gated mid-install; "old" not yet swapped out
 
 			result := make(chan error, 1)
 			go func() { result <- tc.read(db) }()
-			<-part.blocked // the read captured and pinned sequence one
+			require.NoError(t, <-result, "point read must see its captured version while a compaction is in flight")
 
-			require.NoError(t, db.Put(PutOptions{Key: []byte("key"), Value: []byte("new")}))
-			require.NoError(t, db.shards[0].Flush())
-			require.NoError(t, db.CompactShard(0))
-			close(part.release)
-			released = true
-			require.NoError(t, <-result)
+			close(release)
+			require.NoError(t, <-compactDone)
 			assert.Zero(t, db.snaps.live(), "point-read sequence pin must be released")
 		})
 	}
@@ -116,7 +113,6 @@ func TestRecoverWALAcrossJournalFlushBoundary(t *testing.T) {
 
 	db, err := Open(func() Options {
 		o := DefaultOptions(dir)
-		o.ShardCount = 4
 		o.MemtableSize = 1 << 30
 		return o
 	}())
@@ -131,19 +127,18 @@ func TestRecoverWALAcrossJournalFlushBoundary(t *testing.T) {
 }
 
 // TestConcurrentWritersSurviveCrash guards against silent data loss when many
-// goroutines write to one shard and the process crashes. The global sequence is
-// assigned inside each shard WAL's append (under the enqueue lock), so a shard's
-// records are physically ordered by seq. If seq were assigned before the append
-// (a global pre-reservation), two writers to one shard could enqueue in the
-// opposite order to their seqs; crash recovery treats a regressing seq within a
-// shard as corruption and drops every record after it - here that would silently
-// lose most of the writes. All must survive.
+// goroutines write concurrently and the process crashes. The global sequence is
+// assigned inside the WAL's append (under the enqueue lock), so records are
+// physically ordered by seq. If seq were assigned before the append (a global
+// pre-reservation), two writers could enqueue in the opposite order to their
+// seqs; crash recovery treats a regressing seq as corruption and drops every
+// record after it - here that would silently lose most of the writes. All must
+// survive.
 func TestConcurrentWritersSurviveCrash(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	opts := func() Options {
 		o := DefaultOptions(dir)
-		o.ShardCount = 1 // one shard so all writers share one WAL and can invert
 		o.NoSync = true
 		o.MemtableSize = 1 << 30 // keep everything in the WAL until the crash
 		return o
@@ -180,218 +175,12 @@ func TestConcurrentWritersSurviveCrash(t *testing.T) {
 	}
 }
 
-// TestMultiShardBatchVisibleAtomically is a concurrent -race smoke check for
-// cross-shard batch atomicity: a two-shard batch must never be seen half-applied
-// by a concurrent snapshot, while a noise writer to a third shard interleaves
-// seqs between the batch's shards. The deterministic guarantee lives in
-// TestReadSeqWatermarkHoldsForUnappliedGap; this exercises the same paths under
-// real concurrency and the race detector, kept lean with bounded loops.
-func TestMultiShardBatchVisibleAtomically(t *testing.T) {
-	t.Parallel()
-	o := DefaultOptions(t.TempDir())
-	o.ShardCount = 3
-	o.NoSync = true
-	o.MemtableSize = 1 << 30
-	o.Partitioner = PartitionerRange
-	db, err := Open(o)
-	require.NoError(t, err)
-	defer db.Close()
-
-	shardKey := func(want int) []byte {
-		for i := 0; i < 256; i++ {
-			k := []byte{byte(i)}
-			if s, _ := db.shardForKey(k); s == want {
-				return k
-			}
-		}
-		return nil
-	}
-	k0, k1, kn := shardKey(0), shardKey(1), shardKey(2)
-	require.NotNil(t, k0)
-	require.NotNil(t, k1)
-	require.NotNil(t, kn)
-
-	stop := make(chan struct{})
-	var torn int64
-	var wg sync.WaitGroup
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for i := 0; ; i++ {
-			select {
-			case <-stop:
-				return
-			default:
-			}
-			_ = db.Put(PutOptions{Key: kn, Value: []byte(fmt.Sprintf("n%d", i))})
-			runtime.Gosched()
-		}
-	}()
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for s := 0; s < 800; s++ {
-			snap, e := db.Snapshot()
-			if e != nil {
-				return
-			}
-			_, e0 := snap.Get(k0)
-			_, e1 := snap.Get(k1)
-			if (e0 == nil) != (e1 == nil) {
-				atomic.AddInt64(&torn, 1)
-			}
-			snap.Release()
-			runtime.Gosched()
-		}
-	}()
-
-	for i := 0; i < 300; i++ {
-		var b Batch
-		b.Put(PutOptions{Key: k0, Value: []byte(fmt.Sprintf("a%d", i))})
-		b.Put(PutOptions{Key: k1, Value: []byte(fmt.Sprintf("b%d", i))})
-		require.NoError(t, db.Write(&b))
-	}
-	close(stop)
-	wg.Wait()
-	assert.Zero(t, atomic.LoadInt64(&torn), "a two-shard batch was observed half-applied")
-}
-
-// TestReadSeqWatermarkHoldsForUnappliedGap deterministically guards the readSeq
-// watermark: while a multi-shard batch is mid-apply (one shard gated), a
-// concurrent single-shard write with a HIGHER seq must NOT advance readSeq past
-// the gated batch. publishRange advances readSeq only over the fully-applied
-// contiguous prefix, so the concurrent write's range is buffered until the gap
-// fills. A plain CAS-max publish would expose the gated batch half-applied.
-func TestReadSeqWatermarkHoldsForUnappliedGap(t *testing.T) {
-	t.Parallel()
-	o := DefaultOptions(t.TempDir())
-	o.ShardCount = 3
-	o.NoSync = true
-	o.MemtableSize = 1 << 30
-	o.Partitioner = PartitionerRange
-	db, err := Open(o)
-	require.NoError(t, err)
-	defer db.Close()
-
-	shardKey := func(want int) []byte {
-		for i := 0; i < 256; i++ {
-			k := []byte{byte(i)}
-			if s, _ := db.shardForKey(k); s == want {
-				return k
-			}
-		}
-		return nil
-	}
-	k0, k2, kn := shardKey(0), shardKey(2), shardKey(1)
-	require.NotNil(t, k0)
-	require.NotNil(t, k2)
-	require.NotNil(t, kn)
-
-	// Gate shard 2's first apply so the batch cannot finish.
-	orig2 := db.wals[2].wal.apply
-	gate := make(chan struct{})
-	var once bool
-	db.wals[2].wal.apply = func(e []walEntry) {
-		if !once {
-			once = true
-			<-gate
-		}
-		orig2(e)
-	}
-
-	bdone := make(chan struct{})
-	go func() {
-		var b Batch
-		b.Put(PutOptions{Key: k0, Value: []byte("A")})
-		b.Put(PutOptions{Key: k2, Value: []byte("C")})
-		_ = db.Write(&b)
-		close(bdone)
-	}()
-	time.Sleep(50 * time.Millisecond) // batch stuck applying shard 2
-
-	// A higher-seq single-shard write completes fully.
-	require.NoError(t, db.Put(PutOptions{Key: kn, Value: []byte("N")}))
-
-	// readSeq must not have advanced past the gated batch: a snapshot must see
-	// neither the batch's applied half nor tear.
-	snap, err := db.Snapshot()
-	require.NoError(t, err)
-	_, e0 := snap.Get(k0)
-	_, e2 := snap.Get(k2)
-	assert.Equal(t, e0 == nil, e2 == nil, "gated batch must not be visible half-applied")
-	assert.NotNil(t, e0, "gated batch must be fully invisible while an unapplied seq precedes readSeq")
-	snap.Release()
-
-	close(gate)
-	<-bdone
-
-	// Once the gate opens everything is visible (read-your-writes).
-	_, e0 = db.Get(k0)
-	_, e2 = db.Get(k2)
-	_, en := db.Get(kn)
-	require.NoError(t, e0)
-	require.NoError(t, e2)
-	require.NoError(t, en)
-}
-
-// TestAbortedBatchDoesNotStallWatermark guards the readSeq watermark against a
-// permanent stall when a multi-shard batch aborts mid-fan-out. assignSeq reserves
-// the batch's contiguous range before the per-shard enqueue; if a later shard's
-// enqueue fails, the reserved range still has appendToShardWALs as its sole
-// publisher, so it MUST publish the range even on error - otherwise readSeq stalls
-// below that range forever and a concurrent healthy writer's acked write (a higher
-// range buffered in pendingRanges) is never made visible. After the fix readSeq
-// advances to walSeq even though the batch failed.
-func TestAbortedBatchDoesNotStallWatermark(t *testing.T) {
-	o := DefaultOptions(t.TempDir())
-	o.ShardCount = 3
-	o.NoSync = true
-	o.MemtableSize = 1 << 30
-	o.Partitioner = PartitionerRange
-	db, err := Open(o)
-	require.NoError(t, err)
-	defer db.Close()
-
-	shardKey := func(want int) []byte {
-		for i := 0; i < 256; i++ {
-			k := []byte{byte(i)}
-			if s, _ := db.shardForKey(k); s == want {
-				return k
-			}
-		}
-		return nil
-	}
-	k0, k2 := shardKey(0), shardKey(2)
-	require.NotNil(t, k0)
-	require.NotNil(t, k2)
-
-	// Poison shard 2's WAL so the two-shard batch aborts after shard 0 is enqueued.
-	w2 := db.wals[2].wal
-	w2.mu.Lock()
-	w2.err = errors.New("injected wal failure")
-	w2.mu.Unlock()
-
-	var b Batch
-	b.Put(PutOptions{Key: k0, Value: []byte("a")})
-	b.Put(PutOptions{Key: k2, Value: []byte("c")})
-	require.Error(t, db.Write(&b), "batch must fail when a shard WAL is poisoned")
-
-	// The reserved range was published (gap-filled) on abort, so the watermark did
-	// not stall below the reservation counter.
-	assert.Equal(t, db.walSeq.Load(), db.readSeq.Load(),
-		"readSeq must not stall below walSeq after an aborted batch")
-}
-
 func TestWALAppliesConcurrentBatchesInCommitOrder(t *testing.T) {
-	// One shard so both writes share a single WAL committer: the ordering
-	// guarantee is per-shard now, so this exercises it within a shard.
-	db := openTestDB(t, func(o *Options) { o.ShardCount = 1; o.MemtableSize = 1 << 30 })
-	originalApply := db.wals[0].wal.apply
+	db := openTestDB(t, func(o *Options) { o.MemtableSize = 1 << 30 })
+	originalApply := db.wal.wal.apply
 	entered := make(chan struct{})
 	release := make(chan struct{})
-	db.wals[0].wal.apply = func(entries []walEntry) {
+	db.wal.wal.apply = func(entries []walEntry) {
 		if len(entries) > 1 {
 			close(entered)
 			<-release
@@ -426,7 +215,6 @@ func TestWALAppliesConcurrentBatchesInCommitOrder(t *testing.T) {
 
 func TestConcurrentIteratorAndWrites(t *testing.T) {
 	db := openTestDB(t, func(o *Options) {
-		o.ShardCount = 1
 		o.MemtableSize = 1 << 30
 	})
 
@@ -459,7 +247,6 @@ func TestCleanCloseRetiresWALWithoutDuplicateTables(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	o := DefaultOptions(dir)
-	o.ShardCount = 1
 	o.MemtableSize = 1 << 30
 	db, err := Open(o)
 	require.NoError(t, err)
@@ -468,7 +255,7 @@ func TestCleanCloseRetiresWALWithoutDuplicateTables(t *testing.T) {
 
 	s, err := openStorage(dir)
 	require.NoError(t, err)
-	logs, err := s.listLogs(0)
+	logs, err := s.listLogs()
 	require.NoError(t, err)
 	require.NoError(t, s.Close())
 	assert.Empty(t, logs)
@@ -517,7 +304,6 @@ func TestReadOnlyOpenDoesNotMutateRecoveryState(t *testing.T) {
 	before := fingerprintTree(t, dir)
 
 	o := DefaultOptions(dir)
-	o.ShardCount = 4
 	o.MemtableSize = 1 << 30
 	o.ReadOnly = true
 	ro, err := Open(o)
@@ -534,7 +320,6 @@ func TestReadOnlyLargeWALReplayStaysInMemory(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	writeOpts := DefaultOptions(dir)
-	writeOpts.ShardCount = 1
 	writeOpts.MemtableSize = 1 << 30
 	// The crash helper syncs the WAL before closing it. Avoid an unrelated fsync
 	// for every setup write so this recovery regression stays within the package's
@@ -593,7 +378,6 @@ func TestWALCheckpointBoundsSegmentsAndSurvivesCrash(t *testing.T) {
 
 	dir := t.TempDir()
 	o := DefaultOptions(dir)
-	o.ShardCount = 2
 	o.MemtableSize = 1 << 30
 	db, err := Open(o)
 	require.NoError(t, err)
@@ -607,13 +391,11 @@ func TestWALCheckpointBoundsSegmentsAndSurvivesCrash(t *testing.T) {
 	// segment is retired before we assert on the WAL directory.
 	db.checkpointWG.Wait()
 	require.NoError(t, db.checkpointWAL())
-	// Per-shard WALs: after a checkpoint each shard keeps exactly its one live
-	// segment and every rotated-out segment is retired.
-	for shard := 0; shard < o.ShardCount; shard++ {
-		logs, err := db.store.listLogs(shard)
-		require.NoError(t, err)
-		require.Len(t, logs, 1, "checkpoint must retire every old segment")
-	}
+	// After a checkpoint the WAL keeps exactly its one live segment and every
+	// rotated-out segment is retired.
+	logs, err := db.store.listLogs()
+	require.NoError(t, err)
+	require.Len(t, logs, 1, "checkpoint must retire every old segment")
 	db.crash()
 
 	db, err = Open(o)
@@ -637,7 +419,6 @@ func TestWALStallsWhenCheckpointLagsBehind(t *testing.T) {
 	walSegmentBytes = 4096 // small so a few writes push the live WAL over the cap
 
 	o := DefaultOptions(t.TempDir())
-	o.ShardCount = 1
 	o.MemtableSize = 1 << 30
 	o.NoSync = true
 	db, err := Open(o)
@@ -661,10 +442,9 @@ func TestWALStallsWhenCheckpointLagsBehind(t *testing.T) {
 	// maybeCheckpoint) until it is over the cap.
 	value := make([]byte, 2048)
 	walCap := walSegmentBytes * walCheckpointStallMultiple
-	sw := db.wals[0].wal
+	sw := db.wal.wal
 	for i := 0; sw.currentSize() < walCap; i++ {
 		require.NoError(t, sw.append([]walEntry{{
-			Shard: 0,
 			Kind:  walKindPut,
 			Key:   []byte(fmt.Sprintf("k%06d", i)),
 			Value: value,
@@ -712,7 +492,6 @@ func TestWALStallReleasesWithoutWaitGroup(t *testing.T) {
 	walSegmentBytes = 4096
 
 	o := DefaultOptions(t.TempDir())
-	o.ShardCount = 1
 	o.MemtableSize = 1 << 30
 	o.NoSync = true
 	db, err := Open(o)
@@ -729,10 +508,9 @@ func TestWALStallReleasesWithoutWaitGroup(t *testing.T) {
 
 	value := make([]byte, 2048)
 	walCap := walSegmentBytes * walCheckpointStallMultiple
-	sw := db.wals[0].wal
+	sw := db.wal.wal
 	for i := 0; sw.currentSize() < walCap; i++ {
 		require.NoError(t, sw.append([]walEntry{{
-			Shard: 0,
 			Kind:  walKindPut,
 			Key:   []byte(fmt.Sprintf("k%06d", i)),
 			Value: value,
@@ -794,7 +572,7 @@ func TestCompactionFileSizeTargetsAndSplitting(t *testing.T) {
 	assert.Equal(t, int64(700), cc.targetFileSize(2))
 	assert.Equal(t, int64(700), cc.targetFileSize(20))
 
-	s := newTestShard(t, 1<<30)
+	s := newTestEngine(t, 1<<30)
 	value := make([]byte, 128)
 	const entriesPerTable = 10
 	for table := 0; table < 2; table++ {
@@ -814,7 +592,7 @@ func TestCompactionFileSizeTargetsAndSplitting(t *testing.T) {
 
 func TestCompactionReadFailureKeepsInputs(t *testing.T) {
 	t.Parallel()
-	s := newTestShard(t, 1<<20)
+	s := newTestEngine(t, 1<<20)
 	flushSingle(t, s, 1, "a", "1")
 	flushSingle(t, s, 2, "b", "2")
 	before := s.Tables()
@@ -847,7 +625,7 @@ func TestCompactionReadFailureKeepsInputs(t *testing.T) {
 func TestFlushManifestFailureKeepsImmutableForRetry(t *testing.T) {
 	t.Parallel()
 	want := errors.New("manifest unavailable")
-	s := newTestShard(t, 1<<20)
+	s := newTestEngine(t, 1<<20)
 	s.cfg.Commit = func([]*tableMeta, []*tableMeta, func()) error { return want }
 	s.Put(1, []byte("old"), []byte("value"))
 	err := s.Flush()
@@ -870,7 +648,7 @@ func TestFlushManifestFailureKeepsImmutableForRetry(t *testing.T) {
 func TestCompactionManifestFailureKeepsSourceTables(t *testing.T) {
 	t.Parallel()
 	want := errors.New("manifest unavailable")
-	s := newTestShard(t, 1<<20)
+	s := newTestEngine(t, 1<<20)
 	flushSingle(t, s, 1, "a", "1")
 	flushSingle(t, s, 2, "b", "2")
 	before := s.Tables()
@@ -921,7 +699,7 @@ func TestExhaustedIteratorReleasesSequencePin(t *testing.T) {
 
 func TestCompactionDropsVersionAtRetentionBoundary(t *testing.T) {
 	t.Parallel()
-	s := newTestShard(t, 1<<20)
+	s := newTestEngine(t, 1<<20)
 	flushSingle(t, s, 1, "k", "v1")
 	flushSingle(t, s, 3, "k", "v3")
 	require.NoError(t, s.Compact(0, 3, testCompactionConfig()))
@@ -940,7 +718,7 @@ func TestCompactionDropsVersionAtRetentionBoundary(t *testing.T) {
 
 func TestCompactionDeduplicatesReplayedInternalKeys(t *testing.T) {
 	t.Parallel()
-	s := newTestShard(t, 1<<20)
+	s := newTestEngine(t, 1<<20)
 	flushSingle(t, s, 7, "k", "value")
 	flushSingle(t, s, 7, "k", "value")
 	require.NoError(t, s.Compact(0, maxIKeySeq, testCompactionConfig()))
@@ -959,7 +737,7 @@ func TestCompactionDeduplicatesReplayedInternalKeys(t *testing.T) {
 
 func TestDeepCompactionOutputCannotShadowNewerShallowTable(t *testing.T) {
 	t.Parallel()
-	s := newTestShard(t, 1<<20)
+	s := newTestEngine(t, 1<<20)
 	cc := testCompactionConfig()
 
 	// Build two old depth-1 tables.
@@ -991,7 +769,7 @@ func TestDeepCompactionOutputCannotShadowNewerShallowTable(t *testing.T) {
 
 func TestReplayedOlderMemtableEntryCannotShadowNewerTable(t *testing.T) {
 	t.Parallel()
-	s := newTestShard(t, 1<<20)
+	s := newTestEngine(t, 1<<20)
 	s.Put(10, []byte("value-key"), []byte("new"))
 	s.del(11, []byte("deleted-key"))
 	require.NoError(t, s.Flush())
@@ -1015,7 +793,7 @@ func TestReplayedOlderMemtableEntryCannotShadowNewerTable(t *testing.T) {
 
 func TestCompactAllRewritesSingleTable(t *testing.T) {
 	t.Parallel()
-	s := newTestShard(t, 1<<20)
+	s := newTestEngine(t, 1<<20)
 	s.Put(1, []byte("gone"), []byte("value"))
 	s.del(2, []byte("gone"))
 	require.NoError(t, s.Flush())
@@ -1030,25 +808,26 @@ func TestCompactAllRewritesSingleTable(t *testing.T) {
 
 func TestCloseWaitsForManualCompaction(t *testing.T) {
 	db := openTestDB(t, func(o *Options) {
-		o.ShardCount = 1
 		o.MemtableSize = 1 << 30
 		o.TierRatio = 100
 	})
 	require.NoError(t, db.Put(PutOptions{Key: []byte("a"), Value: []byte("1")}))
-	require.NoError(t, db.shards[0].Flush())
+	require.NoError(t, db.eng.Flush())
 	require.NoError(t, db.Put(PutOptions{Key: []byte("b"), Value: []byte("2")}))
-	require.NoError(t, db.shards[0].Flush())
+	require.NoError(t, db.eng.Flush())
 
-	originalCommit := db.shards[0].cfg.Commit
+	originalCommit := db.eng.cfg.Commit
 	entered := make(chan struct{})
 	release := make(chan struct{})
-	db.shards[0].cfg.Commit = func(inputs, outputs []*tableMeta, install func()) error {
-		close(entered)
-		<-release
+	db.eng.cfg.Commit = func(inputs, outputs []*tableMeta, install func()) error {
+		if len(inputs) > 0 {
+			close(entered)
+			<-release
+		}
 		return originalCommit(inputs, outputs, install)
 	}
 	compactDone := make(chan error, 1)
-	go func() { compactDone <- db.CompactShard(0) }()
+	go func() { compactDone <- db.CompactRange(nil, nil) }()
 	<-entered
 
 	closeDone := make(chan error, 1)
@@ -1071,8 +850,6 @@ func TestFailedRecoveryRemovesUnmanifestedTables(t *testing.T) {
 	// write stays only in the WAL, so any .sst that exists after recovery is a
 	// recovery output (never a pre-crash manifested table).
 	writeOpts := DefaultOptions(dir)
-	writeOpts.ShardCount = 2
-	writeOpts.Partitioner = PartitionerRange
 	writeOpts.MemtableSize = 1 << 30
 	db, err := Open(writeOpts)
 	require.NoError(t, err)
@@ -1082,19 +859,19 @@ func TestFailedRecoveryRemovesUnmanifestedTables(t *testing.T) {
 	require.NoError(t, db.Put(PutOptions{Key: []byte{0xff}, Value: []byte("right")}))
 	db.crash()
 
-	// Corrupt shard 1's WAL segment so recovery of shard 1 fails; keep the original
-	// bytes to restore for the successful reopen. Under StrictWALRecovery the
-	// corruption aborts Open, and shard 0's recovery tables (flushed during replay,
-	// not yet in a manifest) must be rolled back.
+	// Corrupt the WAL segment so recovery fails; keep the original bytes to restore
+	// for the successful reopen. Under StrictWALRecovery the corruption aborts Open,
+	// and recovery tables (flushed during replay, not yet in a manifest) must be
+	// rolled back.
 	s, err := openStorage(dir)
 	require.NoError(t, err)
-	logs1, err := s.listLogs(1)
+	logs, err := s.listLogs()
 	require.NoError(t, err)
-	require.NotEmpty(t, logs1, "shard 1 must have a leftover WAL segment")
-	seg1, err := s.logPath(1, logs1[0])
+	require.NotEmpty(t, logs, "there must be a leftover WAL segment")
+	seg, err := s.logPath(logs[0])
 	require.NoError(t, err)
 	require.NoError(t, s.Close())
-	orig, err := os.ReadFile(seg1)
+	orig, err := os.ReadFile(seg)
 	require.NoError(t, err)
 	require.Greater(t, len(orig), headerSize, "segment must hold a full record to corrupt")
 	// Flip a byte in the record body (past the 7-byte chunk header) so the frame
@@ -1102,11 +879,11 @@ func TestFailedRecoveryRemovesUnmanifestedTables(t *testing.T) {
 	// strict recovery still tolerates).
 	corrupt := append([]byte(nil), orig...)
 	corrupt[len(corrupt)-1] ^= 0xff
-	require.NoError(t, os.WriteFile(seg1, corrupt, 0o644))
+	require.NoError(t, os.WriteFile(seg, corrupt, 0o644))
 
-	// Recovery session: a tiny memtable so shard 0's replay flushes tables before
-	// shard 1's corrupt segment aborts the Open. StrictWALRecovery makes the
-	// corruption fail rather than salvage.
+	// Recovery session: a tiny memtable so replay flushes tables before the
+	// corrupt record aborts the Open. StrictWALRecovery makes the corruption fail
+	// rather than salvage.
 	recOpts := writeOpts
 	recOpts.MemtableSize = 256
 	recOpts.StrictWALRecovery = true
@@ -1114,7 +891,7 @@ func TestFailedRecoveryRemovesUnmanifestedTables(t *testing.T) {
 	require.Error(t, err)
 
 	var tables []string
-	require.NoError(t, filepath.WalkDir(filepath.Join(dir, shardsDir), func(path string, entry os.DirEntry, walkErr error) error {
+	require.NoError(t, filepath.WalkDir(dir, func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
@@ -1125,8 +902,8 @@ func TestFailedRecoveryRemovesUnmanifestedTables(t *testing.T) {
 	}))
 	assert.Empty(t, tables, "recovery outputs without a manifest must be rolled back")
 
-	// Restore the uncorrupted segment; the reopen now recovers both shards.
-	require.NoError(t, os.WriteFile(seg1, orig, 0o644))
+	// Restore the uncorrupted segment; the reopen now recovers successfully.
+	require.NoError(t, os.WriteFile(seg, orig, 0o644))
 	db, err = Open(recOpts)
 	require.NoError(t, err)
 	defer db.Close()
@@ -1155,7 +932,6 @@ func TestReadOnlyLocksAreSharedAndExcludeWriter(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	opts := DefaultOptions(dir)
-	opts.ShardCount = 1
 	db, err := Open(opts)
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
@@ -1178,52 +954,18 @@ func TestReadOnlyLocksAreSharedAndExcludeWriter(t *testing.T) {
 	require.NoError(t, db.Close())
 }
 
-type invalidShardPartitioner struct{ shard int }
-
-func (p invalidShardPartitioner) Shard([]byte, int) int { return p.shard }
-func (invalidShardPartitioner) Name() string            { return "invalid-shard-test-v1" }
-
-func TestInvalidCustomPartitionerReturnsErrorsOnEveryPointAPI(t *testing.T) {
-	t.Parallel()
-	for _, shard := range []int{-1, 2} {
-		t.Run(fmt.Sprintf("shard-%d", shard), func(t *testing.T) {
-			opts := DefaultOptions(t.TempDir())
-			opts.ShardCount = 2
-			opts.CustomPartitioner = invalidShardPartitioner{shard: shard}
-			db, err := Open(opts)
-			require.NoError(t, err)
-			defer db.Close()
-
-			assert.ErrorContains(t, db.Put(PutOptions{Key: []byte("k"), Value: []byte("v")}), "partitioner returned shard")
-			_, err = db.Get([]byte("k"))
-			assert.ErrorContains(t, err, "partitioner returned shard")
-			_, err = db.Has([]byte("k"))
-			assert.ErrorContains(t, err, "partitioner returned shard")
-			snap, err := db.Snapshot()
-			require.NoError(t, err)
-			defer snap.Release()
-			_, err = snap.Get([]byte("k"))
-			assert.ErrorContains(t, err, "partitioner returned shard")
-			_, err = snap.Has([]byte("k"))
-			assert.ErrorContains(t, err, "partitioner returned shard")
-		})
-	}
-}
-
 func TestWritableOpenRemovesOnlyOrphanCanonicalTables(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	opts := DefaultOptions(dir)
-	opts.ShardCount = 1
 	db, err := Open(opts)
 	require.NoError(t, err)
 	require.NoError(t, db.Put(PutOptions{Key: []byte("live"), Value: []byte("value")}))
 	require.NoError(t, db.Close())
 
-	shardDir := filepath.Join(dir, shardsDir, "00")
-	orphan := filepath.Join(shardDir, "00fffffe.sst")
-	nonCanonical := filepath.Join(shardDir, "00FFFFFD.sst")
-	unrelated := filepath.Join(shardDir, "keep.tmp")
+	orphan := filepath.Join(dir, "00fffffe.sst")
+	nonCanonical := filepath.Join(dir, "00FFFFFD.sst")
+	unrelated := filepath.Join(dir, "keep.tmp")
 	require.NoError(t, os.WriteFile(orphan, []byte("orphan"), 0o644))
 	require.NoError(t, os.WriteFile(nonCanonical, []byte("not-engine-owned"), 0o644))
 	require.NoError(t, os.WriteFile(unrelated, []byte("not-engine-owned"), 0o644))
@@ -1243,14 +985,11 @@ func TestReadOnlyOpenPreservesOrphanTables(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	opts := DefaultOptions(dir)
-	opts.ShardCount = 1
 	db, err := Open(opts)
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 
-	shardDir, err := db.store.shardDir(0)
-	require.NoError(t, err)
-	orphan := filepath.Join(shardDir, "00fffffe.sst")
+	orphan := filepath.Join(db.store.dir, "00fffffe.sst")
 	require.NoError(t, os.WriteFile(orphan, []byte("orphan"), 0o644))
 
 	opts.ReadOnly = true
@@ -1262,16 +1001,15 @@ func TestReadOnlyOpenPreservesOrphanTables(t *testing.T) {
 
 func TestFlushWorkerDrainsMemtableFilledDuringActiveFlush(t *testing.T) {
 	db := openTestDB(t, func(o *Options) {
-		o.ShardCount = 1
 		o.MemtableSize = 1
 		o.TierRatio = 100
 	})
 
-	originalCommit := db.shards[0].cfg.Commit
+	originalCommit := db.eng.cfg.Commit
 	entered := make(chan struct{})
 	release := make(chan struct{})
 	var once sync.Once
-	db.shards[0].cfg.Commit = func(inputs, outputs []*tableMeta, install func()) error {
+	db.eng.cfg.Commit = func(inputs, outputs []*tableMeta, install func()) error {
 		once.Do(func() {
 			close(entered)
 			<-release
@@ -1285,23 +1023,6 @@ func TestFlushWorkerDrainsMemtableFilledDuringActiveFlush(t *testing.T) {
 	close(release)
 	db.sched.drain()
 
-	assert.True(t, db.shards[0].memEmpty(), "worker must drain the over-limit replacement memtable without a third write")
-	assert.Len(t, db.shards[0].Tables(), 2)
-}
-
-func TestLegacyUnversionedPartitionerIdentityIsRejected(t *testing.T) {
-	t.Parallel()
-	dir := t.TempDir()
-	store, err := openStorage(dir)
-	require.NoError(t, err)
-	manifest, err := createManifest(store.manifestPath(1), "hash", 1)
-	require.NoError(t, err)
-	require.NoError(t, manifest.Close())
-	require.NoError(t, store.setCurrent(1))
-	require.NoError(t, store.Close())
-
-	opts := DefaultOptions(dir)
-	opts.ShardCount = 1
-	_, err = Open(opts)
-	assert.ErrorIs(t, err, ErrPartitionerMismatch)
+	assert.True(t, db.eng.memEmpty(), "worker must drain the over-limit replacement memtable without a third write")
+	assert.Len(t, db.eng.Tables(), 2)
 }

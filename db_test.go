@@ -15,7 +15,6 @@ import (
 func openTestDB(t *testing.T, mutate func(*Options)) *DB {
 	t.Helper()
 	o := DefaultOptions(t.TempDir())
-	o.ShardCount = 2      // 2 exercises multi-shard paths while keeping per-shard WAL open/flush cost low in the shared test helper
 	o.MemtableSize = 1024 // small, to exercise flush
 	o.NoSync = true       // logical tests do not need durable fsyncs; keeps them fast
 	// Skip compression by default: logic tests do not need it and zstd/s2 CPU
@@ -63,7 +62,7 @@ func TestOverwrite(t *testing.T) {
 	assert.Equal(t, []byte("v2"), v)
 }
 
-func TestManyKeysAcrossShardsAndFlush(t *testing.T) {
+func TestManyKeysAndFlush(t *testing.T) {
 	t.Parallel()
 	db := openTestDB(t, func(o *Options) { o.MemtableSize = 4096 })
 
@@ -160,13 +159,12 @@ func TestEmptyKeyRejected(t *testing.T) {
 func TestReadOnlyRejectsWrites(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	db, err := Open(func() Options { o := DefaultOptions(dir); o.ShardCount = 2; return o }())
+	db, err := Open(DefaultOptions(dir))
 	require.NoError(t, err)
 	require.NoError(t, db.Put(PutOptions{Key: []byte("k"), Value: []byte("v")}))
 	require.NoError(t, db.Close())
 
 	ro := DefaultOptions(dir)
-	ro.ShardCount = 2
 	ro.ReadOnly = true
 	rodb, err := Open(ro)
 	require.NoError(t, err)
@@ -184,7 +182,6 @@ func TestReopenRestoresData(t *testing.T) {
 	dir := t.TempDir()
 	open := func() *DB {
 		o := DefaultOptions(dir)
-		o.ShardCount = 4
 		o.MemtableSize = 1024
 		o.NoSync = true // reopen/restore test; durability fsync not under test
 		o.FreshCodec = CodecNone
@@ -208,32 +205,6 @@ func TestReopenRestoresData(t *testing.T) {
 		require.NoError(t, err, i)
 		assert.Equal(t, []byte(fmt.Sprintf("v%d", i)), v)
 	}
-}
-
-func TestPartitionerMismatchRejected(t *testing.T) {
-	t.Parallel()
-	dir := t.TempDir()
-	o := DefaultOptions(dir)
-	o.ShardCount = 4
-	o.Partitioner = PartitionerHash
-	o.MemtableSize = 128
-	db, err := Open(o)
-	require.NoError(t, err)
-	require.NoError(t, db.Put(PutOptions{Key: []byte("k"), Value: []byte("v")}))
-	require.NoError(t, db.Close())
-
-	// Reopen with a different partitioner must fail loudly.
-	o2 := DefaultOptions(dir)
-	o2.ShardCount = 4
-	o2.Partitioner = PartitionerRange
-	_, err = Open(o2)
-	assert.ErrorIs(t, err, ErrPartitionerMismatch)
-
-	// Different shard count also rejected.
-	o3 := DefaultOptions(dir)
-	o3.ShardCount = 8
-	_, err = Open(o3)
-	assert.ErrorIs(t, err, ErrPartitionerMismatch)
 }
 
 func TestWriteEmptyBatchIsNoOp(t *testing.T) {
@@ -319,7 +290,6 @@ func TestConcurrentWrites(t *testing.T) {
 func benchDB(b *testing.B) *DB {
 	b.Helper()
 	o := DefaultOptions(b.TempDir())
-	o.ShardCount = 8
 	o.MemtableSize = 4 << 20
 	db, err := Open(o)
 	require.NoError(b, err)
@@ -356,36 +326,6 @@ func BenchmarkPutSequential(b *testing.B) {
 		if err := db.Put(PutOptions{Key: seqKey(i), Value: val}); err != nil {
 			b.Fatal(err)
 		}
-	}
-}
-
-// BenchmarkPutBatchedShardCount isolates the per-key partitioner cost on the
-// write path across shard counts. With ShardCount==1 the partitioner is skipped
-// entirely (every key maps to shard 0), so this quantifies that fast path.
-func BenchmarkPutBatchedShardCount(b *testing.B) {
-	val := make([]byte, 100)
-	const batchSize = 100
-	for _, shards := range []int{1, 8, 32} {
-		b.Run(fmt.Sprintf("shards=%d", shards), func(b *testing.B) {
-			o := DefaultOptions(b.TempDir())
-			o.ShardCount = shards
-			o.MemtableSize = 4 << 20
-			o.NoSync = true
-			db, err := Open(o)
-			require.NoError(b, err)
-			b.Cleanup(func() { db.Close() })
-
-			b.ResetTimer()
-			for i := 0; i < b.N; i += batchSize {
-				var batch Batch
-				for j := 0; j < batchSize && i+j < b.N; j++ {
-					batch.Put(PutOptions{Key: seqKey(i + j), Value: val})
-				}
-				if err := db.Write(&batch); err != nil {
-					b.Fatal(err)
-				}
-			}
-		})
 	}
 }
 
@@ -491,8 +431,8 @@ func BenchmarkIteratorScan(b *testing.B) {
 	}
 }
 
-// benchDefaultsDB opens a database with the exact DefaultOptions (8 shards,
-// 2 MiB memtable, durable per-batch fsync, s2/zstd codecs, 256 MiB cache) so the
+// benchDefaultsDB opens a database with the exact DefaultOptions (2 MiB
+// memtable, durable per-batch fsync, s2/zstd codecs, 256 MiB cache) so the
 // benchmarks below report real out-of-the-box performance.
 func benchDefaultsDB(b *testing.B) *DB {
 	b.Helper()
@@ -628,64 +568,9 @@ func TestIteratorsAfterCloseFail(t *testing.T) {
 	assert.ErrorIs(t, err, ErrClosed)
 }
 
-func TestCompactShard(t *testing.T) {
-	t.Parallel()
-	// One shard so every key lands there and CompactShard(0) compacts it all.
-	db := openTestDB(t, func(o *Options) {
-		o.ShardCount = 1
-		o.MemtableSize = 256
-	})
-	for gen := 0; gen < 2; gen++ {
-		for i := 0; i < 40; i++ {
-			require.NoError(t, db.Put(PutOptions{Key: []byte(fmt.Sprintf("k%03d", i)), Value: []byte(fmt.Sprintf("v%d", gen))}))
-		}
-	}
-	for i := 0; i < 20; i++ {
-		require.NoError(t, db.Delete([]byte(fmt.Sprintf("k%03d", i))))
-	}
-	db.sched.drain()
-
-	before, err := db.Stats()
-	require.NoError(t, err)
-	require.NoError(t, db.CompactShard(0))
-	after, err := db.Stats()
-	require.NoError(t, err)
-	assert.LessOrEqual(t, after.TablesSize, before.TablesSize)
-
-	// Survivors readable, deleted gone.
-	for i := 20; i < 40; i++ {
-		v, err := db.Get([]byte(fmt.Sprintf("k%03d", i)))
-		require.NoError(t, err, i)
-		assert.Equal(t, []byte("v1"), v)
-	}
-	for i := 0; i < 20; i++ {
-		_, err := db.Get([]byte(fmt.Sprintf("k%03d", i)))
-		assert.ErrorIs(t, err, ErrNotFound, i)
-	}
-}
-
-func TestCompactShardErrors(t *testing.T) {
-	t.Parallel()
-	db := openTestDB(t, func(o *Options) { o.ShardCount = 4 })
-	require.NoError(t, db.Put(PutOptions{Key: []byte("k"), Value: []byte("v")}))
-
-	// Out-of-range shard indices.
-	assert.Error(t, db.CompactShard(-1))
-	assert.Error(t, db.CompactShard(4))
-	assert.Error(t, db.CompactShard(100))
-
-	// In-range and range form both succeed.
-	require.NoError(t, db.CompactShard(0))
-	require.NoError(t, db.CompactShardRange(1, []byte("a"), []byte("z")))
-
-	require.NoError(t, db.Close())
-	assert.ErrorIs(t, db.CompactShard(0), ErrClosed)
-}
-
 func TestCompactRange(t *testing.T) {
 	t.Parallel()
 	db := openTestDB(t, func(o *Options) {
-		o.ShardCount = 1
 		o.MemtableSize = 256
 	})
 
@@ -739,7 +624,7 @@ func TestHas(t *testing.T) {
 	require.NoError(t, db.Put(PutOptions{Key: []byte("flushed"), Value: []byte("v")}))
 	db.sched.drain() // push at least one key into an on-disk table
 
-	// Present in a table (Has exercises the shard's table path).
+	// Present in a table (Has exercises the on-disk table path).
 	has, err := db.Has([]byte("flushed"))
 	require.NoError(t, err)
 	assert.True(t, has)
@@ -797,23 +682,22 @@ func TestDBWithSmallFDLimit(t *testing.T) {
 
 func TestWriteBackpressureSlowdownRecordsStall(t *testing.T) {
 	t.Parallel()
-	// One shard, tiny slowdown threshold, high stop and TierRatio so compaction
-	// does not fire and depth-0 tables accumulate deterministically.
+	// Tiny slowdown threshold, high stop and TierRatio so compaction does not fire
+	// and depth-0 tables accumulate deterministically.
 	db := openTestDB(t, func(o *Options) {
-		o.ShardCount = 1
 		o.MemtableSize = 256
 		o.TierRatio = 1000
 		o.L0SlowdownTables = 3
 		o.L0StopTables = 1000
 	})
 
-	// Create several depth-0 tables (write straight to the shard so the setup
+	// Create several depth-0 tables (write straight to the engine so the setup
 	// itself is not throttled).
 	for i := 0; i < 6; i++ {
-		db.shards[0].Put(uint64(i+1), []byte(fmt.Sprintf("k%04d", i)), []byte("v"))
-		require.NoError(t, db.shards[0].Flush())
+		db.eng.Put(uint64(i+1), []byte(fmt.Sprintf("k%04d", i)), []byte("v"))
+		require.NoError(t, db.eng.Flush())
 	}
-	require.GreaterOrEqual(t, db.shards[0].depth0Count(), db.opts.L0SlowdownTables,
+	require.GreaterOrEqual(t, db.eng.depth0Count(), db.opts.L0SlowdownTables,
 		"enough fresh-tier tables to trigger slowdown")
 
 	before := db.metrics.writeStalls.Load()
@@ -827,23 +711,22 @@ func TestWriteBackpressureSlowdownRecordsStall(t *testing.T) {
 
 func TestWriteBackpressureHardStopReleasesAfterDrain(t *testing.T) {
 	t.Parallel()
-	// A pre-filled shard sits above the hard-stop mark; a writer must block until
+	// A pre-filled engine sits above the hard-stop mark; a writer must block until
 	// a background drain pulls the fresh tier below stop, then proceed. Proves the
 	// stop path both engages and releases (no deadlock).
 	db := openTestDB(t, func(o *Options) {
-		o.ShardCount = 1
 		o.MemtableSize = 256
 		o.TierRatio = 1000 // do not auto-compact; we drain manually
 		o.L0SlowdownTables = 3
 		o.L0StopTables = 4
 	})
-	// Build 5 depth-0 tables (>= stop) by writing straight to the shard, which
+	// Build 5 depth-0 tables (>= stop) by writing straight to the engine, which
 	// bypasses the throttle so the precondition itself does not block.
 	for i := 0; i < 5; i++ {
-		db.shards[0].Put(uint64(i+1), []byte(fmt.Sprintf("k%04d", i)), []byte("v"))
-		require.NoError(t, db.shards[0].Flush())
+		db.eng.Put(uint64(i+1), []byte(fmt.Sprintf("k%04d", i)), []byte("v"))
+		require.NoError(t, db.eng.Flush())
 	}
-	require.GreaterOrEqual(t, db.shards[0].depth0Count(), db.opts.L0StopTables)
+	require.GreaterOrEqual(t, db.eng.depth0Count(), db.opts.L0StopTables)
 
 	// Release the writer shortly after it blocks by compacting the fresh tier
 	// down to one deeper table (depth-0 count -> 0).
@@ -851,7 +734,7 @@ func TestWriteBackpressureHardStopReleasesAfterDrain(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 		retain, cc, release, err := db.compactionRunConfig(false)
 		if err == nil {
-			_ = db.shards[0].CompactAll(retain, cc)
+			_ = db.eng.CompactAll(retain, cc)
 			release()
 		}
 	}()
@@ -872,24 +755,23 @@ func TestWriteBackpressureHardStopReleasesAfterDrain(t *testing.T) {
 }
 
 // TestWriteBackpressureFailsFastOnBackgroundError is a regression test: when a
-// shard is past the hard-stop mark AND background compaction is permanently
+// the engine is past the hard-stop mark AND background compaction is permanently
 // poisoned, a write must fail fast with the background error rather than
-// livelock forever in the throttle loop (the shard will never drain).
+// livelock forever in the throttle loop (the engine will never drain).
 func TestWriteBackpressureFailsFastOnBackgroundError(t *testing.T) {
 	t.Parallel()
 	db := openTestDB(t, func(o *Options) {
-		o.ShardCount = 1
 		o.MemtableSize = 256
 		o.TierRatio = 1000 // no auto-compaction to drain the tier
 		o.L0SlowdownTables = 3
 		o.L0StopTables = 4
 	})
-	// Fill the shard past the hard-stop mark (bypassing the throttle).
+	// Fill the engine past the hard-stop mark (bypassing the throttle).
 	for i := 0; i < 5; i++ {
-		db.shards[0].Put(uint64(i+1), []byte(fmt.Sprintf("k%04d", i)), []byte("v"))
-		require.NoError(t, db.shards[0].Flush())
+		db.eng.Put(uint64(i+1), []byte(fmt.Sprintf("k%04d", i)), []byte("v"))
+		require.NoError(t, db.eng.Flush())
 	}
-	require.GreaterOrEqual(t, db.shards[0].depth0Count(), db.opts.L0StopTables)
+	require.GreaterOrEqual(t, db.eng.depth0Count(), db.opts.L0StopTables)
 
 	// Poison background work so the tier can never drain below stop.
 	db.setBackgroundError(errFailWrite)
@@ -911,7 +793,6 @@ func TestWriteBackpressureFailsFastOnBackgroundError(t *testing.T) {
 func TestTombstoneTriggerNoLivelockWithHeldSnapshot(t *testing.T) {
 	t.Parallel()
 	db := openTestDB(t, func(o *Options) {
-		o.ShardCount = 1
 		o.MemtableSize = 256
 		o.TierRatio = 1000               // count trigger off
 		o.TombstoneCompactionRatio = 0.5 // tombstone trigger on
@@ -990,10 +871,9 @@ func TestBatchTooLargeRejected(t *testing.T) {
 	maxEntrySize = 4096
 	t.Cleanup(func() { maxEntrySize = orig })
 
-	// One shard so all ops accumulate into one memtable.
-	db := openTestDB(t, func(o *Options) { o.ShardCount = 1 })
+	db := openTestDB(t, nil)
 
-	// Several ops each under the per-entry limit but together over it for the shard.
+	// Several ops each under the per-entry limit but together over the batch limit.
 	each := maxEntrySize / 2 // 2 ops already exceed the limit
 	var b Batch
 	for i := 0; i < 4; i++ {
@@ -1007,7 +887,7 @@ func TestBatchTooLargeRejected(t *testing.T) {
 		assert.ErrorIs(t, err, ErrNotFound, "op %d must not apply from a rejected batch", i)
 	}
 
-	// A batch that stays within the per-shard limit still applies.
+	// A batch that stays within the limit still applies.
 	var ok Batch
 	ok.Put(PutOptions{Key: []byte("a"), Value: []byte("v")})
 	require.NoError(t, db.Write(&ok))

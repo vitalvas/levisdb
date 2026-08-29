@@ -29,14 +29,13 @@ func TestOpenMissingManifestErrors(t *testing.T) {
 	require.NoError(t, os.Remove(s.manifestPath(num)))
 	require.NoError(t, s.Close())
 
-	_, err = Open(func() Options { o := DefaultOptions(dir); o.ShardCount = 4; return o }())
+	_, err = Open(DefaultOptions(dir))
 	require.Error(t, err)
 }
 
 func openAt(t *testing.T, dir string, memSize int64) *DB {
 	t.Helper()
 	o := DefaultOptions(dir)
-	o.ShardCount = 4
 	o.MemtableSize = memSize
 	// Skip compression to keep recovery tests fast; blocks record their own codec
 	// id, so reopening data written with any codec still reads correctly.
@@ -154,41 +153,22 @@ func TestRestoreTablesMissingFileErrors(t *testing.T) {
 	// Delete one .sst table the manifest references; reopen must fail because
 	// restoreTables cannot open the missing table file.
 	removed := false
-	shards := filepath.Join(dir, "shards")
-	shardDirs, err := os.ReadDir(shards)
+	data := dir
+	files, err := os.ReadDir(data)
 	require.NoError(t, err)
-	for _, sd := range shardDirs {
-		files, err := os.ReadDir(filepath.Join(shards, sd.Name()))
-		require.NoError(t, err)
-		for _, f := range files {
-			if filepath.Ext(f.Name()) == ".sst" {
-				require.NoError(t, os.Remove(filepath.Join(shards, sd.Name(), f.Name())))
-				removed = true
-				break
-			}
-		}
-		if removed {
+	for _, f := range files {
+		if filepath.Ext(f.Name()) == ".sst" {
+			require.NoError(t, os.Remove(filepath.Join(data, f.Name())))
+			removed = true
 			break
 		}
 	}
 	require.True(t, removed, "expected at least one flushed .sst table")
 
 	o := DefaultOptions(dir)
-	o.ShardCount = 4
 	o.MemtableSize = 512
 	_, err = Open(o)
 	assert.Error(t, err)
-}
-
-func TestRecoverWALSkipsOutOfRangeShard(t *testing.T) {
-	t.Parallel()
-	db := openTestDB(t, nil)
-	// Shard index out of range and negative are guarded and skipped; in-range
-	// entries still apply.
-	shardLogs := [][]uint32{}
-	seq, err := db.recoverWAL(shardLogs, 0)
-	require.NoError(t, err)
-	assert.Equal(t, uint64(0), seq)
 }
 
 func TestRecoverSecondCrashPreservesRecovered(t *testing.T) {
@@ -237,7 +217,7 @@ func TestOpenCorruptManifestErrors(t *testing.T) {
 	require.NoError(t, jw.Write([]byte{0x7f})) // unknown manifest tag
 	require.NoError(t, jw.Flush())
 
-	_, err = Open(func() Options { o := DefaultOptions(dir); o.ShardCount = 4; return o }())
+	_, err = Open(DefaultOptions(dir))
 	require.Error(t, err)
 }
 
@@ -249,33 +229,22 @@ func mustCreate(t *testing.T, path string) *os.File {
 	return f
 }
 
-// firstShardLog scans shards [0,count) for exactly one leftover WAL segment and
-// returns its shard index and segment number. Recovery tests write a single key
-// then need to locate the WAL segment it landed in, wherever the key hashed.
-func firstShardLog(t *testing.T, s *storageT, count int) (int, uint32) {
+// firstLog returns the first leftover WAL segment number. Recovery tests write a
+// single key then need to locate the WAL segment it landed in.
+func firstLog(t *testing.T, s *storageT) uint32 {
 	t.Helper()
-	for shard := 0; shard < count; shard++ {
-		logs, err := s.listLogs(shard)
-		require.NoError(t, err)
-		if len(logs) > 0 {
-			return shard, logs[0]
-		}
-	}
-	t.Fatal("no leftover WAL segment found")
-	return 0, 0
+	logs, err := s.listLogs()
+	require.NoError(t, err)
+	require.NotEmpty(t, logs, "no leftover WAL segment found")
+	return logs[0]
 }
 
-// allShardLogs collects every shard's leftover WAL segment numbers. WAL
-// retirement is now per shard, so retention tests assert against the union.
-func allShardLogs(t *testing.T, s *storageT, count int) []uint32 {
+// allLogs collects the leftover WAL segment numbers.
+func allLogs(t *testing.T, s *storageT) []uint32 {
 	t.Helper()
-	var all []uint32
-	for shard := 0; shard < count; shard++ {
-		logs, err := s.listLogs(shard)
-		require.NoError(t, err)
-		all = append(all, logs...)
-	}
-	return all
+	logs, err := s.listLogs()
+	require.NoError(t, err)
+	return logs
 }
 
 func TestRecoverWALDecodeErrorPropagates(t *testing.T) {
@@ -290,8 +259,8 @@ func TestRecoverWALDecodeErrorPropagates(t *testing.T) {
 	// (too short) to the leftover WAL, so recoverWAL's decode fails on reopen.
 	s, err := openStorage(dir)
 	require.NoError(t, err)
-	shard, num := firstShardLog(t, s, 4)
-	logPath, err := s.logPath(shard, num)
+	num := firstLog(t, s)
+	logPath, err := s.logPath(num)
 	require.NoError(t, err)
 	require.NoError(t, s.Close())
 
@@ -305,7 +274,6 @@ func TestRecoverWALDecodeErrorPropagates(t *testing.T) {
 	// Strict recovery rejects the undecodable record.
 	_, err = Open(func() Options {
 		o := DefaultOptions(dir)
-		o.ShardCount = 4
 		o.StrictWALRecovery = true
 		return o
 	}())
@@ -322,8 +290,8 @@ func TestLenientRecoveryKeepsPrefixBeforeCorruption(t *testing.T) {
 	// Append an undecodable (well-framed, bad payload) record after the good one.
 	s, err := openStorage(dir)
 	require.NoError(t, err)
-	shard, num := firstShardLog(t, s, 4)
-	logPath, err := s.logPath(shard, num)
+	num := firstLog(t, s)
+	logPath, err := s.logPath(num)
 	require.NoError(t, err)
 	require.NoError(t, s.Close())
 	f, err := os.OpenFile(logPath, os.O_RDWR|os.O_APPEND, 0o644)
@@ -334,7 +302,7 @@ func TestLenientRecoveryKeepsPrefixBeforeCorruption(t *testing.T) {
 	require.NoError(t, f.Close())
 
 	// Lenient (default) recovery opens successfully and keeps the intact prefix.
-	db2, err := Open(func() Options { o := DefaultOptions(dir); o.ShardCount = 4; return o }())
+	db2, err := Open(DefaultOptions(dir))
 	require.NoError(t, err)
 	defer db2.Close()
 	v, err := db2.Get([]byte("good"))
@@ -346,7 +314,6 @@ func TestRecoverWALRejectsSequenceRegressionAcrossSegments(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	opts := DefaultOptions(dir)
-	opts.ShardCount = 1
 	opts.MemtableSize = 1 << 30
 	opts.StrictWALRecovery = true // reject corruption instead of recovering the prefix
 	db, err := Open(opts)
@@ -355,7 +322,7 @@ func TestRecoverWALRejectsSequenceRegressionAcrossSegments(t *testing.T) {
 
 	s, err := openStorage(dir)
 	require.NoError(t, err)
-	logs, err := s.listLogs(0)
+	logs, err := s.listLogs()
 	require.NoError(t, err)
 	require.Len(t, logs, 1)
 	writeSegment := func(path string, seq uint64) {
@@ -363,7 +330,6 @@ func TestRecoverWALRejectsSequenceRegressionAcrossSegments(t *testing.T) {
 		require.NoError(t, err)
 		jw := newJournalWriter(f)
 		require.NoError(t, jw.Write(encodeBatch(nil, seq, []walEntry{{
-			Shard: 0,
 			Kind:  walKindPut,
 			Key:   []byte{byte(seq)},
 			Value: []byte("v"),
@@ -372,9 +338,9 @@ func TestRecoverWALRejectsSequenceRegressionAcrossSegments(t *testing.T) {
 		require.NoError(t, f.Sync())
 		require.NoError(t, f.Close())
 	}
-	seg0, err := s.logPath(0, logs[0])
+	seg0, err := s.logPath(logs[0])
 	require.NoError(t, err)
-	seg1, err := s.logPath(0, logs[0]+1)
+	seg1, err := s.logPath(logs[0] + 1)
 	require.NoError(t, err)
 	writeSegment(seg0, 2)
 	writeSegment(seg1, 1)
@@ -384,61 +350,35 @@ func TestRecoverWALRejectsSequenceRegressionAcrossSegments(t *testing.T) {
 	assert.ErrorContains(t, err, "non-increasing sequence")
 }
 
+// TestRecoverWALRejectsImpossibleKeyMetadata: a valid-CRC record whose contents
+// are logically impossible (an empty key) is a semantic corruption signal and
+// must fail Open even in lenient mode.
 func TestRecoverWALRejectsImpossibleKeyMetadata(t *testing.T) {
 	t.Parallel()
-	for _, tc := range []struct {
-		name  string
-		entry walEntry
-		want  string
-	}{
-		{
-			name:  "empty key",
-			entry: walEntry{Shard: 0, Kind: walKindPut, Value: []byte("v")},
-			want:  "empty key",
-		},
-		{
-			name:  "wrong shard",
-			entry: walEntry{Shard: 0, Kind: walKindPut, Key: []byte("b"), Value: []byte("v")},
-			want:  "key belongs to shard",
-		},
-		{
-			// A record naming a shard other than the one that owns the segment is
-			// rejected by the per-shard ownership check (shard 99 does not match the
-			// shard-0 segment it was written into).
-			name:  "out-of-range shard",
-			entry: walEntry{Shard: 99, Kind: walKindPut, Key: []byte("a"), Value: []byte("v")},
-			want:  "segment holds record for shard",
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			dir := t.TempDir()
-			opts := DefaultOptions(dir)
-			opts.ShardCount = 2
-			db, err := Open(opts)
-			require.NoError(t, err)
-			db.crash()
+	dir := t.TempDir()
+	opts := DefaultOptions(dir)
+	db, err := Open(opts)
+	require.NoError(t, err)
+	db.crash()
 
-			s, err := openStorage(dir)
-			require.NoError(t, err)
-			// The crafted batch names shard 0, so overwrite shard 0's segment.
-			logs, err := s.listLogs(0)
-			require.NoError(t, err)
-			require.Len(t, logs, 1)
-			logPath, err := s.logPath(0, logs[0])
-			require.NoError(t, err)
-			f, err := os.OpenFile(logPath, os.O_RDWR|os.O_TRUNC, 0o644)
-			require.NoError(t, err)
-			jw := newJournalWriter(f)
-			require.NoError(t, jw.Write(encodeBatch(nil, 1, []walEntry{tc.entry})))
-			require.NoError(t, jw.Flush())
-			require.NoError(t, f.Sync())
-			require.NoError(t, f.Close())
-			require.NoError(t, s.Close())
+	s, err := openStorage(dir)
+	require.NoError(t, err)
+	logs, err := s.listLogs()
+	require.NoError(t, err)
+	require.Len(t, logs, 1)
+	logPath, err := s.logPath(logs[0])
+	require.NoError(t, err)
+	f, err := os.OpenFile(logPath, os.O_RDWR|os.O_TRUNC, 0o644)
+	require.NoError(t, err)
+	jw := newJournalWriter(f)
+	require.NoError(t, jw.Write(encodeBatch(nil, 1, []walEntry{{Kind: walKindPut, Value: []byte("v")}})))
+	require.NoError(t, jw.Flush())
+	require.NoError(t, f.Sync())
+	require.NoError(t, f.Close())
+	require.NoError(t, s.Close())
 
-			_, err = Open(opts)
-			assert.ErrorContains(t, err, tc.want)
-		})
-	}
+	_, err = Open(opts)
+	assert.ErrorContains(t, err, "empty key")
 }
 
 func TestOpenCorruptTableFileErrors(t *testing.T) {
@@ -456,20 +396,19 @@ func TestOpenCorruptTableFileErrors(t *testing.T) {
 	s, err := openStorage(dir)
 	require.NoError(t, err)
 	corrupted := false
-	for shard := 0; shard < 4 && !corrupted; shard++ {
-		d, derr := s.shardDir(shard)
-		require.NoError(t, derr)
-		entries, _ := os.ReadDir(d)
-		for _, e := range entries {
-			require.NoError(t, os.WriteFile(filepath.Join(d, e.Name()), []byte("garbage"), 0o644))
-			corrupted = true
-			break
+	entries, _ := os.ReadDir(s.dir)
+	for _, e := range entries {
+		if filepath.Ext(e.Name()) != tableSuffix {
+			continue
 		}
+		require.NoError(t, os.WriteFile(filepath.Join(s.dir, e.Name()), []byte("garbage"), 0o644))
+		corrupted = true
+		break
 	}
 	require.NoError(t, s.Close())
 	require.True(t, corrupted, "expected at least one table file to corrupt")
 
-	_, err = Open(func() Options { o := DefaultOptions(dir); o.ShardCount = 4; return o }())
+	_, err = Open(DefaultOptions(dir))
 	require.Error(t, err)
 }
 
@@ -477,17 +416,16 @@ func TestOpenRejectsManifestTableSizeMismatch(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	opts := DefaultOptions(dir)
-	opts.ShardCount = 1
 	db, err := Open(opts)
 	require.NoError(t, err)
 	require.NoError(t, db.Put(PutOptions{Key: []byte("key"), Value: []byte("value")}))
 	require.NoError(t, db.Close())
 
-	shardDir := filepath.Join(dir, shardsDir, "00")
-	files, err := os.ReadDir(shardDir)
+	data := dir
+	files, err := os.ReadDir(data)
 	require.NoError(t, err)
 	require.NotEmpty(t, files)
-	tablePath := filepath.Join(shardDir, files[0].Name())
+	tablePath := filepath.Join(data, files[0].Name())
 	f, err := os.OpenFile(tablePath, os.O_WRONLY|os.O_APPEND, 0o644)
 	require.NoError(t, err)
 	_, err = f.Write([]byte("unmanifested-tail"))
@@ -515,7 +453,6 @@ func TestManifestNoAccumulationAcrossRestarts(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	o := DefaultOptions(dir)
-	o.ShardCount = 2
 
 	// Several clean open/close cycles plus a crash, then a final open.
 	for i := 0; i < 5; i++ {
@@ -546,7 +483,6 @@ func TestManifestRotationBoundsGrowth(t *testing.T) {
 
 	dir := t.TempDir()
 	o := DefaultOptions(dir)
-	o.ShardCount = 1
 	o.MemtableSize = 256 // small: each burst of writes flushes -> a manifest edit
 	db, err := Open(o)
 	require.NoError(t, err)
@@ -583,11 +519,10 @@ func TestOpenManifestKeepsPostRenameStateOnSyncFailure(t *testing.T) {
 	store.currentSyncDir = func(string) error { return sentinel }
 	output := &tableMeta{num: 99, size: 123}
 	db := &DB{
-		opts:           func() Options { o := DefaultOptions(dir); o.ShardCount = 1; return o }(),
-		part:           HashPartitioner{},
+		opts:           DefaultOptions(dir),
 		store:          store,
 		alloc:          newAllocator(99),
-		shards:         []*shardT{{tables: []*tableMeta{output}}},
+		eng:            &engineT{tables: []*tableMeta{output}},
 		startupOutputs: []*tableMeta{output},
 	}
 
@@ -614,11 +549,10 @@ func TestManifestRotationAdoptsPostRenameStateOnSyncFailure(t *testing.T) {
 	store, err := openStorage(dir)
 	require.NoError(t, err)
 	db := &DB{
-		opts:   func() Options { o := DefaultOptions(dir); o.ShardCount = 1; return o }(),
-		part:   HashPartitioner{},
-		store:  store,
-		alloc:  newAllocator(0),
-		shards: []*shardT{{}},
+		opts:  DefaultOptions(dir),
+		store: store,
+		alloc: newAllocator(0),
+		eng:   &engineT{},
 	}
 	require.NoError(t, db.openManifest())
 	oldNum := db.manNum
@@ -646,7 +580,6 @@ func TestCloseRetainsWALWhenManifestRotationSyncFails(t *testing.T) {
 
 	dir := t.TempDir()
 	opts := DefaultOptions(dir)
-	opts.ShardCount = 2
 	opts.MemtableSize = 1 << 30
 	db, err := Open(opts)
 	require.NoError(t, err)
@@ -656,7 +589,7 @@ func TestCloseRetainsWALWhenManifestRotationSyncFails(t *testing.T) {
 	db.store.currentSyncDir = func(string) error { return sentinel }
 	err = db.Close()
 	assert.ErrorIs(t, err, sentinel)
-	logs := allShardLogs(t, db.store, opts.ShardCount)
+	logs := allLogs(t, db.store)
 	assert.NotEmpty(t, logs, "a late manifest durability failure must prevent WAL retirement")
 }
 
@@ -664,7 +597,6 @@ func TestManifestSyncFailurePreservesReferencedFlushOutput(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	opts := DefaultOptions(dir)
-	opts.ShardCount = 1
 	opts.MemtableSize = 1 << 30
 	db, err := Open(opts)
 	require.NoError(t, err)
@@ -672,7 +604,7 @@ func TestManifestSyncFailurePreservesReferencedFlushOutput(t *testing.T) {
 
 	sentinel := errors.New("manifest sync failed")
 	db.man.syncFile = func() error { return sentinel }
-	err = db.shards[0].Flush()
+	err = db.eng.Flush()
 	assert.ErrorIs(t, err, sentinel)
 	db.crash()
 
@@ -691,7 +623,6 @@ func TestCloseRetainsWALWhenManifestCloseFails(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	opts := DefaultOptions(dir)
-	opts.ShardCount = 1
 	opts.MemtableSize = 1 << 30
 	db, err := Open(opts)
 	require.NoError(t, err)
@@ -704,7 +635,7 @@ func TestCloseRetainsWALWhenManifestCloseFails(t *testing.T) {
 	}
 	err = db.Close()
 	assert.ErrorIs(t, err, sentinel)
-	logs := allShardLogs(t, db.store, opts.ShardCount)
+	logs := allLogs(t, db.store)
 	assert.NotEmpty(t, logs, "manifest close failure must be known before WAL retirement")
 }
 
@@ -712,7 +643,6 @@ func TestNoSyncBackgroundWALSyncPersistsBeforeCrash(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	o := DefaultOptions(dir)
-	o.ShardCount = 2
 	o.MemtableSize = 1 << 30 // keep everything in the WAL, none flushed
 	o.NoSync = true
 	o.WALSyncInterval = 10 * time.Millisecond
@@ -769,7 +699,6 @@ func TestLenientRecoveryStopsAtCorruptionAcrossSegments(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	opts := DefaultOptions(dir)
-	opts.ShardCount = 1
 	opts.MemtableSize = 1 << 30
 	db, err := Open(opts)
 	require.NoError(t, err)
@@ -777,18 +706,17 @@ func TestLenientRecoveryStopsAtCorruptionAcrossSegments(t *testing.T) {
 
 	s, err := openStorage(dir)
 	require.NoError(t, err)
-	logs, err := s.listLogs(0)
+	logs, err := s.listLogs()
 	require.NoError(t, err)
 	require.Len(t, logs, 1)
 
 	// Segment 1: one valid record (seq 1, key "a") then a corrupt tail record.
-	seg1, err := s.logPath(0, logs[0])
+	seg1, err := s.logPath(logs[0])
 	require.NoError(t, err)
 	f, err := os.OpenFile(seg1, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o644)
 	require.NoError(t, err)
 	jw := newJournalWriter(f)
 	require.NoError(t, jw.Write(encodeBatch(nil, 1, []walEntry{{
-		Shard: 0,
 		Kind:  walKindPut,
 		Key:   []byte("a"),
 		Value: []byte("v"),
@@ -799,13 +727,12 @@ func TestLenientRecoveryStopsAtCorruptionAcrossSegments(t *testing.T) {
 	require.NoError(t, f.Close())
 
 	// Segment 2: a valid record (seq 5, key "b") that lives PAST the corruption.
-	seg2, err := s.logPath(0, logs[0]+1)
+	seg2, err := s.logPath(logs[0] + 1)
 	require.NoError(t, err)
 	f2, err := os.OpenFile(seg2, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o644)
 	require.NoError(t, err)
 	jw2 := newJournalWriter(f2)
 	require.NoError(t, jw2.Write(encodeBatch(nil, 5, []walEntry{{
-		Shard: 0,
 		Kind:  walKindPut,
 		Key:   []byte("b"),
 		Value: []byte("v"),
@@ -828,7 +755,7 @@ func TestLenientRecoveryStopsAtCorruptionAcrossSegments(t *testing.T) {
 	assert.ErrorIs(t, err, ErrNotFound, "records past a corruption must not be recovered")
 }
 
-// TestRecoveryFlushesMidReplay verifies recovery flushes a shard's memtable when
+// TestRecoveryFlushesMidReplay verifies recovery flushes the memtable when
 // it reaches the threshold during replay, rather than accumulating the entire WAL
 // into one memtable (which could overflow the skiplist arena). Many recovered
 // entries with a tiny MemtableSize must yield multiple tables after reopen.
@@ -837,7 +764,6 @@ func TestRecoveryFlushesMidReplay(t *testing.T) {
 	dir := t.TempDir()
 
 	o := DefaultOptions(dir)
-	o.ShardCount = 1     // all writes to one shard's memtable
 	o.MemtableSize = 512 // tiny, so mid-replay flush triggers
 	o.NoSync = true
 	o.FreshCodec = CodecNone

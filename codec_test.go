@@ -112,7 +112,6 @@ func TestEntropyCompressionOption(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			db := openTestDB(t, func(o *Options) {
-				o.ShardCount = 1
 				o.MemtableSize = 4 << 10
 				o.FreshCodec = CodecS2
 				o.BottomCodec = CodecZstd
@@ -150,7 +149,6 @@ func TestEntropyCompressionOption(t *testing.T) {
 func TestLevelCodecsAppliedToFlushedTable(t *testing.T) {
 	t.Parallel()
 	db := openTestDB(t, func(o *Options) {
-		o.ShardCount = 1
 		// Large memtable so the workload lands in one or two L0 tables and is not
 		// immediately compacted down to a deeper (non-overridden) depth.
 		o.MemtableSize = 64 << 10
@@ -168,16 +166,16 @@ func TestLevelCodecsAppliedToFlushedTable(t *testing.T) {
 	}
 	db.sched.drain()
 
-	ids := depth0BlockCodecIDs(t, db.shards[0])
+	ids := depth0BlockCodecIDs(t, db.eng)
 	require.NotEmpty(t, ids, "expected at least one flushed L0 table")
 	assert.Contains(t, ids, codecZstd, "L0 blocks should use the depth-0 override (zstd)")
 	assert.NotContains(t, ids, codecS2, "no L0 block should use s2")
 }
 
 // depth0BlockCodecIDs reads the first data block of every live depth-0 table in
-// the shard raw (bypassing decodeBlock) and returns the set of codec ids from
+// the engine raw (bypassing decodeBlock) and returns the set of codec ids from
 // their trailers. Trailer layout from finishBlock: [payload][codec id][crc32].
-func depth0BlockCodecIDs(t *testing.T, s *shardT) map[codecID]bool {
+func depth0BlockCodecIDs(t *testing.T, s *engineT) map[codecID]bool {
 	t.Helper()
 	s.mu.RLock()
 	var metas []*tableMeta

@@ -1,7 +1,7 @@
-// The manifest is the global, durable record of every shard's table set
-// and the database identity (partitioner name and shard count). It is an
+// The manifest is the durable record of the live table set. It is an
 // append-only log of edits framed with the journal format; replaying it
-// reconstructs the live state on open.
+// reconstructs the live state on open. The first edit carries an identity
+// marker so a truncated or foreign file is rejected on open.
 
 package levisdb
 
@@ -15,7 +15,6 @@ import (
 
 // TableInfo describes one on-disk table in the manifest.
 type manifestTableInfo struct {
-	Shard      int
 	Num        uint32
 	Depth      int
 	Size       int64
@@ -25,24 +24,21 @@ type manifestTableInfo struct {
 	Tombstones int // tombstone entries, for the density trigger
 }
 
-// Edit is one atomic change: an optional identity header (on the first edit)
+// Edit is one atomic change: an optional identity marker (on the first edit)
 // plus tables added and removed, and an optional committed-sequence watermark.
 type manifestEdit struct {
 	HasIdentity bool
-	Partitioner string
-	ShardCount  int
 
 	HasLastSeq bool
 	LastSeq    uint64 // highest committed sequence at the time of this edit
 
 	Added   []manifestTableInfo
-	Deleted []manifestTableRef // shard+num identify a table to remove
+	Deleted []manifestTableRef // num identifies a table to remove
 }
 
 // TableRef identifies a table for deletion.
 type manifestTableRef struct {
-	Shard int
-	Num   uint32
+	Num uint32
 }
 
 // record tags for the edit encoding.
@@ -59,8 +55,6 @@ func (e *manifestEdit) encode() []byte {
 	var b []byte
 	if e.HasIdentity {
 		b = append(b, tagIdentity)
-		b = appendString(b, e.Partitioner)
-		b = binary.AppendUvarint(b, uint64(e.ShardCount))
 	}
 	if e.HasLastSeq {
 		b = append(b, tagLastSeq)
@@ -68,7 +62,6 @@ func (e *manifestEdit) encode() []byte {
 	}
 	for _, t := range e.Added {
 		b = append(b, tagAdd)
-		b = binary.AppendUvarint(b, uint64(t.Shard))
 		b = binary.AppendUvarint(b, uint64(t.Num))
 		b = binary.AppendUvarint(b, uint64(t.Depth))
 		b = binary.AppendUvarint(b, uint64(t.Size))
@@ -79,7 +72,6 @@ func (e *manifestEdit) encode() []byte {
 	}
 	for _, d := range e.Deleted {
 		b = append(b, tagDelete)
-		b = binary.AppendUvarint(b, uint64(d.Shard))
 		b = binary.AppendUvarint(b, uint64(d.Num))
 	}
 	b = append(b, tagEnd)
@@ -101,21 +93,7 @@ func decodeEdit(rec []byte) (manifestEdit, error) {
 			if e.HasIdentity {
 				return e, fmt.Errorf("manifest: duplicate identity tag")
 			}
-			name, r, err := readString(rec)
-			if err != nil {
-				return e, err
-			}
-			sc, n := binary.Uvarint(r)
-			if n <= 0 {
-				return e, fmt.Errorf("manifest: bad shard count")
-			}
-			if sc == 0 || sc > uint64(^uint(0)>>1) {
-				return e, fmt.Errorf("manifest: shard count out of range")
-			}
 			e.HasIdentity = true
-			e.Partitioner = name
-			e.ShardCount = int(sc)
-			rec = r[n:]
 		case tagLastSeq:
 			if e.HasLastSeq {
 				return e, fmt.Errorf("manifest: duplicate last-sequence tag")
@@ -138,19 +116,15 @@ func decodeEdit(rec []byte) (manifestEdit, error) {
 			e.Added = append(e.Added, t)
 			rec = r
 		case tagDelete:
-			shard, n1 := binary.Uvarint(rec)
-			if n1 <= 0 {
+			num, n := binary.Uvarint(rec)
+			if n <= 0 {
 				return e, fmt.Errorf("manifest: bad delete")
 			}
-			num, n2 := binary.Uvarint(rec[n1:])
-			if n2 <= 0 {
-				return e, fmt.Errorf("manifest: bad delete")
-			}
-			if shard > uint64(^uint(0)>>1) || num > math.MaxUint32 {
+			if num > math.MaxUint32 {
 				return e, fmt.Errorf("manifest: delete out of range")
 			}
-			e.Deleted = append(e.Deleted, manifestTableRef{Shard: int(shard), Num: uint32(num)})
-			rec = rec[n1+n2:]
+			e.Deleted = append(e.Deleted, manifestTableRef{Num: uint32(num)})
+			rec = rec[n:]
 		default:
 			return e, fmt.Errorf("manifest: unknown tag %d", tag)
 		}
@@ -165,11 +139,6 @@ func readTable(rec []byte) (manifestTableInfo, []byte, error) {
 	bad := func() (manifestTableInfo, []byte, error) {
 		return manifestTableInfo{}, nil, fmt.Errorf("manifest: bad table record")
 	}
-	shard, n := binary.Uvarint(rec)
-	if n <= 0 {
-		return bad()
-	}
-	rec = rec[n:]
 	num, n := binary.Uvarint(rec)
 	if n <= 0 {
 		return bad()
@@ -185,7 +154,7 @@ func readTable(rec []byte) (manifestTableInfo, []byte, error) {
 		return bad()
 	}
 	rec = rec[n:]
-	if shard > uint64(^uint(0)>>1) || num > math.MaxUint32 || depth > uint64(^uint(0)>>1) || size > math.MaxInt64 {
+	if num > math.MaxUint32 || depth > uint64(^uint(0)>>1) || size > math.MaxInt64 {
 		return bad()
 	}
 	minKey, rec, err := readKeyBound(rec)
@@ -210,7 +179,6 @@ func readTable(rec []byte) (manifestTableInfo, []byte, error) {
 		return bad()
 	}
 	return manifestTableInfo{
-		Shard:      int(shard),
 		Num:        uint32(num),
 		Depth:      int(depth),
 		Size:       int64(size),
@@ -241,19 +209,6 @@ func readKeyBound(rec []byte) ([]byte, []byte, error) {
 	return append([]byte(nil), rec[:l]...), rec[l:], nil
 }
 
-func appendString(b []byte, s string) []byte {
-	b = binary.AppendUvarint(b, uint64(len(s)))
-	return append(b, s...)
-}
-
-func readString(rec []byte) (string, []byte, error) {
-	l, n := binary.Uvarint(rec)
-	if n <= 0 || uint64(len(rec[n:])) < l {
-		return "", nil, fmt.Errorf("manifest: bad string")
-	}
-	return string(rec[n : n+int(l)]), rec[n+int(l):], nil
-}
-
 // Writer appends edits to a manifest file.
 type manifestWriter struct {
 	file      *os.File
@@ -265,13 +220,13 @@ type manifestWriter struct {
 }
 
 // Create opens path for a new manifest and writes the identity edit.
-func createManifest(path, partitioner string, shardCount int) (*manifestWriter, error) {
+func createManifest(path string) (*manifestWriter, error) {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o644)
 	if err != nil {
 		return nil, err
 	}
 	w := &manifestWriter{file: f, jw: newJournalWriter(f)}
-	id := manifestEdit{HasIdentity: true, Partitioner: partitioner, ShardCount: shardCount}
+	id := manifestEdit{HasIdentity: true}
 	if err := w.append(&id); err != nil {
 		_ = f.Close()
 		_ = removeFileDurable(path)
@@ -326,22 +281,19 @@ func (w *manifestWriter) Close() error {
 
 // State is the reconstructed live view after replaying a manifest.
 type manifestState struct {
-	Partitioner string
-	ShardCount  int
-	LastSeq     uint64 // highest committed sequence recorded
-	// Tables maps shard index to its live tables.
-	Tables map[int][]manifestTableInfo
+	LastSeq uint64              // highest committed sequence recorded
+	Tables  []manifestTableInfo // the live table set
 }
 
 // Replay reads a manifest file and reconstructs the live table set. It applies
 // adds and deletes in order; a torn tail is ignored.
 func replayManifestFile(r io.Reader) (*manifestState, error) {
-	st := &manifestState{Tables: map[int][]manifestTableInfo{}}
+	st := &manifestState{}
 	live := map[manifestTableRef]manifestTableInfo{}
 	// File numbers come from one global, never-reused allocator. Tracking every
 	// table number seen (not just the live set) catches a corrupt manifest that
-	// could otherwise make two shards share one block-cache identity.
-	seenTableNums := map[uint32]manifestTableRef{}
+	// reuses a number, which would collide two tables on one block-cache identity.
+	seenTableNums := map[uint32]bool{}
 
 	jr := newJournalReader(r)
 	haveIdentity := false
@@ -361,8 +313,6 @@ func replayManifestFile(r io.Reader) (*manifestState, error) {
 			if haveIdentity {
 				return nil, fmt.Errorf("manifest: repeated identity")
 			}
-			st.Partitioner = edit.Partitioner
-			st.ShardCount = edit.ShardCount
 			haveIdentity = true
 		}
 		if !haveIdentity {
@@ -372,25 +322,18 @@ func replayManifestFile(r io.Reader) (*manifestState, error) {
 			st.LastSeq = edit.LastSeq
 		}
 		for _, t := range edit.Added {
-			if t.Shard < 0 || t.Shard >= st.ShardCount {
-				return nil, fmt.Errorf("manifest: table shard %d outside [0,%d)", t.Shard, st.ShardCount)
-			}
 			if t.Num == 0 {
 				return nil, fmt.Errorf("manifest: table file number 0 is reserved")
 			}
-			ref := manifestTableRef{Shard: t.Shard, Num: t.Num}
-			if previous, exists := seenTableNums[t.Num]; exists {
-				return nil, fmt.Errorf("manifest: table file number %d reused by shard %d after shard %d", t.Num, t.Shard, previous.Shard)
+			if seenTableNums[t.Num] {
+				return nil, fmt.Errorf("manifest: table file number %d reused", t.Num)
 			}
-			seenTableNums[t.Num] = ref
-			live[ref] = t
+			seenTableNums[t.Num] = true
+			live[manifestTableRef{Num: t.Num}] = t
 		}
 		for _, d := range edit.Deleted {
-			if d.Shard < 0 || d.Shard >= st.ShardCount {
-				return nil, fmt.Errorf("manifest: deleted shard %d outside [0,%d)", d.Shard, st.ShardCount)
-			}
 			if _, exists := live[d]; !exists {
-				return nil, fmt.Errorf("manifest: delete of unknown table %d in shard %d", d.Num, d.Shard)
+				return nil, fmt.Errorf("manifest: delete of unknown table %d", d.Num)
 			}
 			delete(live, d)
 		}
@@ -400,7 +343,7 @@ func replayManifestFile(r io.Reader) (*manifestState, error) {
 		return nil, fmt.Errorf("manifest: missing identity")
 	}
 	for _, t := range live {
-		st.Tables[t.Shard] = append(st.Tables[t.Shard], t)
+		st.Tables = append(st.Tables, t)
 	}
 	return st, nil
 }

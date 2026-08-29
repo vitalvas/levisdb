@@ -13,11 +13,10 @@ import (
 func TestPutTTLExpiresAndShadowsOlderValue(t *testing.T) {
 	t.Parallel()
 	db := openTestDB(t, func(o *Options) {
-		o.ShardCount = 1
 		o.MemtableSize = 1 << 30
 	})
 	require.NoError(t, db.Put(PutOptions{Key: []byte("key"), Value: []byte("old")}))
-	require.NoError(t, db.shards[0].Flush())
+	require.NoError(t, db.eng.Flush())
 	require.NoError(t, db.Put(PutOptions{Key: []byte("key"), Value: []byte("temporary"), TTL: 200 * time.Millisecond}))
 
 	value, err := db.Get([]byte("key"))
@@ -37,7 +36,6 @@ func TestTTLIsPersistedAcrossReopen(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	opts := DefaultOptions(dir)
-	opts.ShardCount = 1
 	db, err := Open(opts)
 	require.NoError(t, err)
 	require.NoError(t, db.Put(PutOptions{Key: []byte("key"), Value: []byte("value"), TTL: 100 * time.Millisecond}))
@@ -56,7 +54,6 @@ func TestWALRecoveryDoesNotRestartTTL(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	opts := DefaultOptions(dir)
-	opts.ShardCount = 1
 	opts.MemtableSize = 1 << 30
 	db, err := Open(opts)
 	require.NoError(t, err)
@@ -74,7 +71,6 @@ func TestWALRecoveryDoesNotRestartTTL(t *testing.T) {
 func TestTTLIteratorUsesCreationTime(t *testing.T) {
 	t.Parallel()
 	db := openTestDB(t, func(o *Options) {
-		o.ShardCount = 1
 		o.MemtableSize = 1 << 30
 	})
 	require.NoError(t, db.Put(PutOptions{Key: []byte("key"), Value: []byte("value"), TTL: 200 * time.Millisecond}))
@@ -108,7 +104,7 @@ func TestTTLValidationIsAtomic(t *testing.T) {
 
 func TestCompactionReclaimsExpiredTTLAndShadowedValue(t *testing.T) {
 	t.Parallel()
-	s := newTestShard(t, 1<<20)
+	s := newTestEngine(t, 1<<20)
 	s.Put(1, []byte("key"), []byte("old"))
 	s.putTTL(2, []byte("key"), []byte("expired"), time.Now().Add(-time.Second).UnixNano())
 	require.NoError(t, s.Flush())
@@ -118,7 +114,7 @@ func TestCompactionReclaimsExpiredTTLAndShadowedValue(t *testing.T) {
 
 func TestCompactionPreservesTTLForLiveIteratorTime(t *testing.T) {
 	t.Parallel()
-	s := newTestShard(t, 1<<20)
+	s := newTestEngine(t, 1<<20)
 	const expiresAt = int64(10_000)
 	s.putTTL(1, []byte("key"), []byte("value"), expiresAt)
 	require.NoError(t, s.Flush())
@@ -137,68 +133,9 @@ func TestCompactionPreservesTTLForLiveIteratorTime(t *testing.T) {
 	assert.Empty(t, s.Tables(), "TTL can be reclaimed once every iterator view sees it expired")
 }
 
-func TestIteratorPinsTTLWhileAcquiringLaterShards(t *testing.T) {
-	t.Parallel()
-	db := openTestDB(t, func(o *Options) {
-		o.ShardCount = 2
-		o.MemtableSize = 1 << 30
-	})
-	var key []byte
-	for i := 0; i < 256; i++ {
-		candidate := []byte{byte(i)}
-		shard, err := db.shardForKey(candidate)
-		require.NoError(t, err)
-		if shard == 1 {
-			key = candidate
-			break
-		}
-	}
-	require.NotEmpty(t, key)
-	require.NoError(t, db.Put(PutOptions{Key: key, Value: []byte("value"), TTL: 200 * time.Millisecond}))
-	require.NoError(t, db.shards[1].Flush())
-
-	// Stop construction on shard zero after the DB iterator has pinned its TTL
-	// read time but before it can acquire shard one's table reference.
-	db.shards[0].mu.Lock()
-	locked := true
-	defer func() {
-		if locked {
-			db.shards[0].mu.Unlock()
-		}
-	}()
-	type iteratorResult struct {
-		it  Iterator
-		err error
-	}
-	result := make(chan iteratorResult, 1)
-	go func() {
-		it, err := db.NewIterator()
-		result <- iteratorResult{it: it, err: err}
-	}()
-	require.Eventually(t, func() bool {
-		return db.snaps.oldestIteratorTime(math.MaxInt64) != math.MaxInt64
-	}, time.Second, time.Millisecond)
-
-	require.Eventually(t, func() bool {
-		_, err := db.Get(key)
-		return errors.Is(err, ErrNotFound)
-	}, 2*time.Second, 5*time.Millisecond)
-	require.NoError(t, db.CompactShard(1))
-
-	db.shards[0].mu.Unlock()
-	locked = false
-	res := <-result
-	require.NoError(t, res.err)
-	require.True(t, res.it.Next(), "compaction must preserve the iterator's earlier TTL view")
-	assert.Equal(t, key, res.it.Key())
-	assert.Equal(t, []byte("value"), res.it.Value())
-	require.NoError(t, res.it.Close())
-	assert.Equal(t, int64(math.MaxInt64), db.snaps.oldestIteratorTime(math.MaxInt64))
-}
-
 func TestTableTTLUsesPersistedAbsoluteDeadline(t *testing.T) {
 	t.Parallel()
-	s := newTestShard(t, 1<<20)
+	s := newTestEngine(t, 1<<20)
 	const expiresAt = int64(10_000)
 	s.putTTL(1, []byte("key"), []byte("value"), expiresAt)
 	require.NoError(t, s.Flush())

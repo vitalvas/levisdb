@@ -14,36 +14,33 @@ import (
 // DB is an open levisdb database.
 type DB struct {
 	opts   Options
-	part   Partitioner
 	store  *storageT
 	alloc  *allocatorT
 	man    *manifestWriter
 	manNum uint32 // file number of the live manifest, for rotation cleanup
-	// wals holds one WAL per shard: each shard's writes go to its own log, so
-	// writes to different shards do not serialize on a single committer. Indexed
-	// by shard.
-	wals []*shardWAL
+	// wal is the single write-ahead log and the segment bookkeeping the
+	// checkpoint uses to rotate and retire it.
+	wal *dbWAL
 	// startupOutputs are tables produced by WAL recovery but not yet protected
 	// by a CURRENT-selected manifest. A failed Open removes only these tables,
 	// never tables restored from the previous manifest.
 	startupOutputs []*tableMeta
-	shards         []*shardT
+	eng            *engineT
 
 	// walSeq is the global monotonic sequence assigned to every mutation as it is
-	// fanned out to per-shard WALs (under each shard WAL's lock). readSeq is
-	// published only after a whole batch applies, so cross-shard snapshot isolation
-	// holds even though each shard logs independently.
+	// logged. readSeq is the highest committed sequence, published only after a
+	// batch applies, so snapshot reads never observe a half-applied batch.
 	walSeq  atomic.Uint64
 	readSeq atomic.Uint64 // highest committed sequence, for snapshot reads
 	// filterSafeSeq is the highest sequence whose WAL segment has been retired
-	// after every shard was flushed. A compaction filter may physically discard
-	// only versions at or below this point, or crash replay could resurrect them.
+	// after a flush. A compaction filter may physically discard only versions at
+	// or below this point, or crash replay could resurrect them.
 	filterSafeSeq atomic.Uint64
 
 	sched *scheduler   // serializes flush + compaction off the write path
 	snaps *snapshots   // live read snapshots, for compaction retention
-	cache *blockCacheT // shared block cache across all shards
-	fds   *fdPool      // shared bounded open-table-descriptor pool
+	cache *blockCacheT // block cache
+	fds   *fdPool      // bounded open-table-descriptor pool
 
 	metrics dbMetrics // cumulative counters since open
 
@@ -71,29 +68,18 @@ type DB struct {
 	bgErr        error
 
 	// seqMu orders sequence assignment with WAL enqueue: a batch reserves its
-	// contiguous global seq range and enqueues each shard's slice into that shard's
-	// WAL while holding it, so a shard's records are enqueued (and thus written and
-	// recovered) in ascending seq order, and no concurrent write's seq can split a
-	// multi-shard batch (which would let a snapshot see it half-applied). Only the
-	// in-memory reserve+enqueue is serialized; the WAL fsync/commit runs outside it,
-	// so different shards still persist in parallel.
+	// contiguous seq range and enqueues it while holding this, so records are
+	// written and recovered in ascending seq order. The WAL fsync/commit runs
+	// outside it so a slow commit does not serialize the next batch's enqueue.
 	seqMu sync.Mutex
-
-	// seqPublishMu guards readSeq's contiguous-prefix advance (publishRange).
-	// pendingRanges buffers applied seq ranges that completed out of order, keyed by
-	// their first seq, until the gap before them fills. ponytail: a single mutex +
-	// map; upgrade only if publish contention shows up in profiling.
-	seqPublishMu  sync.Mutex
-	pendingRanges map[uint64]uint64
 
 	mu     sync.RWMutex
 	closed bool
 }
 
-// shardWAL is one shard's write-ahead log and the segment bookkeeping the
-// checkpoint uses to rotate and retire it independently of other shards.
-type shardWAL struct {
-	shard   int
+// dbWAL is the write-ahead log and the segment bookkeeping the checkpoint uses
+// to rotate and retire it.
+type dbWAL struct {
 	wal     *walT
 	file    *os.File
 	num     uint32   // live segment file number
@@ -168,18 +154,15 @@ func Open(opts Options) (*DB, error) {
 		cacheSize = 0
 	}
 	db := &DB{
-		opts:          opts,
-		part:          opts.resolvePartitioner(),
-		store:         store,
-		snaps:         newSnapshots(),
-		cache:         newBlockCache(cacheSize),
-		fds:           newFDPool(opts.MaxOpenFiles),
-		pendingRanges: map[uint64]uint64{},
-		log:           newRootLogger(opts.Logger),
+		opts:  opts,
+		store: store,
+		snaps: newSnapshots(),
+		cache: newBlockCache(cacheSize),
+		fds:   newFDPool(opts.MaxOpenFiles),
+		log:   newRootLogger(opts.Logger),
 	}
 	db.log.Info("opening database",
-		"op", "open", "dir", opts.Dir, "shards", opts.ShardCount,
-		"partitioner", db.part.Name(), "read_only", opts.ReadOnly)
+		"op", "open", "dir", opts.Dir, "read_only", opts.ReadOnly)
 
 	if err := db.load(); err != nil {
 		db.log.Error("open failed", "op", "open", "err", err)
@@ -196,7 +179,7 @@ func Open(opts Options) (*DB, error) {
 // crash-loss window. It is a no-op for read-only, durable (sync), or disabled
 // (negative interval) configurations.
 func (db *DB) startWALSyncLoop() {
-	if db.opts.ReadOnly || !db.opts.NoSync || db.opts.WALSyncInterval <= 0 || len(db.wals) == 0 {
+	if db.opts.ReadOnly || !db.opts.NoSync || db.opts.WALSyncInterval <= 0 || db.wal == nil {
 		return
 	}
 	stop := make(chan struct{})
@@ -214,14 +197,8 @@ func (db *DB) startWALSyncLoop() {
 			case <-stop:
 				return
 			case <-t.C:
-				// Fsync every shard WAL to bound the NoSync loss window. One shard's
-				// error must not stop syncing the others: record it and keep going, so
-				// a transient failure on one segment does not silently widen the
-				// crash-loss window for every shard.
-				for _, sw := range db.wals {
-					if _, err := sw.wal.syncNow(); err != nil && err != os.ErrClosed {
-						db.setBackgroundError(err)
-					}
+				if _, err := db.wal.wal.syncNow(); err != nil && err != os.ErrClosed {
+					db.setBackgroundError(err)
 				}
 			}
 		}
@@ -244,52 +221,41 @@ func (db *DB) closeAfterOpenError() {
 	if db.sched != nil {
 		db.sched.Close()
 	}
-	for _, sw := range db.wals {
-		if sw == nil {
-			continue
-		}
-		_ = sw.file.Close()
-		if sw.num != 0 {
-			_ = db.store.removeLog(sw.shard, sw.num)
+	if db.wal != nil {
+		_ = db.wal.file.Close()
+		if db.wal.num != 0 {
+			_ = db.store.removeLog(db.wal.num)
 		}
 	}
 	if db.man != nil {
 		_ = db.man.Close()
 	}
-	if len(db.startupOutputs) > 0 {
+	if len(db.startupOutputs) > 0 && db.eng != nil {
 		unmanifested := make(map[*tableMeta]bool, len(db.startupOutputs))
 		for _, table := range db.startupOutputs {
 			unmanifested[table] = true
 		}
-		for _, shard := range db.shards {
-			if shard == nil {
-				continue
+		db.eng.mu.Lock()
+		kept := db.eng.tables[:0]
+		for _, table := range db.eng.tables {
+			if !unmanifested[table] {
+				kept = append(kept, table)
 			}
-			shard.mu.Lock()
-			kept := shard.tables[:0]
-			for _, table := range shard.tables {
-				if !unmanifested[table] {
-					kept = append(kept, table)
-				}
-			}
-			shard.tables = kept
-			shard.mu.Unlock()
 		}
+		db.eng.tables = kept
+		db.eng.mu.Unlock()
 		for _, table := range db.startupOutputs {
 			_ = table.releaseOwner(true)
 		}
 		db.startupOutputs = nil
 	}
-	for _, s := range db.shards {
-		if s != nil {
-			_ = s.Close()
-		}
+	if db.eng != nil {
+		_ = db.eng.Close()
 	}
 	_ = db.store.Close()
 }
 
-// load recovers existing state or initializes a fresh database, verifying the
-// partitioner identity and shard count against any persisted manifest.
+// load recovers existing state or initializes a fresh database.
 func (db *DB) load() error {
 	manNum, ok, err := db.store.readCurrent()
 	if err != nil {
@@ -303,28 +269,20 @@ func (db *DB) load() error {
 		if err != nil {
 			return err
 		}
-		if state.Partitioner != db.part.Name() || state.ShardCount != db.opts.ShardCount {
-			return ErrPartitionerMismatch
-		}
 		startSeq = state.LastSeq
 	}
 
-	// Existing WAL segments (from a crash, now one set per shard) and the current
-	// manifest number also come from the shared counter; start the allocator above
-	// all of them so no file number is reused. shardLogs[i] holds shard i's leftover
-	// segment numbers, ascending.
-	shardLogs := make([][]uint32, db.opts.ShardCount)
+	// Existing WAL segments (from a crash) and the current manifest number come
+	// from the shared counter; start the allocator above all of them so no file
+	// number is reused.
+	logs, lerr := db.store.listLogs()
+	if lerr != nil {
+		return lerr
+	}
 	start := db.highestFileNum(state)
-	for i := 0; i < db.opts.ShardCount; i++ {
-		logs, lerr := db.store.listLogs(i)
-		if lerr != nil {
-			return lerr
-		}
-		shardLogs[i] = logs
-		for _, n := range logs {
-			if n > start {
-				start = n
-			}
+	for _, n := range logs {
+		if n > start {
+			start = n
 		}
 	}
 	if ok && manNum > start {
@@ -332,10 +290,7 @@ func (db *DB) load() error {
 	}
 	db.alloc = newAllocator(start)
 
-	db.shards = make([]*shardT, db.opts.ShardCount)
-	for i := range db.shards {
-		db.shards[i] = newShard(db.shardConfig(i), db.alloc, db.tablePathFn(i), int64(i+1))
-	}
+	db.eng = newEngine(db.engineConfig(), db.alloc, db.tablePathFn())
 	if state != nil {
 		if err := db.restoreTables(state); err != nil {
 			return err
@@ -343,9 +298,9 @@ func (db *DB) load() error {
 	}
 	originalTables := db.liveTableSet()
 
-	// Replay each shard's leftover WAL segments into its memtable. This recovers
-	// writes committed since the last flush that a crash left only in the WAL.
-	recoveredSeq, err := db.recoverWALMode(shardLogs, startSeq, !db.opts.ReadOnly)
+	// Replay leftover WAL segments into the memtable. This recovers writes
+	// committed since the last flush that a crash left only in the WAL.
+	recoveredSeq, err := db.recoverWALMode(logs, startSeq, !db.opts.ReadOnly)
 	if !db.opts.ReadOnly {
 		db.startupOutputs = db.tablesAddedSince(originalTables)
 	}
@@ -369,54 +324,41 @@ func (db *DB) load() error {
 	}
 	db.startupOutputs = nil // CURRENT now protects every recovery output
 	// CURRENT now durably names a baseline containing every table produced by
-	// recovery. Only at this point is it safe to retire the old per-shard WAL
-	// segments.
-	for shard, nums := range shardLogs {
-		for _, num := range nums {
-			if err := db.store.removeLog(shard, num); err != nil {
-				return err
-			}
+	// recovery. Only at this point is it safe to retire the old WAL segments.
+	for _, num := range logs {
+		if err := db.store.removeLog(num); err != nil {
+			return err
 		}
 	}
 	db.filterSafeSeq.Store(startSeq)
-	// Remove stale manifests: the one replayed above plus any orphans from a
-	// crashed rotation are obsolete now that CURRENT points at the fresh
-	// baseline. This keeps manifest files from accumulating across restarts.
+	// Remove stale manifests and orphaned tables now that CURRENT points at the
+	// fresh baseline. Read-only opens return above and never perform this.
 	db.cleanupManifests()
-	// A crash can land after a compaction output is synced but before its
-	// manifest edit, or after the edit but before obsolete inputs are removed.
-	// CURRENT now protects the complete live set, so every other canonical table
-	// name is provably orphaned and can be reclaimed. Read-only opens return
-	// above and never perform this cleanup.
 	db.cleanupTables()
 
-	db.sched = newScheduler(db.opts.CompactionConcurrency, db.flushShard)
+	db.sched = newScheduler(db.flushEngine)
 	return nil
 }
 
 func (db *DB) liveTableSet() map[*tableMeta]bool {
 	set := make(map[*tableMeta]bool)
-	for _, shard := range db.shards {
-		shard.mu.RLock()
-		for _, table := range shard.tables {
-			set[table] = true
-		}
-		shard.mu.RUnlock()
+	db.eng.mu.RLock()
+	for _, table := range db.eng.tables {
+		set[table] = true
 	}
+	db.eng.mu.RUnlock()
 	return set
 }
 
 func (db *DB) tablesAddedSince(original map[*tableMeta]bool) []*tableMeta {
 	var added []*tableMeta
-	for _, shard := range db.shards {
-		shard.mu.RLock()
-		for _, table := range shard.tables {
-			if !original[table] {
-				added = append(added, table)
-			}
+	db.eng.mu.RLock()
+	for _, table := range db.eng.tables {
+		if !original[table] {
+			added = append(added, table)
 		}
-		shard.mu.RUnlock()
 	}
+	db.eng.mu.RUnlock()
 	return added
 }
 
@@ -437,33 +379,30 @@ func (db *DB) cleanupManifests() {
 // table set selected by CURRENT. Failures are best-effort: an orphan must not
 // make otherwise-valid data unavailable, and a later writable open retries.
 func (db *DB) cleanupTables() {
-	for shardIdx, shard := range db.shards {
-		live := make(map[uint32]bool)
-		shard.mu.RLock()
-		for _, table := range shard.tables {
-			live[table.num] = true
-		}
-		shard.mu.RUnlock()
+	live := make(map[uint32]bool)
+	db.eng.mu.RLock()
+	for _, table := range db.eng.tables {
+		live[table.num] = true
+	}
+	db.eng.mu.RUnlock()
 
-		nums, err := db.store.listTables(shardIdx)
-		if err != nil {
+	nums, err := db.store.listTables()
+	if err != nil {
+		return
+	}
+	for _, num := range nums {
+		if live[num] {
 			continue
 		}
-		for _, num := range nums {
-			if live[num] {
-				continue
-			}
-			path, err := db.store.tablePath(shardIdx, num)
-			if err == nil {
-				_ = removeFileDurable(path)
-			}
+		path, err := db.store.tablePath(num)
+		if err == nil {
+			_ = removeFileDurable(path)
 		}
 	}
 }
 
-func (db *DB) shardConfig(i int) shardConfigT {
-	return shardConfigT{
-		Index:          i,
+func (db *DB) engineConfig() engineConfigT {
+	return engineConfigT{
 		MemtableSize:   db.opts.MemtableSize,
 		BloomBits:      db.opts.BloomBits,
 		BlockSize:      db.opts.BlockSize,
@@ -473,14 +412,14 @@ func (db *DB) shardConfig(i int) shardConfigT {
 		Cache:          db.cache,
 		FDs:            db.fds,
 		Commit: func(inputs, outputs []*tableMeta, install func()) error {
-			return db.commitTableChange(i, inputs, outputs, install)
+			return db.commitTableChange(inputs, outputs, install)
 		},
 	}
 }
 
-func (db *DB) tablePathFn(shard int) func(uint32) (string, error) {
+func (db *DB) tablePathFn() func(uint32) (string, error) {
 	return func(num uint32) (string, error) {
-		return db.store.tablePath(shard, num)
+		return db.store.tablePath(num)
 	}
 }
 
@@ -536,45 +475,32 @@ func (db *DB) compactionRunConfig(forceCheckpoint bool) (retain uint64, cc compa
 	return db.snaps.oldest(db.readSeq.Load()), cc, func() {}, nil
 }
 
-// openWAL creates a fresh WAL segment per shard for this session. The global
-// sequence and readSeq are seeded from startSeq (the highest recovered seq);
-// per-shard WALs assign no sequences of their own (see writeBatch).
+// openWAL creates a fresh WAL segment for this session. The global sequence and
+// readSeq are seeded from startSeq (the highest recovered seq).
 func (db *DB) openWAL(startSeq uint64) error {
 	db.walSeq.Store(startSeq)
 	db.readSeq.Store(startSeq)
-	db.wals = make([]*shardWAL, len(db.shards))
-	for i := range db.shards {
-		sw, err := db.openShardWAL(i)
-		if err != nil {
-			return err
-		}
-		db.wals[i] = sw
-	}
-	return nil
-}
-
-// openShardWAL creates a fresh WAL segment for one shard.
-func (db *DB) openShardWAL(shard int) (*shardWAL, error) {
 	num := db.alloc.Next()
 	if num == 0 {
-		return nil, ErrFileNumberExhausted
+		return ErrFileNumberExhausted
 	}
-	path, err := db.store.logPath(shard, num)
+	path, err := db.store.logPath(num)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o644)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if err := syncDir(filepath.Dir(path)); err != nil {
 		_ = f.Close()
-		_ = db.store.removeLog(shard, num)
-		return nil, err
+		_ = db.store.removeLog(num)
+		return err
 	}
 	w := newWAL(f, db.walBridge(), walConfig{sync: !db.opts.NoSync})
 	w.apply = db.applyCommitted
-	return &shardWAL{shard: shard, wal: w, file: f, num: num}, nil
+	db.wal = &dbWAL{wal: w, file: f, num: num}
+	return nil
 }
 
 // openManifest creates a fresh manifest for this session and records the
@@ -587,7 +513,7 @@ func (db *DB) openManifest() error {
 	if err := db.store.setCurrent(num); err != nil {
 		if currentWasInstalled(err) {
 			// CURRENT already names this complete baseline. Keep both it and any
-			// recovery outputs it references; the old WALs remain because load
+			// recovery outputs it references; the old WAL remains because load
 			// stops here, so either pre- or post-rename state can recover safely.
 			db.man = w
 			db.manNum = num
@@ -612,25 +538,14 @@ func (db *DB) newManifestWithBaseline() (*manifestWriter, uint32, error) {
 	if num == 0 {
 		return nil, 0, ErrFileNumberExhausted
 	}
-	w, err := createManifest(db.store.manifestPath(num), db.part.Name(), db.opts.ShardCount)
+	w, err := createManifest(db.store.manifestPath(num))
 	if err != nil {
 		return nil, 0, err
 	}
 
 	edit := manifestEdit{HasLastSeq: true, LastSeq: db.readSeq.Load()}
-	for i, s := range db.shards {
-		for _, t := range s.Tables() {
-			edit.Added = append(edit.Added, manifestTableInfo{
-				Shard:      i,
-				Num:        t.Num,
-				Depth:      t.Depth,
-				Size:       t.Size,
-				MinKey:     t.MinKey,
-				MaxKey:     t.MaxKey,
-				Entries:    t.Entries,
-				Tombstones: t.Tombstones,
-			})
-		}
+	for _, t := range db.eng.Tables() {
+		edit.Added = append(edit.Added, manifestTableInfo(t))
 	}
 	if err := w.append(&edit); err != nil {
 		_ = w.Close()
@@ -680,11 +595,11 @@ func (db *DB) maybeRotateManifest() {
 // It is a var so tests can lower it; production keeps the default.
 var manifestRotateEdits = 4096
 
-// walSegmentBytes bounds a live WAL segment. Rotation checkpoints every shard
-// before retiring old segments; it is a var so tests can exercise rotation. At
-// 256 MiB the barrier checkpoint (which flushes every shard) fires rarely enough
-// that a bulk writer is not stalled by it; the WAL-size cap still bounds the live
-// WAL at walCheckpointStallMultiple x this.
+// walSegmentBytes bounds a live WAL segment. Rotation checkpoints (flushes)
+// before retiring the old segment; it is a var so tests can exercise rotation.
+// At 256 MiB the barrier checkpoint fires rarely enough that a bulk writer is
+// not stalled by it; the WAL-size cap still bounds the live WAL at
+// walCheckpointStallMultiple x this.
 var walSegmentBytes int64 = 256 << 20
 
 // walCheckpointStallMultiple caps how far the live WAL may outgrow
@@ -734,10 +649,8 @@ func (db *DB) Close() error {
 	defer db.mu.Unlock()
 	if db.opts.ReadOnly {
 		var firstErr error
-		for _, s := range db.shards {
-			if err := s.Close(); err != nil && firstErr == nil {
-				firstErr = err
-			}
+		if err := db.eng.Close(); err != nil {
+			firstErr = err
 		}
 		if err := db.store.Close(); err != nil && firstErr == nil {
 			firstErr = err
@@ -751,18 +664,14 @@ func (db *DB) Close() error {
 			firstErr = e
 		}
 	}
-	// Flush every shard on clean shutdown so buffered writes persist to tables.
-	// WAL replay (M10) covers the crash case; this covers the graceful one.
-	for _, s := range db.shards {
-		if err := s.Flush(); err != nil {
-			setErr(err)
-			continue
-		}
-		// A background flush may already have sealed an immutable memtable. The
-		// first pass drains it; the second captures the active memtable too.
-		if err := s.Flush(); err != nil {
-			setErr(err)
-		}
+	// Flush on clean shutdown so buffered writes persist to tables. WAL replay
+	// covers the crash case; this covers the graceful one. A background flush may
+	// already have sealed an immutable memtable, so the first pass drains it and
+	// the second captures the active memtable too.
+	if err := db.eng.Flush(); err != nil {
+		setErr(err)
+	} else if err := db.eng.Flush(); err != nil {
+		setErr(err)
 	}
 	// A manifest rotation can fail at the final directory sync after its
 	// rename. That failure is recorded asynchronously by commitTableChange even
@@ -775,22 +684,18 @@ func (db *DB) Close() error {
 	if db.man != nil {
 		setErr(db.man.Close())
 	}
-	for _, sw := range db.wals {
-		setErr(sw.wal.Close())
+	if db.wal != nil {
+		setErr(db.wal.wal.Close())
 	}
-	if firstErr == nil {
-		// Every shard flushed above; retire each shard's live + retired segments.
-		for _, sw := range db.wals {
-			for _, num := range append(sw.retired, sw.num) {
-				if num != 0 {
-					setErr(db.store.removeLog(sw.shard, num))
-				}
+	if firstErr == nil && db.wal != nil {
+		// Flushed above; retire the live + retired segments.
+		for _, num := range append(db.wal.retired, db.wal.num) {
+			if num != 0 {
+				setErr(db.store.removeLog(num))
 			}
 		}
 	}
-	for _, s := range db.shards {
-		setErr(s.Close())
-	}
+	setErr(db.eng.Close())
 	setErr(db.store.Close())
 	if firstErr != nil {
 		db.log.Error("database closed with error", "op", "close", "err", firstErr)
@@ -831,19 +736,17 @@ func (db *DB) crash() {
 	defer db.checkpointMu.Unlock()
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	// Close every shard WAL WITHOUT fsync: a real crash never fsyncs, and the
-	// records already reached the OS page cache in writeGroup, which survives
-	// process exit. No segment is removed, so recovery replays them.
-	for _, sw := range db.wals {
-		if sw.file != nil {
-			sw.file.Close()
-		}
+	// Close the WAL WITHOUT fsync: a real crash never fsyncs, and the records
+	// already reached the OS page cache in writeGroup, which survives process
+	// exit. No segment is removed, so recovery replays them.
+	if db.wal != nil && db.wal.file != nil {
+		db.wal.file.Close()
 	}
 	if db.man != nil {
 		db.man.Close()
 	}
-	for _, s := range db.shards {
-		s.Close()
+	if db.eng != nil {
+		db.eng.Close()
 	}
 	db.store.Close()
 }
@@ -874,9 +777,9 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 		db.mu.RUnlock()
 		return nil, ErrEmptyKey
 	}
-	// Keep the captured version alive until the shard lookup has acquired its
-	// read lock. Otherwise a concurrent write and compaction can reclaim this
-	// version in the gap between loading readSeq and reading the table set.
+	// Keep the captured version alive until the lookup has acquired its read
+	// lock. Otherwise a concurrent write and compaction can reclaim this version
+	// in the gap between loading readSeq and reading the table set.
 	seq := db.snaps.acquireCurrent(&db.readSeq)
 	db.mu.RUnlock()
 	defer db.snaps.release(seq)
@@ -893,11 +796,7 @@ func (db *DB) getAt(seq uint64, key []byte) ([]byte, error) {
 	if len(key) == 0 {
 		return nil, ErrEmptyKey
 	}
-	idx, err := db.shardForKey(key)
-	if err != nil {
-		return nil, err
-	}
-	v, found, deleted, err := db.shards[idx].get(seq, key)
+	v, found, deleted, err := db.eng.get(seq, key)
 	if err != nil {
 		return nil, err
 	}
@@ -935,38 +834,17 @@ func (db *DB) hasAt(seq uint64, key []byte) (bool, error) {
 	if len(key) == 0 {
 		return false, ErrEmptyKey
 	}
-	idx, err := db.shardForKey(key)
-	if err != nil {
-		return false, err
-	}
-	found, deleted, err := db.shards[idx].has(seq, key)
+	found, deleted, err := db.eng.has(seq, key)
 	if err != nil {
 		return false, err
 	}
 	return found && !deleted, nil
 }
 
-// shardForKey validates custom partitioners at the API boundary. Built-ins
-// always return an in-range index, but a broken custom implementation should
-// produce an ordinary error rather than an index-out-of-range panic on reads.
-func (db *DB) shardForKey(key []byte) (int, error) {
-	// With one shard and a built-in partitioner every key maps to shard 0; skip
-	// the partitioner entirely. A custom partitioner is still always consulted:
-	// callers may rely on Shard being invoked, and it must be validated.
-	if db.opts.ShardCount == 1 && db.opts.CustomPartitioner == nil {
-		return 0, nil
-	}
-	shard := db.part.Shard(key, db.opts.ShardCount)
-	if shard < 0 || shard >= db.opts.ShardCount {
-		return 0, fmt.Errorf("levisdb: partitioner returned shard %d outside [0,%d)", shard, db.opts.ShardCount)
-	}
-	return shard, nil
-}
-
 // backpressure poll/slowdown tuning. The slowdown delay matches LevelDB's
 // ~1ms-per-write nudge; the hard-stop path polls at the same cadence and
 // re-signals the scheduler so a blocked writer always makes progress once
-// compaction drains the shard.
+// compaction drains the engine.
 const (
 	writeSlowdownDelay = time.Millisecond
 	writeStopPoll      = time.Millisecond
@@ -974,15 +852,19 @@ const (
 
 // Write applies a batch atomically.
 func (db *DB) Write(b *Batch) error {
-	// Resolve each op's shard once, so the partitioner is invoked a single time
-	// per key across both backpressure and the write itself.
-	shards, err := db.resolveBatchShards(b)
-	if err != nil {
-		return err
+	if b == nil || len(b.ops) == 0 {
+		return nil
 	}
-	db.throttleWrite(shards)
+	// Reject an empty key before throttling so a bad batch fails fast; writeBatch
+	// re-checks under the lock.
+	for _, op := range b.ops {
+		if len(op.key) == 0 {
+			return ErrEmptyKey
+		}
+	}
+	db.throttleWrite()
 	db.mu.RLock()
-	err = db.writeBatch(b, shards)
+	err := db.writeBatch(b)
 	db.mu.RUnlock()
 	if err != nil {
 		return err
@@ -991,42 +873,12 @@ func (db *DB) Write(b *Batch) error {
 	return nil
 }
 
-// resolveBatchShards maps each op to its shard once. nil for an empty batch.
-func (db *DB) resolveBatchShards(b *Batch) ([]int, error) {
-	if b == nil || len(b.ops) == 0 {
-		return nil, nil
-	}
-	shards := make([]int, len(b.ops))
-	// With one shard and a built-in partitioner every op maps to shard 0 (the zero
-	// value make already gave), so skip the partitioner and only validate keys. A
-	// custom partitioner is still consulted per op below.
-	if db.opts.ShardCount == 1 && db.opts.CustomPartitioner == nil {
-		for _, op := range b.ops {
-			if len(op.key) == 0 {
-				return nil, ErrEmptyKey
-			}
-		}
-		return shards, nil
-	}
-	for i, op := range b.ops {
-		if len(op.key) == 0 {
-			return nil, ErrEmptyKey
-		}
-		shard, err := db.shardForKey(op.key)
-		if err != nil {
-			return nil, err
-		}
-		shards[i] = shard
-	}
-	return shards, nil
-}
-
-// throttleWrite applies per-shard write backpressure before the batch is
-// logged, so a burst cannot outrun the serialized compactor and grow the fresh
-// tier without bound. It never holds db.mu, so background flush/compaction keeps
-// running while a writer waits. shards are the pre-resolved op shards.
-func (db *DB) throttleWrite(shards []int) {
-	if db.opts.ReadOnly || len(shards) == 0 {
+// throttleWrite applies write backpressure before the batch is logged, so a
+// burst cannot outrun the serialized compactor and grow the fresh tier without
+// bound. It never holds db.mu, so background flush/compaction keeps running
+// while a writer waits.
+func (db *DB) throttleWrite() {
+	if db.opts.ReadOnly {
 		return
 	}
 	slow, stop := db.opts.L0SlowdownTables, db.opts.L0StopTables
@@ -1034,14 +886,10 @@ func (db *DB) throttleWrite(shards []int) {
 		return
 	}
 	stalled := false
-	// Hard stop: block while any target shard is at or above the stop threshold,
-	// re-signalling it so the scheduler drains it, until it falls below stop.
+	// Hard stop: block while the fresh tier is at or above the stop threshold,
+	// re-signalling the scheduler so it drains, until it falls below stop.
 	if stop > 0 {
-		for {
-			shard, count := db.maxDepth0(shards)
-			if count < stop {
-				break
-			}
+		for db.eng.depth0Count() >= stop {
 			if !stalled {
 				db.metrics.writeStalls.Add(1)
 				stalled = true
@@ -1050,38 +898,24 @@ func (db *DB) throttleWrite(shards []int) {
 			closed := db.closed
 			db.mu.RUnlock()
 			// Stop waiting if the DB closed or a background compaction/flush failure
-			// is latched: the shard will never drain, so let writeBatch surface the
+			// is latched: the tier will never drain, so let writeBatch surface the
 			// error instead of spinning here forever.
 			if closed || db.backgroundError() != nil {
 				return
 			}
-			db.sched.Signal(shard)
+			db.sched.Signal()
 			time.Sleep(writeStopPoll)
 		}
 	}
-	// Soft slowdown: a single brief delay when a target shard is over the mark
+	// Soft slowdown: a single brief delay when the fresh tier is over the mark
 	// (skip if the hard path already stalled this write).
-	if !stalled && slow > 0 {
-		if _, count := db.maxDepth0(shards); count >= slow {
-			db.metrics.writeStalls.Add(1)
-			time.Sleep(writeSlowdownDelay)
-		}
+	if !stalled && slow > 0 && db.eng.depth0Count() >= slow {
+		db.metrics.writeStalls.Add(1)
+		time.Sleep(writeSlowdownDelay)
 	}
 }
 
-// maxDepth0 returns the shard with the most fresh-tier tables among shards, and
-// that count. shards may repeat; each is checked once by the caller's loop.
-func (db *DB) maxDepth0(shards []int) (maxShard, maxCount int) {
-	maxShard, maxCount = -1, -1
-	for _, shard := range shards {
-		if c := db.shards[shard].depth0Count(); c > maxCount {
-			maxShard, maxCount = shard, c
-		}
-	}
-	return maxShard, maxCount
-}
-
-func (db *DB) writeBatch(b *Batch, shards []int) error {
+func (db *DB) writeBatch(b *Batch) error {
 	if db.closed {
 		return ErrClosed
 	}
@@ -1097,10 +931,10 @@ func (db *DB) writeBatch(b *Batch, shards []int) error {
 
 	entries := make([]walEntry, len(b.ops))
 	now := time.Now()
-	// The whole batch is applied to shard memtables before any flush check, so
-	// bound the cumulative bytes landing in one shard as well as each entry. Both
-	// limits keep the skiplist arena (uint32 offsets) well below 2^32.
-	var perShard map[int]int64
+	// The whole batch is applied to the memtable before any flush check, so bound
+	// the cumulative bytes as well as each entry. Both limits keep the skiplist
+	// arena (uint32 offsets) well below 2^32.
+	var total int64
 	for i, op := range b.ops {
 		if len(op.key) == 0 {
 			return ErrEmptyKey
@@ -1115,11 +949,8 @@ func (db *DB) writeBatch(b *Batch, shards []int) error {
 		if entrySize > maxEntrySize {
 			return ErrEntryTooLarge
 		}
-		if perShard == nil {
-			perShard = make(map[int]int64, len(db.shards))
-		}
-		perShard[shards[i]] += int64(entrySize)
-		if perShard[shards[i]] > int64(maxEntrySize) {
+		total += int64(entrySize)
+		if total > int64(maxEntrySize) {
 			return ErrBatchTooLarge
 		}
 		expiresAt, err := ttlExpiresAt(now, op.ttl)
@@ -1131,7 +962,6 @@ func (db *DB) writeBatch(b *Batch, shards []int) error {
 			kind = walKindPutTTL
 		}
 		entries[i] = walEntry{
-			Shard:     shards[i],
 			Kind:      kind,
 			Key:       op.key,
 			Value:     op.value,
@@ -1139,28 +969,11 @@ func (db *DB) writeBatch(b *Batch, shards []int) error {
 		}
 	}
 
-	// Fan out to per-shard WALs. appendToShardWALs assigns the contiguous global
-	// seq range and enqueues every shard under db.seqMu, so a shard's records are
-	// ordered by seq (crash recovery depends on this) and no concurrent write's seq
-	// can split this batch (which would let a snapshot see it half-applied). The
-	// per-shard fsync/commit runs outside seqMu, so shards persist in parallel.
-	if err := db.appendToShardWALs(entries); err != nil {
+	if err := db.appendWAL(entries); err != nil {
 		db.setBackgroundError(err)
 		return err
 	}
 	return nil
-}
-
-// maxWALSegmentSize returns the largest current-segment byte count across all
-// shard WALs, the checkpoint trigger.
-func (db *DB) maxWALSegmentSize() int64 {
-	var m int64
-	for _, sw := range db.wals {
-		if s := sw.wal.currentSize(); s > m {
-			m = s
-		}
-	}
-	return m
 }
 
 // reserveSeq atomically reserves n consecutive global sequence numbers and
@@ -1177,131 +990,50 @@ func (db *DB) reserveSeq(n uint64) (uint64, error) {
 	}
 }
 
-// appendToShardWALs groups entries by shard and appends each group to its shard
-// WAL. It assigns the batch one contiguous global seq range and enqueues every
-// shard's slice under db.seqMu, so (a) a shard's records are enqueued - and thus
-// written and recovered - in ascending seq order, and (b) no concurrent write's
-// seq lands between this batch's shards, so a snapshot never sees it half-applied.
-// The per-shard fsync/commit and the readSeq publish happen after seqMu is
-// released, so shards persist in parallel and readSeq advances only once the whole
-// batch is applied.
-func (db *DB) appendToShardWALs(entries []walEntry) error {
-	// Fast path: all entries in one shard. Still ordered under seqMu so this shard's
-	// records stay seq-ordered against any other batch that also touches it.
-	oneShard := true
-	for i := 1; i < len(entries); i++ {
-		if entries[i].Shard != entries[0].Shard {
-			oneShard = false
-			break
-		}
-	}
-	if oneShard {
-		shard := entries[0].Shard
-		db.seqMu.Lock()
-		if err := db.assignSeq(entries); err != nil {
-			db.seqMu.Unlock()
-			return err // no seqs reserved: nothing to publish
-		}
-		pb, mustCommit, err := db.wals[shard].wal.enqueue(entries)
-		db.seqMu.Unlock()
-		lo, hi := entries[0].Seq, entries[len(entries)-1].Seq
-		if err == nil {
-			err = db.wals[shard].wal.runCommit(pb, mustCommit)
-		}
-		// The reserved range has exactly one publisher; publish it even on error so a
-		// concurrent writer's higher range is not blocked forever in the watermark.
-		// On error the DB is poisoned by the caller, so exposing this batch's data is
-		// moot; the point is that readSeq must not stall for other writers.
-		db.publishRange(lo, hi)
-		return err
-	}
-	// Multi-shard: assign the contiguous seq range, split preserving per-shard order,
-	// then enqueue every shard - all under seqMu, before committing any - so the whole
-	// batch occupies a contiguous seq range no concurrent write can split. Seqs are
-	// stamped BEFORE grouping so each per-shard copy carries its assigned seq.
-	type shardCommit struct {
-		wal        *walT
-		pb         *pendingBatch
-		mustCommit bool
-	}
-	var commits []shardCommit
-
+// appendWAL assigns the batch a contiguous seq range and enqueues it to the
+// single WAL under db.seqMu, so records are written and recovered in ascending
+// seq order. The fsync/commit runs outside seqMu, so a slow commit does not
+// serialize the next batch's enqueue. readSeq advances only after the batch
+// applies (publishSeq), so a snapshot never observes it half-applied.
+func (db *DB) appendWAL(entries []walEntry) error {
 	db.seqMu.Lock()
-	err := db.assignSeq(entries)
-	if err != nil {
-		db.seqMu.Unlock()
-		return err // no seqs reserved: nothing to publish
-	}
-	byShard := make(map[int][]walEntry, len(db.shards))
-	for _, e := range entries {
-		byShard[e.Shard] = append(byShard[e.Shard], e)
-	}
-	commits = make([]shardCommit, 0, len(byShard))
-	for shard, es := range byShard {
-		w := db.wals[shard].wal
-		pb, mustCommit, eerr := w.enqueue(es)
-		if eerr != nil {
-			err = eerr
-			break
-		}
-		commits = append(commits, shardCommit{wal: w, pb: pb, mustCommit: mustCommit})
-	}
-	db.seqMu.Unlock()
-
-	// Drive each shard's commit (outside seqMu, so shards fsync in parallel with
-	// other writers) and wait. A mid-fan-out error leaves already-committed shards
-	// durable but the whole batch un-atomic across shards; the caller latches a
-	// background error that fails the DB, matching the "atomic within a shard, not
-	// across" durability contract.
-	firstErr := err
-	for _, c := range commits {
-		if cerr := c.wal.runCommit(c.pb, c.mustCommit); cerr != nil && firstErr == nil {
-			firstErr = cerr
-		}
-	}
-	// Publish the whole reserved range once every shard is applied - and also on
-	// error, so a stranded range never blocks the readSeq watermark for concurrent
-	// writers (assignSeq succeeded here, so the range [entries[0], entries[last]] is
-	// reserved and has this call as its sole publisher).
-	db.publishRange(entries[0].Seq, entries[len(entries)-1].Seq)
-	return firstErr
-}
-
-// assignSeq reserves one contiguous global sequence range for the whole batch and
-// stamps each entry in order, so the batch's seqs are contiguous and ascending. It
-// is called under db.seqMu together with the WAL enqueue, so reservation order
-// equals enqueue order per shard.
-func (db *DB) assignSeq(entries []walEntry) error {
 	base, err := db.reserveSeq(uint64(len(entries)))
 	if err != nil {
+		db.seqMu.Unlock()
 		return err
 	}
 	for i := range entries {
 		entries[i].Seq = base + uint64(i)
 	}
-	return nil
+	pb, mustCommit, err := db.wal.wal.enqueue(entries)
+	db.seqMu.Unlock()
+	if err != nil {
+		return err
+	}
+	return db.wal.wal.runCommit(pb, mustCommit)
 }
 
-// maybeCheckpoint rotates and retires the shared WAL once it grows past
+// maxWALSegmentSize returns the current WAL segment byte count, the checkpoint
+// trigger.
+func (db *DB) maxWALSegmentSize() int64 {
+	if db.wal == nil {
+		return 0
+	}
+	return db.wal.wal.currentSize()
+}
+
+// maybeCheckpoint rotates and retires the WAL once it grows past
 // walSegmentBytes. It runs the checkpoint on a background goroutine so a writer
-// never blocks on the flush-all-shards barrier; write backpressure
-// (throttleWrite) already bounds how far ahead writes can get. Only one
-// checkpoint runs at a time (checkpointRunning), and Close/crash wait for an
-// in-flight one via checkpointWG. The synchronous force path
-// (prepareCompactionFilter) still calls checkpointWALMode directly.
+// never blocks on the flush barrier; write backpressure (throttleWrite) already
+// bounds how far ahead writes can get. Only one checkpoint runs at a time
+// (checkpointRunning), and Close/crash wait for an in-flight one via
+// checkpointWG. The synchronous force path (prepareCompactionFilter) still calls
+// checkpointWALMode directly.
 func (db *DB) maybeCheckpoint() {
 	if walSegmentBytes <= 0 || db.opts.ReadOnly {
 		return
 	}
-	// Poll every shard's current-segment byte counter (atomic, no Stat syscall)
-	// after a write; checkpoint once any shard crosses the threshold. size is the
-	// largest shard segment, used for the hard-cap stall decision below.
-	var size int64
-	for _, sw := range db.wals {
-		if s := sw.wal.currentSize(); s > size {
-			size = s
-		}
-	}
+	size := db.maxWALSegmentSize()
 	if size < walSegmentBytes {
 		return
 	}
@@ -1312,12 +1044,6 @@ func (db *DB) maybeCheckpoint() {
 	// without bound. This bounds the live WAL (and crash-recovery cost) at roughly
 	// walCheckpointStallMultiple * walSegmentBytes.
 	if !db.checkpointRunning.CompareAndSwap(false, true) {
-		// The write outran the background checkpoint past the hard cap: stall until it
-		// drains. Poll checkpointRunning rather than checkpointWG.Wait(): that WaitGroup
-		// is reused per checkpoint, and a Wait here (holding no lock) can run concurrently
-		// with another writer's Add(1) below when a checkpoint finishes between the two,
-		// which panics. Polling also lets the stall bail on close/failure, like the L0
-		// hard-stop loop above.
 		for size >= walSegmentBytes*walCheckpointStallMultiple {
 			db.mu.RLock()
 			closed := db.closed
@@ -1390,81 +1116,66 @@ func (db *DB) checkpointWALMode(force bool) (uint64, error) {
 	ckStart := time.Now()
 	db.log.Debug("wal checkpoint started",
 		"op", "checkpoint", "force", force, "wal_bytes", db.maxWALSegmentSize())
-	// Rotate every shard's WAL to a fresh segment, recording each shard's retired
-	// segment. A per-shard WAL means writes to other shards continue during this.
-	for _, sw := range db.wals {
-		num := db.alloc.Next()
-		if num == 0 {
-			return db.filterSafeSeq.Load(), ErrFileNumberExhausted
-		}
-		path, err := db.store.logPath(sw.shard, num)
-		if err != nil {
-			return db.filterSafeSeq.Load(), err
-		}
-		f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o644)
-		if err != nil {
-			return db.filterSafeSeq.Load(), err
-		}
-		if err := syncDir(filepath.Dir(path)); err != nil {
-			_ = f.Close()
-			_ = db.store.removeLog(sw.shard, num)
-			return db.filterSafeSeq.Load(), err
-		}
-		oldNum := sw.num
-		oldFile, err := sw.wal.rotate(f)
-		if err != nil {
-			_ = f.Close()
-			_ = removeFileDurable(path)
-			return db.filterSafeSeq.Load(), err
-		}
-		sw.file = f
-		sw.num = num
-		sw.retired = append(sw.retired, oldNum)
-		if err := oldFile.Close(); err != nil {
-			return db.filterSafeSeq.Load(), err
-		}
+	// Rotate the WAL to a fresh segment, recording the retired segment.
+	num := db.alloc.Next()
+	if num == 0 {
+		return db.filterSafeSeq.Load(), ErrFileNumberExhausted
+	}
+	path, err := db.store.logPath(num)
+	if err != nil {
+		return db.filterSafeSeq.Load(), err
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o644)
+	if err != nil {
+		return db.filterSafeSeq.Load(), err
+	}
+	if err := syncDir(filepath.Dir(path)); err != nil {
+		_ = f.Close()
+		_ = db.store.removeLog(num)
+		return db.filterSafeSeq.Load(), err
+	}
+	oldNum := db.wal.num
+	oldFile, err := db.wal.wal.rotate(f)
+	if err != nil {
+		_ = f.Close()
+		_ = removeFileDurable(path)
+		return db.filterSafeSeq.Load(), err
+	}
+	db.wal.file = f
+	db.wal.num = num
+	db.wal.retired = append(db.wal.retired, oldNum)
+	if err := oldFile.Close(); err != nil {
+		return db.filterSafeSeq.Load(), err
 	}
 
-	// Capture the cutoff so every seq <= cutoff is provably applied to a memtable.
-	// readSeq is published (CAS-max) only after a batch applies, but a lower-seq
-	// batch can still be mid-apply (un-published) while a higher-seq batch has
-	// already published - so readSeq alone can exceed an un-applied lower seq. A
-	// writer holds db.mu.RLock across its whole batch (apply then publish), so take
-	// db.mu exclusively for the instant of the read: it drains every in-flight writer
-	// past apply, making readSeq a true contiguous watermark. Without this barrier a
-	// crash could replay a value a compaction filter dropped from a table
-	// (resurrection). Holding it only for the Load keeps writers unblocked during the
-	// slow double-Flush below.
-	//
-	// A failed multi-shard append can leave some shards applied but unpublished; that
-	// path sets a background error, which the check after the flushes below returns on
-	// before filterSafeSeq advances, so the gap never reaches the cutoff.
+	// readSeq is a true contiguous watermark: a writer holds db.mu.RLock across
+	// its whole batch (apply then publish), and there is one commit stream, so
+	// once the current writers drain past apply every seq <= readSeq is applied.
+	// Take db.mu exclusively for the instant of the read to drain in-flight
+	// writers, so the cutoff never precedes an un-applied write; without it a
+	// crash could replay a value a compaction filter dropped from a table.
 	db.mu.Lock()
 	cutoff := db.readSeq.Load()
 	db.mu.Unlock()
 
-	// Two passes cover a shard that already had an immutable memtable when the
-	// checkpoint began: the first drains it, the second captures the active table
-	// that contains every write from the retired segment.
-	for _, s := range db.shards {
-		if err := s.Flush(); err != nil {
-			return db.filterSafeSeq.Load(), err
-		}
-		if err := s.Flush(); err != nil {
-			return db.filterSafeSeq.Load(), err
-		}
+	// Two passes cover the case where an immutable memtable already existed when
+	// the checkpoint began: the first drains it, the second captures the active
+	// table that contains every write from the retired segment.
+	if err := db.eng.Flush(); err != nil {
+		return db.filterSafeSeq.Load(), err
+	}
+	if err := db.eng.Flush(); err != nil {
+		return db.filterSafeSeq.Load(), err
 	}
 	if err := db.backgroundError(); err != nil {
 		return db.filterSafeSeq.Load(), err
 	}
-	// Every shard is flushed through cutoff; retire each shard's old segments.
-	for _, sw := range db.wals {
-		for len(sw.retired) > 0 {
-			if err := db.store.removeLog(sw.shard, sw.retired[0]); err != nil {
-				return db.filterSafeSeq.Load(), err
-			}
-			sw.retired = sw.retired[1:]
+	// Flushed through cutoff; retire the old segments.
+	for len(db.wal.retired) > 0 {
+		if err := db.store.removeLog(db.wal.retired[0]); err != nil {
+			return db.filterSafeSeq.Load(), err
 		}
+		db.wal.retired = db.wal.retired[1:]
 	}
 	// Advance filterSafeSeq only forward: a concurrent force checkpoint may already
 	// have stored a higher cutoff, so never move it backward.
@@ -1478,80 +1189,55 @@ func (db *DB) checkpointWALMode(force bool) (uint64, error) {
 	return safe, nil
 }
 
-// applyCommitted installs one durable WAL batch into its shard's memtable. It
-// does NOT advance readSeq: the writer publishes the sequence via publishSeq once
-// every shard of its (possibly multi-shard) batch is applied, so a snapshot never
-// observes a batch half-applied across shards. Each shard WAL's committer invokes
-// this in that shard's commit order; with per-shard WALs several run concurrently,
-// and a batch carries entries for a single shard (writeBatch fans out per shard).
+// applyCommitted installs one durable WAL batch into the memtable and advances
+// readSeq over it. The single WAL commits batches in seq order, so readSeq is a
+// simple forward store and a snapshot never observes a half-applied batch.
 func (db *DB) applyCommitted(entries []walEntry) {
 	if len(entries) == 0 {
 		return
 	}
-	shard := entries[0].Shard
-	s := db.shards[shard]
 	for i := range entries {
 		e := &entries[i]
 		switch e.Kind {
 		case walKindDelete:
-			s.del(e.Seq, e.Key)
+			db.eng.del(e.Seq, e.Key)
 		case walKindPutTTL:
-			s.putTTL(e.Seq, e.Key, e.Value, e.ExpiresAt)
+			db.eng.putTTL(e.Seq, e.Key, e.Value, e.ExpiresAt)
 		default:
-			s.Put(e.Seq, e.Key, e.Value)
+			db.eng.Put(e.Seq, e.Key, e.Value)
 		}
 	}
-	// Signal this shard if it reached the flush threshold; the scheduler drains it
-	// off this goroutine so writes are not blocked by flush or compaction.
-	if s.needFlush() {
-		db.sched.Signal(shard)
+	db.publishSeq(entries[len(entries)-1].Seq)
+	// Signal a flush if the memtable reached the threshold; the scheduler drains
+	// it off this goroutine so writes are not blocked by flush or compaction.
+	if db.eng.needFlush() {
+		db.sched.Signal()
 	}
 }
 
-// publishRange marks the batch's contiguous seq range [lo, hi] applied and
-// advances readSeq over the fully-applied contiguous prefix. A plain CAS-max on hi
-// would expose seqs that a still-in-flight lower-seq batch has not applied: a
-// concurrent writer that reserved a higher range and finished first would publish
-// its hi, making a snapshot see a lower batch half-applied. Because every batch
-// now owns a contiguous range (assigned under seqMu) and every reserved seq is
-// eventually applied, advancing only the contiguous prefix keeps readSeq a true
-// "all seqs <= readSeq are applied" watermark, so no batch is ever seen partially.
-//
-// Out-of-order completions are buffered in pendingRanges and merged when the gap
-// before them fills. The common case (the next expected range completes) merges
-// nothing and just advances readSeq.
-func (db *DB) publishRange(lo, hi uint64) {
-	db.seqPublishMu.Lock()
-	if lo == db.readSeq.Load()+1 {
-		next := hi
-		// Drain any buffered ranges now contiguous with the advanced watermark.
-		for {
-			r, ok := db.pendingRanges[next+1]
-			if !ok {
-				break
-			}
-			delete(db.pendingRanges, next+1)
-			next = r
+// publishSeq advances readSeq to seq. Batches commit in seq order on the single
+// WAL, so a forward CAS keeps readSeq a true "all seqs <= readSeq are applied"
+// watermark.
+func (db *DB) publishSeq(seq uint64) {
+	for {
+		cur := db.readSeq.Load()
+		if seq <= cur {
+			return
 		}
-		db.readSeq.Store(next)
-	} else {
-		// A lower range is still outstanding; buffer this one until the gap fills.
-		db.pendingRanges[lo] = hi
+		if db.readSeq.CompareAndSwap(cur, seq) {
+			return
+		}
 	}
-	db.seqPublishMu.Unlock()
 }
 
-// flushShard flushes one shard and runs any ready compaction, recording each
-// change in the manifest. It is the scheduler's per-shard work unit, so at most
-// CompactionConcurrency shards run it at once.
-func (db *DB) flushShard(i int) {
-	s := db.shards[i]
+// flushEngine flushes the memtable and runs any ready compaction, recording each
+// change in the manifest. It is the scheduler's work unit.
+func (db *DB) flushEngine() {
+	s := db.eng
 
-	// A writer can fill the new active memtable while an older immutable is
-	// being flushed. Such writes cannot signal another flush until the immutable
-	// is installed, so re-check here and drain every over-limit active table.
-	// Without this loop, the last oversized memtable in a burst could remain in
-	// memory indefinitely when no later write arrived to signal it again.
+	// A writer can fill the new active memtable while an older immutable is being
+	// flushed. Such writes cannot signal another flush until the immutable is
+	// installed, so re-check here and drain every over-limit active table.
 	for {
 		logFlush := db.log.Enabled(context.Background(), slog.LevelDebug)
 		var memSize int64
@@ -1561,14 +1247,14 @@ func (db *DB) flushShard(i int) {
 			start = time.Now()
 		}
 		if err := s.Flush(); err != nil {
-			db.log.Error("flush failed", "op", "flush", "shard", i, "err", err)
+			db.log.Error("flush failed", "op", "flush", "err", err)
 			db.setBackgroundError(err)
 			return
 		}
 		if logFlush {
 			_, l0Bytes := s.tierTableStats(0)
 			db.log.Debug("memtable flushed",
-				"op", "flush", "shard", i, "memtable_bytes", memSize,
+				"op", "flush", "memtable_bytes", memSize,
 				"l0_tables", s.tierTableCount(0), "l0_bytes", l0Bytes, "dur", time.Since(start))
 		}
 		if !s.needFlush() {
@@ -1576,16 +1262,15 @@ func (db *DB) flushShard(i int) {
 		}
 	}
 
-	// Drain all ready tiers so a burst of flushes does not leave the shard
+	// Drain all ready tiers so a burst of flushes does not leave the engine
 	// permanently over the tier ratio, and reclaim delete-heavy tiers early.
 	for {
 		// A tombstone can only be dropped when the retained sequence covers it.
 		// While a live snapshot pins the oldest retained sequence below the
 		// committed one, a tombstone-triggered compaction reclaims nothing and
 		// merely relocates the delete-heavy tier one level deeper, where it
-		// re-fires without bound (unbounded-depth churn). Gate the trigger off in
-		// that state; count-based compaction still runs. This preview is cheap and
-		// does not reserve a compaction filter slot.
+		// re-fires without bound. Gate the trigger off in that state; count-based
+		// compaction still runs.
 		tombstoneRatio := db.opts.TombstoneCompactionRatio
 		if db.snaps.oldest(db.readSeq.Load()) < db.readSeq.Load() {
 			tombstoneRatio = 0
@@ -1610,31 +1295,30 @@ func (db *DB) flushShard(i int) {
 			startTables = s.tierTableCount(depth)
 			start = time.Now()
 			db.log.Debug("compaction started",
-				"op", "compaction", "shard", i, "depth", depth, "input_tables", startTables)
+				"op", "compaction", "depth", depth, "input_tables", startTables)
 		}
 		err = s.Compact(depth, retain, cc)
 		release()
 		if err != nil {
-			db.log.Error("compaction failed", "op", "compaction", "shard", i, "depth", depth, "err", err)
+			db.log.Error("compaction failed", "op", "compaction", "depth", depth, "err", err)
 			db.setBackgroundError(err)
 			break
 		}
 		if logCompaction {
 			outTables, outBytes := s.tierTableStats(depth + 1)
 			db.log.Debug("compaction done",
-				"op", "compaction", "shard", i, "depth", depth,
+				"op", "compaction", "depth", depth,
 				"input_tables", startTables, "output_tables", outTables,
 				"output_bytes", outBytes, "dur", time.Since(start))
 		}
 	}
 }
 
-// CompactRange forces a full compaction of every shard, collapsing all tiers
-// so tombstones and dead versions are reclaimed without waiting for the tier
-// threshold. The start/end bounds are advisory: the Partitioner interface does
-// not expose a range-to-shard mapping, so all shards are compacted regardless.
-// Versions a live snapshot may still read are retained. It blocks until done
-// and is serialized against background compaction per shard.
+// CompactRange forces a full compaction, collapsing all tiers so tombstones and
+// dead versions are reclaimed without waiting for the tier threshold. The
+// start/end bounds are advisory: the whole keyspace is compacted regardless.
+// Versions a live snapshot may still read are retained. It blocks until done and
+// is serialized against background compaction.
 func (db *DB) CompactRange(start, end []byte) error {
 	db.mu.RLock()
 	err := db.validateManualCompaction()
@@ -1654,48 +1338,7 @@ func (db *DB) CompactRange(start, end []byte) error {
 	}
 	_ = start
 	_ = end
-	for _, s := range db.shards {
-		if err := db.compactShardFully(s); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// CompactShard forces a full compaction of a single shard by index, collapsing
-// all its tiers so tombstones and dead versions are reclaimed. It is the
-// per-shard form of CompactRange, useful for a known hot or bloated shard.
-func (db *DB) CompactShard(shard int) error {
-	db.mu.RLock()
-	err := db.validateManualCompaction()
-	shardCount := len(db.shards)
-	db.mu.RUnlock()
-	if err != nil {
-		return err
-	}
-	if shard < 0 || shard >= shardCount {
-		return fmt.Errorf("levisdb: shard %d out of range [0,%d)", shard, shardCount)
-	}
-	if db.opts.CompactionFilter != nil {
-		if _, err := db.prepareCompactionFilter(); err != nil {
-			return err
-		}
-	}
-	db.mu.RLock()
-	defer db.mu.RUnlock()
-	if err := db.validateManualCompaction(); err != nil {
-		return err
-	}
-	return db.compactShardFully(db.shards[shard])
-}
-
-// CompactShardRange forces a full compaction of a single shard. The start/end
-// bounds are advisory (the whole shard is compacted) and exist to mirror
-// CompactRange for callers that scope work by both shard and key range.
-func (db *DB) CompactShardRange(shard int, start, end []byte) error {
-	_ = start
-	_ = end
-	return db.CompactShard(shard)
+	return db.compactEngineFully()
 }
 
 // validateManualCompaction checks state while the caller holds db.mu for the
@@ -1714,10 +1357,10 @@ func (db *DB) validateManualCompaction() error {
 	return nil
 }
 
-// compactShardFully flushes the shard then merges all its tables into sized
-// bottom-tier outputs, reclaiming tombstones and dead versions.
-func (db *DB) compactShardFully(s *shardT) error {
-	if err := s.Flush(); err != nil {
+// compactEngineFully flushes then merges all tables into sized bottom-tier
+// outputs, reclaiming tombstones and dead versions.
+func (db *DB) compactEngineFully() error {
+	if err := db.eng.Flush(); err != nil {
 		return err
 	}
 
@@ -1725,12 +1368,9 @@ func (db *DB) compactShardFully(s *shardT) error {
 	if err != nil {
 		return err
 	}
-	err = s.CompactAll(retain, cc)
+	err = db.eng.CompactAll(retain, cc)
 	release()
-	if err != nil {
-		return err
-	}
-	return nil
+	return err
 }
 
 // NewIterator returns an iterator over the whole keyspace at the latest

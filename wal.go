@@ -71,8 +71,8 @@ func newWAL(file *os.File, obs walObserver, cfg walConfig) *walT {
 // append durably logs a batch of entries and returns once they are fsync'd and
 // the observer (if any) has been notified. Entries must already carry ascending
 // Seqs. It is safe for concurrent use. Used by recovery replay and tests; the
-// live write path uses enqueue + runCommit so it can order enqueue across shards
-// under the DB's seqMu (see appendToShardWALs).
+// live write path uses enqueue + runCommit so it can order the enqueue under the
+// DB's seqMu while committing outside it (see appendWAL).
 func (w *walT) append(entries []walEntry) error {
 	pb, mustCommit, err := w.enqueue(entries)
 	if err != nil {
@@ -81,15 +81,14 @@ func (w *walT) append(entries []walEntry) error {
 	return w.runCommit(pb, mustCommit)
 }
 
-// enqueue adds a pre-sequenced batch to this WAL's pending queue and reports
+// enqueue adds a pre-sequenced batch to the WAL's pending queue and reports
 // whether the caller must drive the commit (it is the first writer in) or another
 // in-flight committer will drain it. Entries must already carry their Seq. The
-// caller enqueues under the DB's seqMu so a shard's records are queued in
-// ascending seq order (recovery treats a regressing seq within a shard as
-// corruption). commit/fsync happens after enqueue returns and outside seqMu, so
-// shards persist in parallel. w.apply installs the batch into the memtable but
-// does NOT advance readSeq; the caller publishes readSeq once the whole batch is
-// applied, keeping a multi-shard batch atomic to concurrent snapshots.
+// caller enqueues under the DB's seqMu so records are queued in ascending seq
+// order (recovery treats a regressing seq as corruption). commit/fsync happens
+// after enqueue returns and outside seqMu, so a slow commit does not serialize
+// the next batch's enqueue. w.apply installs the batch into the memtable and the
+// committer advances readSeq in commit order.
 func (w *walT) enqueue(entries []walEntry) (pb *pendingBatch, mustCommit bool, err error) {
 	if len(entries) == 0 {
 		return nil, false, nil
@@ -129,8 +128,8 @@ func (w *walT) runCommit(pb *pendingBatch, mustCommit bool) error {
 // commit drains all pending batches, writes them to the journal as one group,
 // fsyncs once, then fires the observer and wakes waiters. It loops until no
 // batches remain so late arrivals are not stranded. Entry sequence numbers are
-// assigned by the caller (the DB's global sequence) before append, so a per-shard
-// WAL preserves cross-shard ordering; the WAL only persists them.
+// assigned by the caller (the DB's global sequence) before append; the WAL only
+// persists them.
 func (w *walT) commit() {
 	for {
 		w.mu.Lock()
@@ -263,9 +262,9 @@ func (w *walT) Close() error {
 // rotate atomically switches future appends to file after making the old
 // segment durable, returning the old file for the caller to close. It waits for
 // the active group committer so no record is split across segments. It settles
-// this shard's in-flight commits, but the checkpoint's cutoff still needs a
-// db.mu barrier: a writer can hold a reserved seq below readSeq without having
-// appended to any shard yet, which rotate cannot see.
+// in-flight commits, but the checkpoint's cutoff still needs a db.mu barrier: a
+// writer can hold a reserved seq below readSeq without having appended yet, which
+// rotate cannot see.
 func (w *walT) rotate(file *os.File) (*os.File, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -340,8 +339,8 @@ func replayWALFile(file *os.File, startSeq uint64) (entries []walEntry, seq uint
 // unframeable chunk, or an undecodable batch record) is treated like a torn
 // tail: replay stops at the last intact record and returns nil, recovering the
 // prefix instead of failing the whole open. Semantic errors raised by visit
-// (e.g. a record naming the wrong shard) still propagate regardless, since they
-// signal a logic/format problem rather than bit rot.
+// (e.g. an empty key or a regressing sequence) still propagate regardless, since
+// they signal a logic/format problem rather than bit rot.
 func replayWALFileVisit(file *os.File, startSeq uint64, lenient bool, visit func([]walEntry) error) (seq uint64, err error) {
 	r := newJournalReader(file)
 	seq = startSeq

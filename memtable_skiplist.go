@@ -30,7 +30,7 @@ const (
 )
 
 // skiplist is a single-writer, concurrent-reader ordered map over internal
-// keys. levisdb serializes writes through the shard lock; readers traverse via
+// keys. levisdb serializes writes through the engine lock; readers traverse via
 // offsets that, once written, are never moved (the arena only grows by append),
 // so a reader never observes a torn node.
 type skiplist struct {
@@ -54,10 +54,31 @@ func newSkiplist(seed int64) *skiplist {
 // allocNode appends a node with the given key/value and height and returns its
 // offset. The arena may reallocate (grow) here; that is safe because only the
 // single writer calls allocNode and existing offsets stay valid.
+//
+// The arena grows in place within its capacity (the extra bytes a prior make
+// already zeroed, so next pointers default to nilNode); it reallocates into a
+// fresh, larger array only when capacity runs out. A snapshot iterator that
+// pinned the arena slice keeps its own header (ptr+len), so an in-place extend
+// only exposes bytes beyond that reader's frozen len, and a realloc leaves the
+// reader's array untouched - both are safe lock-free. Growing this way avoids
+// the throwaway `make([]byte, size)` temporary that append(...make...) allocates
+// on every node (the dominant write-path allocation).
 func (s *skiplist) allocNode(key, value []byte, height int) uint32 {
 	off := uint32(len(s.arena))
 	size := nodeHeaderLen + height*4 + len(key) + len(value)
-	s.arena = append(s.arena, make([]byte, size)...)
+	need := len(s.arena) + size
+	if need > cap(s.arena) {
+		// Double the capacity (at least enough for this node) into a new array,
+		// leaving any pinned reader's old array intact. make zeroes the tail.
+		newCap := cap(s.arena) * 2
+		if newCap < need {
+			newCap = need
+		}
+		grown := make([]byte, len(s.arena), newCap)
+		copy(grown, s.arena)
+		s.arena = grown
+	}
+	s.arena = s.arena[:need] // extend into zeroed capacity; no per-node alloc
 
 	binary.LittleEndian.PutUint32(s.arena[off:], uint32(len(key)))
 	binary.LittleEndian.PutUint32(s.arena[off+4:], uint32(len(value)))

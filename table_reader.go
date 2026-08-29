@@ -268,8 +268,8 @@ func (tr *tableReader) get(userKey []byte, seq uint64) (value []byte, found, del
 }
 
 // lookupAtTime returns the newest visible version in this table together with
-// its sequence. The shard read path needs the sequence because compaction
-// output file creation order is not data recency order. When copyValue is
+// its sequence. The read path needs the sequence because compaction output file
+// creation order is not data recency order. When copyValue is
 // false, the returned value aliases the decoded block and is valid only for
 // the immediate consumer.
 func (tr *tableReader) lookupAtTime(userKey []byte, seq uint64, now int64, copyValue bool) (value []byte, versionSeq uint64, found, deleted bool, err error) {
@@ -528,7 +528,9 @@ func (it *tableIterator) Next() bool {
 			it.err = splitErr
 			return false
 		}
-		it.inner = dataBlockIter{entries: entries}
+		// Reset in place so the key-reconstruction buffers are reused across blocks
+		// instead of reallocated per block (a full scan walks every block).
+		it.inner.resetEntries(entries)
 		it.loaded = true
 	}
 }

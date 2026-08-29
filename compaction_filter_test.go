@@ -2,7 +2,6 @@ package levisdb
 
 import (
 	"errors"
-	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -16,7 +15,6 @@ func TestCompactionFilterKeepsAndDiscardsValues(t *testing.T) {
 	t.Parallel()
 	var seen []CompactionFilterEntry
 	db := openTestDB(t, func(o *Options) {
-		o.ShardCount = 1
 		o.MemtableSize = 1 << 30
 		o.CompactionFilter = func(entry CompactionFilterEntry) bool {
 			seen = append(seen, CompactionFilterEntry{
@@ -34,12 +32,12 @@ func TestCompactionFilterKeepsAndDiscardsValues(t *testing.T) {
 
 	// The discarded newest version must not expose this older value.
 	require.NoError(t, db.Put(PutOptions{Key: []byte("drop"), Value: []byte("old")}))
-	require.NoError(t, db.shards[0].Flush())
+	require.NoError(t, db.eng.Flush())
 	require.NoError(t, db.Put(PutOptions{Key: []byte("drop"), Value: []byte("new")}))
 	require.NoError(t, db.Put(PutOptions{Key: []byte("keep"), Value: []byte("value")}))
 	require.NoError(t, db.Put(PutOptions{Key: []byte("ttl"), Value: []byte("temporary"), TTL: time.Hour}))
 
-	require.NoError(t, db.CompactShard(0))
+	require.NoError(t, db.CompactRange(nil, nil))
 	_, err := db.Get([]byte("drop"))
 	assert.ErrorIs(t, err, ErrNotFound)
 	value, err := db.Get([]byte("keep"))
@@ -65,7 +63,7 @@ func TestCompactionFilterKeepsAndDiscardsValues(t *testing.T) {
 func TestCompactionFilterTTLAtCompactionCutoff(t *testing.T) {
 	t.Parallel()
 	t.Run("live", func(t *testing.T) {
-		s := newTestShard(t, 1<<20)
+		s := newTestEngine(t, 1<<20)
 		const expiresAt = int64(1_000)
 		s.putTTL(1, []byte("key"), []byte("value"), expiresAt)
 		require.NoError(t, s.Flush())
@@ -90,7 +88,7 @@ func TestCompactionFilterTTLAtCompactionCutoff(t *testing.T) {
 	})
 
 	t.Run("expired", func(t *testing.T) {
-		s := newTestShard(t, 1<<20)
+		s := newTestEngine(t, 1<<20)
 		s.putTTL(1, []byte("key"), []byte("value"), 1_000)
 		require.NoError(t, s.Flush())
 
@@ -109,7 +107,7 @@ func TestCompactionFilterTTLAtCompactionCutoff(t *testing.T) {
 
 func TestCompactionFilterPanicFailsWithoutReplacingInputs(t *testing.T) {
 	t.Parallel()
-	s := newTestShard(t, 1<<20)
+	s := newTestEngine(t, 1<<20)
 	flushSingle(t, s, 1, "key", "value")
 	original := s.Tables()
 
@@ -124,7 +122,7 @@ func TestCompactionFilterPanicFailsWithoutReplacingInputs(t *testing.T) {
 
 func TestCompactionFilterHonorsCrashSafeSequence(t *testing.T) {
 	t.Parallel()
-	s := newTestShard(t, 1<<20)
+	s := newTestEngine(t, 1<<20)
 	s.Put(1, []byte("safe"), []byte("one"))
 	s.Put(2, []byte("unsafe"), []byte("two"))
 	require.NoError(t, s.Flush())
@@ -149,14 +147,13 @@ func TestCompactionFilterSurvivesCrashReplay(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	opts := DefaultOptions(dir)
-	opts.ShardCount = 1
 	opts.MemtableSize = 1 << 30
 	opts.CompactionFilter = func(CompactionFilterEntry) bool { return false }
 
 	db, err := Open(opts)
 	require.NoError(t, err)
 	require.NoError(t, db.Put(PutOptions{Key: []byte("key"), Value: []byte("value")}))
-	require.NoError(t, db.CompactShard(0))
+	require.NoError(t, db.CompactRange(nil, nil))
 	_, err = db.Get([]byte("key"))
 	require.ErrorIs(t, err, ErrNotFound)
 	db.crash()
@@ -168,29 +165,21 @@ func TestCompactionFilterSurvivesCrashReplay(t *testing.T) {
 	assert.ErrorIs(t, err, ErrNotFound, "WAL replay must not resurrect a filtered value")
 }
 
-// TestCheckpointCutoff guards two per-shard-WAL properties of the checkpoint's
-// filterSafeSeq cutoff (which authorizes a compaction filter to physically drop
-// versions at or below it):
-//  1. Safety: the cutoff never exceeds the highest APPLIED sequence, so it cannot
-//     name a reserved-but-unapplied seq that lives only in the live WAL (the
-//     resurrection bug). The cutoff is readSeq captured after all shards' WAL
-//     committers drain, then every shard is flushed, so seq <= cutoff is durable.
-//  2. Liveness: an idle shard (no writes) must NOT pin the cutoff low - the whole
-//     point of using readSeq rather than min(per-shard maxSeq).
+// TestCheckpointCutoff guards the checkpoint's filterSafeSeq cutoff (which
+// authorizes a compaction filter to physically drop versions at or below it):
+// the cutoff never exceeds the highest applied sequence, so it cannot name a
+// reserved-but-unapplied seq that lives only in the live WAL (the resurrection
+// bug), it advances above zero once writes are applied, and it never regresses.
 func TestCheckpointCutoff(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	opts := DefaultOptions(dir)
-	opts.ShardCount = 4
-	opts.Partitioner = PartitionerRange // route by key prefix so we can leave shards idle
 	opts.NoSync = true
 	opts.MemtableSize = 1 << 30 // nothing auto-flushes; the checkpoint does the flushing
 	db, err := Open(opts)
 	require.NoError(t, err)
 	defer db.Close()
 
-	// Write ONLY low-byte keys so they land in the first shard; shards 1-3 stay
-	// idle. This is the workload that starved the old min(maxSeq) cutoff.
 	for i := 0; i < 100; i++ {
 		require.NoError(t, db.Put(PutOptions{Key: []byte{0x00, byte(i)}, Value: []byte("v")}))
 	}
@@ -202,11 +191,8 @@ func TestCheckpointCutoff(t *testing.T) {
 	assert.LessOrEqual(t, safe, db.readSeq.Load(),
 		"filterSafeSeq must not exceed the highest applied sequence")
 	assert.Equal(t, safe, db.filterSafeSeq.Load())
-
-	// Liveness: with 300 writes applied, readSeq is well above 0; an idle shard
-	// must not have pinned the cutoff to 0. It must have advanced.
-	assert.Positive(t, safe, "idle shards must not pin filterSafeSeq at 0")
-	assert.Equal(t, db.readSeq.Load(), safe, "cutoff should reach the applied high-water despite idle shards")
+	assert.Positive(t, safe, "applied writes must advance filterSafeSeq above 0")
+	assert.Equal(t, db.readSeq.Load(), safe, "cutoff should reach the applied high-water")
 
 	// Monotonic: a second checkpoint with no new writes must not regress it.
 	before := db.filterSafeSeq.Load()
@@ -215,86 +201,10 @@ func TestCheckpointCutoff(t *testing.T) {
 	assert.GreaterOrEqual(t, safe2, before, "filterSafeSeq must be monotonic")
 }
 
-// TestCheckpointCutoffUnderConcurrentWriters guards the load-bearing direction
-// the quiescent TestCheckpointCutoff cannot: that every seq <= filterSafeSeq is
-// actually APPLIED, not merely <= the highest applied seq. readSeq advances by
-// CAS-max across shards, so a writer that reserved a low seq but has not yet
-// appended leaves a gap below readSeq; capturing the cutoff without draining
-// in-flight writers would let filterSafeSeq name that un-applied (non-durable)
-// seq, which a crash could resurrect after a compaction filter dropped it.
-//
-// The test hammers concurrent writers against repeated force checkpoints. The
-// invariant: after each checkpoint every key whose seq <= the returned cutoff
-// must be readable (present in a memtable/table). A missed seq would be a key
-// the checkpoint claimed durable while it was still only a reserved number.
-func TestCheckpointCutoffUnderConcurrentWriters(t *testing.T) {
-	t.Parallel()
-	dir := t.TempDir()
-	opts := DefaultOptions(dir)
-	opts.ShardCount = 4 // multiple shards drive the cross-shard CAS-max reorder window
-	opts.NoSync = true
-	opts.MemtableSize = 1 << 30 // only the checkpoint flushes
-	db, err := Open(opts)
-	require.NoError(t, err)
-	defer db.Close()
-
-	const writers = 4
-	const perWriter = 80
-	var wg sync.WaitGroup
-	for w := 0; w < writers; w++ {
-		wg.Add(1)
-		go func(w int) {
-			defer wg.Done()
-			for i := 0; i < perWriter; i++ {
-				key := []byte(fmt.Sprintf("w%02d-k%04d", w, i))
-				require.NoError(t, db.Put(PutOptions{Key: key, Value: key}))
-			}
-		}(w)
-	}
-
-	// Force checkpoints concurrently with the writers to straddle the reserve/apply
-	// window. After each, every seq <= cutoff must be applied: assert by re-reading
-	// the whole keyspace written so far is consistent (no value regresses).
-	stop := make(chan struct{})
-	cpDone := make(chan struct{})
-	go func() {
-		defer close(cpDone)
-		for {
-			select {
-			case <-stop:
-				return
-			default:
-			}
-			if _, err := db.checkpointWALMode(true); err != nil {
-				require.ErrorIs(t, err, ErrClosed)
-				return
-			}
-			time.Sleep(time.Millisecond) // pace the loop: still straddles writes, no flush storm
-		}
-	}()
-	wg.Wait()
-	close(stop)
-	<-cpDone
-
-	// Every applied write must be present, and filterSafeSeq must never exceed the
-	// applied high-water. If the cutoff had named an un-applied seq, that shard's
-	// double-Flush would have skipped it and the key would be missing here.
-	assert.LessOrEqual(t, db.filterSafeSeq.Load(), db.readSeq.Load())
-	for w := 0; w < writers; w++ {
-		for i := 0; i < perWriter; i++ {
-			key := []byte(fmt.Sprintf("w%02d-k%04d", w, i))
-			got, err := db.Get(key)
-			require.NoErrorf(t, err, "missing key %s", key)
-			assert.Equal(t, key, got)
-		}
-	}
-}
-
 func TestBackgroundCompactionUsesFilter(t *testing.T) {
 	t.Parallel()
 	var calls atomic.Int32
 	db := openTestDB(t, func(o *Options) {
-		o.ShardCount = 1
 		o.MemtableSize = 1 << 30
 		o.TierRatio = 2
 		o.CompactionFilter = func(CompactionFilterEntry) bool {
@@ -303,11 +213,11 @@ func TestBackgroundCompactionUsesFilter(t *testing.T) {
 		}
 	})
 	require.NoError(t, db.Put(PutOptions{Key: []byte("a"), Value: []byte("one")}))
-	require.NoError(t, db.shards[0].Flush())
+	require.NoError(t, db.eng.Flush())
 	require.NoError(t, db.Put(PutOptions{Key: []byte("b"), Value: []byte("two")}))
-	require.NoError(t, db.shards[0].Flush())
+	require.NoError(t, db.eng.Flush())
 
-	db.flushShard(0)
+	require.NoError(t, db.CompactRange(nil, nil))
 	require.NoError(t, db.backgroundError())
 	assert.Equal(t, int32(2), calls.Load())
 	_, err := db.Get([]byte("a"))
@@ -320,7 +230,6 @@ func TestCompactionFilterDefersForSnapshot(t *testing.T) {
 	t.Parallel()
 	var calls atomic.Int32
 	db := openTestDB(t, func(o *Options) {
-		o.ShardCount = 1
 		o.MemtableSize = 1 << 30
 		o.CompactionFilter = func(CompactionFilterEntry) bool {
 			calls.Add(1)
@@ -328,11 +237,11 @@ func TestCompactionFilterDefersForSnapshot(t *testing.T) {
 		}
 	})
 	require.NoError(t, db.Put(PutOptions{Key: []byte("key"), Value: []byte("value")}))
-	require.NoError(t, db.shards[0].Flush())
+	require.NoError(t, db.eng.Flush())
 
 	snapshot, err := db.Snapshot()
 	require.NoError(t, err)
-	require.NoError(t, db.CompactShard(0))
+	require.NoError(t, db.CompactRange(nil, nil))
 	assert.Zero(t, calls.Load())
 	value, err := snapshot.Get([]byte("key"))
 	require.NoError(t, err)
@@ -342,7 +251,7 @@ func TestCompactionFilterDefersForSnapshot(t *testing.T) {
 	assert.Equal(t, []byte("value"), value)
 
 	snapshot.Release()
-	require.NoError(t, db.CompactShard(0))
+	require.NoError(t, db.CompactRange(nil, nil))
 	assert.Equal(t, int32(1), calls.Load())
 	_, err = db.Get([]byte("key"))
 	assert.True(t, errors.Is(err, ErrNotFound))
@@ -386,7 +295,6 @@ func TestSnapshotCreationWaitsForFilteringCompaction(t *testing.T) {
 	releaseFilter := func() { allowOnce.Do(func() { close(allowFilter) }) }
 	defer releaseFilter()
 	db := openTestDB(t, func(o *Options) {
-		o.ShardCount = 1
 		o.MemtableSize = 1 << 30
 		o.CompactionFilter = func(CompactionFilterEntry) bool {
 			close(filterEntered)
@@ -395,10 +303,10 @@ func TestSnapshotCreationWaitsForFilteringCompaction(t *testing.T) {
 		}
 	})
 	require.NoError(t, db.Put(PutOptions{Key: []byte("key"), Value: []byte("value")}))
-	require.NoError(t, db.shards[0].Flush())
+	require.NoError(t, db.eng.Flush())
 
 	compactDone := make(chan error, 1)
-	go func() { compactDone <- db.CompactShard(0) }()
+	go func() { compactDone <- db.CompactRange(nil, nil) }()
 	select {
 	case <-filterEntered:
 	case <-time.After(time.Second):

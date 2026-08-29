@@ -34,7 +34,6 @@ func TestSnapshotIsolation(t *testing.T) {
 func TestSnapshotSurvivesCompaction(t *testing.T) {
 	t.Parallel()
 	db := openTestDB(t, func(o *Options) {
-		o.ShardCount = 1
 		o.MemtableSize = 256
 	})
 
@@ -45,8 +44,8 @@ func TestSnapshotSurvivesCompaction(t *testing.T) {
 
 	// Churn: overwrite k many times and add keys to force flush+compaction
 	// while the snapshot is held.
-	// One shard makes 60 generations sufficient to produce several tables and
-	// force compaction without spending the package budget on unrelated I/O.
+	// 60 generations produce several tables and force compaction without
+	// spending the package budget on unrelated I/O.
 	for i := 0; i < 60; i++ {
 		require.NoError(t, db.Put(PutOptions{Key: []byte("k"), Value: []byte(fmt.Sprintf("update%d", i))}))
 		require.NoError(t, db.Put(PutOptions{Key: []byte(fmt.Sprintf("pad%04d", i)), Value: []byte("p")}))

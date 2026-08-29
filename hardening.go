@@ -2,7 +2,7 @@ package levisdb
 
 // This file documents the durability and concurrency invariants that
 // hardening_test.go exercises end to end. They are enforced by code spread
-// across db.go, wal.go, engine_shard.go, and the manifest, but collected here
+// across db.go, wal.go, engine.go, and the manifest, but collected here
 // so the guarantees the hardening tests protect are stated in one place.
 //
 // Crash recovery:

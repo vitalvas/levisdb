@@ -4,9 +4,8 @@
 // is where the balanced-workload read speed comes from.
 //
 // The cache is striped into independent LRU shards, each with its own mutex, so
-// concurrent readers across the database's key shards do not serialize on one
-// lock (even a cache hit mutates LRU order). A block maps to a stripe by
-// hashing its (table, offset) key.
+// concurrent readers do not serialize on one lock (even a cache hit mutates LRU
+// order). A block maps to a stripe by hashing its (table, offset) key.
 
 package levisdb
 

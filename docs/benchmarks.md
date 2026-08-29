@@ -1,16 +1,15 @@
 # Benchmarks
 
-levisdb runs single-shard here so the comparison measures the storage engine, not
-levisdb's sharding layer (goleveldb is not sharded). NoSync. The 1M-element results
-are below; a 50M-element run is at the end.
+Both engines run with NoSync so the comparison measures the storage engine. The
+1M-element results are below; a 50M-element run is at the end.
 
 ## Write (1,000,000 elements)
 
 | Value | levisdb | goleveldb |
 | --- | --- | --- |
-| 16 B | 503 ms | **341 ms** |
-| 256 B | **931 ms** | 1.86 s |
-| 1 KB | **1.88 s** | 6.64 s |
+| 16 B | 435 ms | **357 ms** |
+| 256 B | **938 ms** | 1.79 s |
+| 1 KB | **1.85 s** | 6.80 s |
 
 The write gap widens with value size: goleveldb's leveled write amplification grows
 with the data moved per level, while levisdb's size-tiered path stays efficient.
@@ -19,15 +18,19 @@ with the data moved per level, while levisdb's size-tiered path stays efficient.
 
 | Value | levisdb | goleveldb |
 | --- | --- | --- |
-| 16 B | **560 ns/op** (137 B, 5 allocs) | 2,642 ns/op (1,473 B, 17 allocs) |
-| 256 B | **1,003 ns/op** (583 B, 5 allocs) | 2,920 ns/op (1,186 B, 17 allocs) |
+| 16 B | **553 ns/op** (121 B, 4 allocs) | 2,646 ns/op (1,472 B, 17 allocs) |
+| 256 B | **966 ns/op** (567 B, 4 allocs) | 2,922 ns/op (1,185 B, 17 allocs) |
 
 ## Full scan (1,000,000 elements)
 
 | Value | levisdb | goleveldb |
 | --- | --- | --- |
-| 16 B | 134 ms (9.2 MB, 21.9k allocs) | **54 ms** (14.3 MB, 53.8k allocs) |
-| 256 B | **84 ms** (9.3 MB, 188k allocs) | 172 ms (45.6 MB, 441k allocs) |
+| 16 B | **40 ms** (0.5 MB, 48 allocs) | 54 ms (14.3 MB, 53.9k allocs) |
+| 256 B | **61 ms** (1.1 MB, 60 allocs) | 161 ms (45.4 MB, 441k allocs) |
+
+Scan allocations are near-constant: the iterator reuses its key-reconstruction and
+decompression buffers across blocks, so a full scan does not scale allocations
+with the row count.
 
 ## Large scale (50,000,000 elements)
 
@@ -37,23 +40,24 @@ Bulk load and random point read at 50M elements.
 
 | Value | levisdb | goleveldb |
 | --- | --- | --- |
-| 16 B | **14.97 s** | 21.68 s |
-| 256 B | **86.9 s** | 139.7 s |
+| 16 B | **12.76 s** | 21.44 s |
+| 256 B | **78.65 s** | 138.19 s |
 
 ### Random point read
 
 | Value | levisdb | goleveldb |
 | --- | --- | --- |
-| 16 B | **2.44 µs/op** | 79.9 µs/op |
-| 256 B | **2.93 µs/op** | 91.0 µs/op |
+| 16 B | **2.67 µs/op** | 11.27 µs/op |
+| 256 B | **3.22 µs/op** | 31.01 µs/op |
 
-The read gap widens to ~30x at 50M: goleveldb traverses a deep leveled tree with
-cold-cache misses, while levisdb stays at a few microseconds. The 50M read figures
-are steady-state timings of random gets taken after the load has settled.
+At 50M elements levisdb stays at a few microseconds per read while goleveldb slows
+as it traverses a deeper leveled tree with more cold-cache misses; the gap widens
+with value size. The 50M read figures are steady-state timings of random gets taken
+after the load has settled.
 
 ## Overlap-scoped compaction (tier of 6 disjoint key ranges)
 
 | Overlap selection | Time/op | Bytes merged/op |
 | --- | --- | --- |
-| on (default) | **20.7 ms** | **74 KB** |
-| off | 81.1 ms | 444 KB |
+| on (default) | **17.7 ms** | **74 KB** |
+| off | 82.6 ms | 444 KB |

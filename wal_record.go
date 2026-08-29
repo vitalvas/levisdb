@@ -1,4 +1,4 @@
-// WAL records encode batches of mutations for the shared write-ahead log.
+// WAL records encode batches of mutations for the write-ahead log.
 
 package levisdb
 
@@ -21,10 +21,9 @@ const (
 	walKindPutTTL
 )
 
-// Entry is one mutation in a batch. Seq and Shard are assigned by the writer.
+// Entry is one mutation in a batch. Seq is assigned by the writer.
 type walEntry struct {
 	Seq       uint64
-	Shard     int
 	Kind      walKindType
 	Key       []byte
 	Value     []byte
@@ -32,7 +31,7 @@ type walEntry struct {
 }
 
 // Record encoding: a batch is [count][entry...], each entry
-// [kind(1)][shard(uvarint)][keylen(uvarint)][key][optional expiry(varint)]
+// [kind(1)][keylen(uvarint)][key][optional expiry(varint)]
 // [vallen(uvarint)][val]. Expiry is present only for walKindPutTTL.
 // The base sequence number for the batch is stored once at the front so the
 // per-entry Seq can be reconstructed on replay without storing it per entry.
@@ -49,7 +48,6 @@ func encodeBatch(dst []byte, baseSeq uint64, entries []walEntry) []byte {
 	for i := range entries {
 		e := &entries[i]
 		dst = append(dst, byte(e.Kind))
-		dst = binary.AppendUvarint(dst, uint64(e.Shard))
 		dst = binary.AppendUvarint(dst, uint64(len(e.Key)))
 		dst = append(dst, e.Key...)
 		if e.Kind == walKindPutTTL {
@@ -96,13 +94,13 @@ func decodeBatch(rec []byte) ([]walEntry, error) {
 			return nil, fmt.Errorf("wal: unknown entry kind %d", kind)
 		}
 
-		shard, key, r, err := readShardKey(rest)
+		key, r, err := readBytes(rest)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("wal: key: %w", err)
 		}
 		rest = r
 
-		e := walEntry{Seq: baseSeq + i, Shard: shard, Kind: kind, Key: key}
+		e := walEntry{Seq: baseSeq + i, Kind: kind, Key: key}
 		if kind == walKindPutTTL {
 			expiresAt, used := binary.Varint(rest)
 			if used <= 0 || expiresAt <= 0 {
@@ -125,22 +123,6 @@ func decodeBatch(rec []byte) ([]walEntry, error) {
 		return nil, fmt.Errorf("wal: trailing bytes")
 	}
 	return entries, nil
-}
-
-func readShardKey(rest []byte) (shard int, key, remaining []byte, err error) {
-	s, n := binary.Uvarint(rest)
-	if n <= 0 {
-		return 0, nil, nil, fmt.Errorf("wal: bad shard")
-	}
-	if s > uint64(^uint(0)>>1) {
-		return 0, nil, nil, fmt.Errorf("wal: shard overflows int")
-	}
-	rest = rest[n:]
-	key, rest, err = readBytes(rest)
-	if err != nil {
-		return 0, nil, nil, fmt.Errorf("wal: key: %w", err)
-	}
-	return int(s), key, rest, nil
 }
 
 func readBytes(rest []byte) (data, remaining []byte, err error) {

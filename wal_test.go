@@ -50,11 +50,11 @@ func TestWALPersistsCallerSeqAndObserves(t *testing.T) {
 	// The caller (the DB's global sequence) assigns Seq; the WAL persists and
 	// observes the entries with those sequences unchanged.
 	require.NoError(t, w.append([]walEntry{
-		{Shard: 0, Kind: walKindPut, Key: []byte("a"), Value: []byte("1"), Seq: 1},
-		{Shard: 0, Kind: walKindPut, Key: []byte("b"), Value: []byte("2"), Seq: 2},
+		{Kind: walKindPut, Key: []byte("a"), Value: []byte("1"), Seq: 1},
+		{Kind: walKindPut, Key: []byte("b"), Value: []byte("2"), Seq: 2},
 	}))
 	require.NoError(t, w.append([]walEntry{
-		{Shard: 0, Kind: walKindDelete, Key: []byte("c"), Seq: 3},
+		{Kind: walKindDelete, Key: []byte("c"), Seq: 3},
 	}))
 	require.NoError(t, w.Close())
 
@@ -80,7 +80,7 @@ func TestWALConcurrentAppend(t *testing.T) {
 			defer wg.Done()
 			// Each goroutine supplies a unique caller-assigned seq (1..n).
 			assert.NoError(t, w.append([]walEntry{
-				{Shard: 0, Kind: walKindPut, Key: []byte{byte(i)}, Value: []byte("v"), Seq: uint64(i + 1)},
+				{Kind: walKindPut, Key: []byte{byte(i)}, Value: []byte("v"), Seq: uint64(i + 1)},
 			}))
 		}(i)
 	}
@@ -112,11 +112,11 @@ func TestReplayWALFile(t *testing.T) {
 	f, path := openWALFile(t)
 	w := newWAL(f, nil, walConfig{sync: true})
 	require.NoError(t, w.append([]walEntry{
-		{Shard: 0, Kind: walKindPut, Key: []byte("a"), Value: []byte("1"), Seq: 1},
-		{Shard: 2, Kind: walKindDelete, Key: []byte("b"), Seq: 2},
+		{Kind: walKindPut, Key: []byte("a"), Value: []byte("1"), Seq: 1},
+		{Kind: walKindDelete, Key: []byte("b"), Seq: 2},
 	}))
 	require.NoError(t, w.append([]walEntry{
-		{Shard: 1, Kind: walKindPut, Key: []byte("c"), Value: []byte("3"), Seq: 3},
+		{Kind: walKindPut, Key: []byte("c"), Value: []byte("3"), Seq: 3},
 	}))
 	require.NoError(t, w.Close())
 
@@ -217,7 +217,7 @@ func BenchmarkWALAppend(b *testing.B) {
 	require.NoError(b, err)
 	// sync=false so the benchmark measures encode+write throughput, not fsync.
 	w := newWAL(f, nil, walConfig{sync: false})
-	entry := walEntry{Shard: 0, Kind: walKindPut, Key: []byte("key"), Value: []byte("value")}
+	entry := walEntry{Kind: walKindPut, Key: []byte("key"), Value: []byte("value")}
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {

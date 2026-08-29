@@ -18,9 +18,9 @@ import (
 // Below the cap, the count trigger still fires normally.
 func TestPickCompactionCapTierIsTerminal(t *testing.T) {
 	t.Parallel()
-	s := newTestShard(t, 1<<30)
+	s := newTestEngine(t, 1<<30)
 	// Stub TierRatio (=8) tables at the cap tier with distinct data, no tombstones.
-	// These are metadata-only stubs (no file handle); clear them before the shard's
+	// These are metadata-only stubs (no file handle); clear them before the engine's
 	// Cleanup Close so it does not try to release a nil handle.
 	s.mu.Lock()
 	for i := 0; i < 8; i++ {
@@ -41,7 +41,7 @@ func TestPickCompactionCapTierIsTerminal(t *testing.T) {
 		"tombstone-heavy cap tier is still reclaimed")
 
 	// A tier BELOW the cap with >= ratio tables is picked by count as usual.
-	s2 := newTestShard(t, 1<<30)
+	s2 := newTestEngine(t, 1<<30)
 	s2.mu.Lock()
 	for i := 0; i < 4; i++ {
 		s2.tables = append(s2.tables, &tableMeta{depth: maxTierDepth - 1, size: 1 << 20, entries: 1000})
@@ -62,8 +62,8 @@ func TestCompactOutputDepthCapped(t *testing.T) {
 	tablePath := func(num uint32) (string, error) {
 		return filepath.Join(dir, fmt.Sprintf("%08x.sst", num)), nil
 	}
-	cfg := shardConfigT{MemtableSize: 1 << 30, BloomBits: 10, BlockSize: 256, FreshCodecName: "none"}
-	s := newShard(cfg, newAllocator(0), tablePath, 1)
+	cfg := engineConfigT{MemtableSize: 1 << 30, BloomBits: 10, BlockSize: 256, FreshCodecName: "none"}
+	s := newEngine(cfg, newAllocator(0), tablePath)
 	t.Cleanup(func() { s.Close() })
 
 	// Write two real L0 tables, then relocate them to the cap tier with openTable so
@@ -99,7 +99,7 @@ func TestCompactOutputDepthCapped(t *testing.T) {
 // file offset - the same basis.)
 func TestCompactionRollsOnCompressedSize(t *testing.T) {
 	t.Parallel()
-	s := newTestShard(t, 1<<30)
+	s := newTestEngine(t, 1<<30)
 
 	// Two L0 tables of all-zero values: raw bytes far exceed the target, but they
 	// compress to almost nothing, so the merged output must be a single table.
@@ -138,7 +138,7 @@ func testCompactionConfig() compactionConfigT {
 }
 
 // flushSingle writes one key/value at seq into a fresh L0 table.
-func flushSingle(t *testing.T, s *shardT, seq uint64, key, val string) {
+func flushSingle(t *testing.T, s *engineT, seq uint64, key, val string) {
 	t.Helper()
 	s.Put(seq, []byte(key), []byte(val))
 	require.NoError(t, s.Flush())
@@ -173,7 +173,7 @@ func TestTargetFileSize(t *testing.T) {
 
 func TestPickCompaction(t *testing.T) {
 	t.Parallel()
-	s := newTestShard(t, 1<<20)
+	s := newTestEngine(t, 1<<20)
 
 	t.Run("nothing ready", func(t *testing.T) {
 		assert.Equal(t, -1, s.pickCompaction(2, 0, 0))
@@ -189,7 +189,7 @@ func TestPickCompaction(t *testing.T) {
 
 // flushLarge writes many rows so the resulting L0 table is a few hundred KiB,
 // then flushes it. Repeated calls build a tier of few-but-large tables.
-func flushLarge(t *testing.T, s *shardT, seqBase uint64, keyPrefix string, rows int) {
+func flushLarge(t *testing.T, s *engineT, seqBase uint64, keyPrefix string, rows int) {
 	t.Helper()
 	val := make([]byte, 512)
 	for i := 0; i < rows; i++ {
@@ -207,7 +207,7 @@ func flushLarge(t *testing.T, s *shardT, seqBase uint64, keyPrefix string, rows 
 // ~1.5 MiB of tier bytes, picker returns -1 at ratio 4.
 func TestPickCompactionLargeTableStall(t *testing.T) {
 	t.Parallel()
-	s := newTestShard(t, 1<<30) // large memtable so only explicit Flush rolls a table
+	s := newTestEngine(t, 1<<30) // large memtable so only explicit Flush rolls a table
 
 	const tables = 3 // below the default TierRatio of 4
 	for i := 0; i < tables; i++ {
@@ -240,7 +240,7 @@ func TestPickCompactionDensityTrigger(t *testing.T) {
 	t.Parallel()
 
 	t.Run("large tier picked below count ratio", func(t *testing.T) {
-		s := newTestShard(t, 1<<30)
+		s := newTestEngine(t, 1<<30)
 		for i := 0; i < 3; i++ { // below ratio 4
 			flushLarge(t, s, uint64(i*1000+1), fmt.Sprintf("t%d-k", i), 1000)
 		}
@@ -258,7 +258,7 @@ func TestPickCompactionDensityTrigger(t *testing.T) {
 	})
 
 	t.Run("sparse tier below trigger stays idle", func(t *testing.T) {
-		s := newTestShard(t, 1<<30)
+		s := newTestEngine(t, 1<<30)
 		flushSingle(t, s, 1, "a", "1")
 		flushSingle(t, s, 2, "b", "2") // two tiny tables, well under any real trigger
 		assert.Equal(t, -1, s.pickCompaction(4, 1<<30, 0),
@@ -266,7 +266,7 @@ func TestPickCompactionDensityTrigger(t *testing.T) {
 	})
 
 	t.Run("single table never compacted alone", func(t *testing.T) {
-		s := newTestShard(t, 1<<30)
+		s := newTestEngine(t, 1<<30)
 		flushLarge(t, s, 1, "k", 2000) // one big table
 		s.mu.RLock()
 		bytes := s.tables[0].size
@@ -365,7 +365,7 @@ func TestOverlapSets(t *testing.T) {
 // merges one group and leaves the other tables in place.
 func TestOverlapScopedCompaction(t *testing.T) {
 	t.Parallel()
-	s := newTestShard(t, 1<<30)
+	s := newTestEngine(t, 1<<30)
 
 	// Seed a deeper tier so the depth-0 compaction below is NOT the bottom (overlap
 	// selection is exempt at the bottom, which must merge wholly for tombstone GC).
@@ -413,7 +413,6 @@ func TestOverlapScopedCompactionSurvivesCrash(t *testing.T) {
 	dir := t.TempDir()
 	opts := func() Options {
 		o := DefaultOptions(dir)
-		o.ShardCount = 1
 		o.NoSync = true
 		o.MemtableSize = 4096 // small so writes flush to several L0 tables
 		return o
@@ -427,7 +426,7 @@ func TestOverlapScopedCompactionSurvivesCrash(t *testing.T) {
 		require.NoError(t, db.Put(PutOptions{Key: []byte(fmt.Sprintf("lo-%05d", i)), Value: []byte("v")}))
 		require.NoError(t, db.Put(PutOptions{Key: []byte(fmt.Sprintf("hi-%05d", i)), Value: []byte("v")}))
 	}
-	require.NoError(t, db.CompactShard(0)) // exercises the overlap-scoped path
+	require.NoError(t, db.CompactRange(nil, nil)) // exercises the overlap-scoped path
 	db.crash()
 
 	db, err = Open(opts())
@@ -443,7 +442,7 @@ func TestOverlapScopedCompactionSurvivesCrash(t *testing.T) {
 
 func TestCompactCollapsesVersions(t *testing.T) {
 	t.Parallel()
-	s := newTestShard(t, 1<<20)
+	s := newTestEngine(t, 1<<20)
 
 	// Three generations of the same key across three L0 tables.
 	flushSingle(t, s, 1, "k", "v1")
@@ -462,7 +461,7 @@ func TestCompactCollapsesVersions(t *testing.T) {
 
 func TestCompactRetainsSnapshotVersions(t *testing.T) {
 	t.Parallel()
-	s := newTestShard(t, 1<<20)
+	s := newTestEngine(t, 1<<20)
 	flushSingle(t, s, 1, "k", "v1")
 	flushSingle(t, s, 5, "k", "v5")
 
@@ -476,7 +475,7 @@ func TestCompactRetainsSnapshotVersions(t *testing.T) {
 
 func TestCompactDropsTombstonesAtBottom(t *testing.T) {
 	t.Parallel()
-	s := newTestShard(t, 1<<20)
+	s := newTestEngine(t, 1<<20)
 	flushSingle(t, s, 1, "gone", "v1")
 	// A tombstone in its own table.
 	s.del(2, []byte("gone"))
@@ -492,7 +491,7 @@ func TestCompactDropsTombstonesAtBottom(t *testing.T) {
 
 func TestCompactNoOpBelowTwoInputs(t *testing.T) {
 	t.Parallel()
-	s := newTestShard(t, 1<<20)
+	s := newTestEngine(t, 1<<20)
 	flushSingle(t, s, 1, "k", "v1")
 	require.NoError(t, s.Compact(0, 0, testCompactionConfig()))
 	assert.Len(t, s.Tables(), 1, "single table left untouched")
@@ -502,7 +501,7 @@ func TestCompactErrors(t *testing.T) {
 	t.Parallel()
 
 	t.Run("bad bottom codec", func(t *testing.T) {
-		s := newTestShard(t, 1<<20)
+		s := newTestEngine(t, 1<<20)
 		// Two L0 tables => output tier is the bottom, so BottomCodecName is used.
 		flushSingle(t, s, 1, "a", "1")
 		flushSingle(t, s, 2, "b", "2")
@@ -513,7 +512,7 @@ func TestCompactErrors(t *testing.T) {
 	})
 
 	t.Run("non-bottom output uses fresh codec", func(t *testing.T) {
-		s := newTestShard(t, 1<<20)
+		s := newTestEngine(t, 1<<20)
 		// Two L0 tables merge to a single depth-1 table (the bottom).
 		flushSingle(t, s, 1, "a", "1")
 		flushSingle(t, s, 2, "b", "2")
@@ -541,8 +540,8 @@ func TestCompactErrors(t *testing.T) {
 			}
 			return filepath.Join(dir, fmt.Sprintf("%08x.sst", num)), nil
 		}
-		cfg := shardConfigT{MemtableSize: 1 << 20, BloomBits: 10, BlockSize: 256, FreshCodecName: "none"}
-		s := newShard(cfg, newAllocator(0), tablePath, 1)
+		cfg := engineConfigT{MemtableSize: 1 << 20, BloomBits: 10, BlockSize: 256, FreshCodecName: "none"}
+		s := newEngine(cfg, newAllocator(0), tablePath)
 		t.Cleanup(func() { s.Close() })
 
 		flushSingle(t, s, 1, "a", "1")
@@ -562,8 +561,8 @@ func TestCompactErrors(t *testing.T) {
 			}
 			return filepath.Join(dir, fmt.Sprintf("%08x.sst", num)), nil
 		}
-		cfg := shardConfigT{MemtableSize: 1 << 20, BloomBits: 10, BlockSize: 256, FreshCodecName: "none"}
-		s := newShard(cfg, newAllocator(0), tablePath, 1)
+		cfg := engineConfigT{MemtableSize: 1 << 20, BloomBits: 10, BlockSize: 256, FreshCodecName: "none"}
+		s := newEngine(cfg, newAllocator(0), tablePath)
 		t.Cleanup(func() { s.Close() })
 
 		flushSingle(t, s, 1, "a", "1")
@@ -574,7 +573,7 @@ func TestCompactErrors(t *testing.T) {
 
 func TestCompactManyKeys(t *testing.T) {
 	t.Parallel()
-	s := newTestShard(t, 1<<20)
+	s := newTestEngine(t, 1<<20)
 	// Two tables, disjoint keys, so the merge interleaves them.
 	for i := 0; i < 100; i++ {
 		s.Put(uint64(i+1), []byte(fmt.Sprintf("even%03d", i)), []byte("e"))
@@ -593,14 +592,14 @@ func TestCompactManyKeys(t *testing.T) {
 	}
 }
 
-func newBenchShard(b *testing.B) *shardT {
+func newBenchEngine(b *testing.B) *engineT {
 	b.Helper()
 	dir := b.TempDir()
 	tablePath := func(num uint32) (string, error) {
 		return filepath.Join(dir, fmt.Sprintf("%08x.sst", num)), nil
 	}
-	cfg := shardConfigT{MemtableSize: 1 << 30, BloomBits: 10, BlockSize: 4096, FreshCodecName: "s2"}
-	s := newShard(cfg, newAllocator(0), tablePath, 1)
+	cfg := engineConfigT{MemtableSize: 1 << 30, BloomBits: 10, BlockSize: 4096, FreshCodecName: "s2"}
+	s := newEngine(cfg, newAllocator(0), tablePath)
 	b.Cleanup(func() { s.Close() })
 	return s
 }
@@ -618,7 +617,7 @@ func BenchmarkCompactAll(b *testing.B) {
 	b.ResetTimer()
 	for n := 0; n < b.N; n++ {
 		b.StopTimer()
-		s := newBenchShard(b)
+		s := newBenchEngine(b)
 		seq := uint64(0)
 		// Four overlapping tables so the merge does real k-way work.
 		for t := 0; t < 4; t++ {
@@ -652,10 +651,10 @@ func benchCompactConfig(overlap bool) compactionConfigT {
 // buildDisjointTier builds a non-bottom L0 tier of `ranges` disjoint key ranges
 // (each in its own flushed table) over a pre-existing depth-1 seed table, so a
 // depth-0 compaction is intermediate (overlap selection applies) and only one
-// range's tables actually overlap. Returns the shard ready to Compact(0,...).
-func buildDisjointTier(b *testing.B, ranges, tablesPerRange, rows int) *shardT {
+// range's tables actually overlap. Returns the engine ready to Compact(0,...).
+func buildDisjointTier(b *testing.B, ranges, tablesPerRange, rows int) *engineT {
 	b.Helper()
-	s := newBenchShard(b)
+	s := newBenchEngine(b)
 	val := make([]byte, 100)
 	var seq uint64
 	put := func(prefix string) {
@@ -731,9 +730,9 @@ func BenchmarkCompactOverlapSelection(b *testing.B) {
 }
 
 // BenchmarkPickCompaction measures the picker itself (count + density + tombstone
-// scan over a tier) since it runs on the compaction hot path per shard.
+// scan over a tier) since it runs on the compaction hot path.
 func BenchmarkPickCompaction(b *testing.B) {
-	s := newBenchShard(b)
+	s := newBenchEngine(b)
 	val := make([]byte, 100)
 	var seq uint64
 	for t := 0; t < 8; t++ {
@@ -779,7 +778,7 @@ func TestCapCompactionInputs(t *testing.T) {
 
 func TestCompactionByteCapDrainsTierOverRounds(t *testing.T) {
 	t.Parallel()
-	s := newTestShard(t, 1<<20)
+	s := newTestEngine(t, 1<<20)
 	defer s.Close()
 
 	// Build several depth-0 tables with distinct keys.
@@ -838,7 +837,7 @@ func TestRangesMayContain(t *testing.T) {
 // intermediate compaction, or the old value would reappear.
 func TestIntermediateTierGCDoesNotResurrect(t *testing.T) {
 	t.Parallel()
-	s := newTestShard(t, 1<<20)
+	s := newTestEngine(t, 1<<20)
 	defer s.Close()
 
 	cc := testCompactionConfig()
@@ -878,7 +877,7 @@ func TestIntermediateTierGCDoesNotResurrect(t *testing.T) {
 // compaction (freeing space) rather than being carried down.
 func TestIntermediateTierGCReclaimsWhenNoDeeperTier(t *testing.T) {
 	t.Parallel()
-	s := newTestShard(t, 1<<20)
+	s := newTestEngine(t, 1<<20)
 	defer s.Close()
 
 	cc := testCompactionConfig()
@@ -926,7 +925,7 @@ func TestIntermediateTierGCReclaimsWhenNoDeeperTier(t *testing.T) {
 // holds an older version of the key. Otherwise the deleted value resurfaces.
 func TestByteCappedIntermediateGCDoesNotResurrect(t *testing.T) {
 	t.Parallel()
-	s := newTestShard(t, 1<<20)
+	s := newTestEngine(t, 1<<20)
 	defer s.Close()
 
 	// Build three tables, then force them all to tier depth 1 (same tier) with a
@@ -986,7 +985,7 @@ func TestByteCappedIntermediateGCDoesNotResurrect(t *testing.T) {
 
 func TestTombstoneRatioTriggersCompaction(t *testing.T) {
 	t.Parallel()
-	s := newTestShard(t, 1<<20)
+	s := newTestEngine(t, 1<<20)
 	defer s.Close()
 
 	// Two depth-0 tables (below a high TierRatio) where most entries are deletes.
@@ -1006,7 +1005,7 @@ func TestTombstoneRatioTriggersCompaction(t *testing.T) {
 	assert.Equal(t, 0, s.pickCompaction(1000, 0, 0.5), "delete-heavy tier triggers at 0.5")
 
 	// A single table cannot compact alone even if delete-heavy (needs >= 2).
-	s2 := newTestShard(t, 1<<20)
+	s2 := newTestEngine(t, 1<<20)
 	defer s2.Close()
 	s2.del(1, []byte("x"))
 	require.NoError(t, s2.Flush())
@@ -1017,8 +1016,8 @@ func TestTombstoneCompactionReclaimsDeletedSpace(t *testing.T) {
 	t.Parallel()
 	// A delete-heavy tier with the count trigger off must be compacted down by the
 	// tombstone trigger so the deleted keys read as absent. Built deterministically
-	// at the shard level (no reliance on background flush timing).
-	s := newTestShard(t, 1<<20)
+	// at the engine level (no reliance on background flush timing).
+	s := newTestEngine(t, 1<<20)
 	defer s.Close()
 
 	// Two depth-0 tables that are all tombstones for a set of keys, plus a live

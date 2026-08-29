@@ -20,7 +20,7 @@ func (h discardHandler) WithGroup(string) slog.Handler           { return h }
 // newRootLogger returns the engine's root logger: the caller's logger tagged
 // with the "component"="levisdb" attribute so every event is attributable, or a
 // discarding logger when none was provided. Subsystems derive child loggers from
-// this with per-operation attributes (op, shard, table numbers), forming the
+// this with per-operation attributes (op, table numbers), forming the
 // init->leaf hierarchy: root -> subsystem -> operation.
 func newRootLogger(l *slog.Logger) *slog.Logger {
 	if l == nil {

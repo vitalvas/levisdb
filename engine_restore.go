@@ -15,8 +15,8 @@ type tableSnapshotT struct {
 	Tombstones int
 }
 
-// Tables returns a snapshot of the shard's live tables.
-func (s *shardT) Tables() []tableSnapshotT {
+// Tables returns a snapshot of the engine's live tables.
+func (s *engineT) Tables() []tableSnapshotT {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := make([]tableSnapshotT, len(s.tables))
@@ -34,12 +34,12 @@ func (s *shardT) Tables() []tableSnapshotT {
 	return out
 }
 
-// openTable opens an existing on-disk table file and installs it in the shard,
+// openTable opens an existing on-disk table file and installs it in the engine,
 // used to restore state from the manifest on open. Tables are installed in
 // ascending file-number order for deterministic snapshots; reads compare the
 // visible sequence because compaction file order is not data recency. A zero
 // spec.size is resolved by stat.
-func (s *shardT) openTable(spec tableSpec) error {
+func (s *engineT) openTable(spec tableSpec) error {
 	if spec.size == 0 {
 		info, serr := os.Stat(spec.path)
 		if serr != nil {

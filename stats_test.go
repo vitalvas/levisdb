@@ -10,12 +10,11 @@ import (
 
 func TestStats(t *testing.T) {
 	t.Parallel()
-	db := openTestDB(t, func(o *Options) { o.ShardCount = 4; o.MemtableSize = 256 })
+	db := openTestDB(t, func(o *Options) { o.MemtableSize = 256 })
 
 	// Fresh DB: no tables yet.
 	st, err := db.Stats()
 	require.NoError(t, err)
-	assert.Equal(t, 4, st.Shards)
 	assert.Equal(t, 0, st.Tables)
 	assert.Equal(t, 0, st.LiveSnapshots)
 
@@ -78,7 +77,7 @@ func TestGetProperty(t *testing.T) {
 	assert.Error(t, err)
 }
 
-func TestStatsCumulativeCountersAndPerShard(t *testing.T) {
+func TestStatsCumulativeCounters(t *testing.T) {
 	t.Parallel()
 	db := openTestDB(t, func(o *Options) { o.MemtableSize = 256 })
 
@@ -96,18 +95,6 @@ func TestStatsCumulativeCountersAndPerShard(t *testing.T) {
 	assert.Positive(t, st.FlushCount, "flushes counted")
 	assert.Positive(t, st.FlushBytesWritten, "flush bytes counted")
 
-	// Per-shard breakdown sums to the totals.
-	require.Len(t, st.PerShard, st.Shards)
-	var shardTables int
-	var shardSize int64
-	for i, ss := range st.PerShard {
-		assert.Equal(t, i, ss.Index)
-		shardTables += ss.Tables
-		shardSize += ss.TablesSize
-	}
-	assert.Equal(t, st.Tables, shardTables, "per-shard table counts sum to total")
-	assert.Equal(t, st.TablesSize, shardSize, "per-shard sizes sum to total")
-
 	// Reads populate cache hit/miss counters (a warm re-read should hit).
 	for i := 0; i < entries; i++ {
 		_, _ = db.Get([]byte(fmt.Sprintf("k%04d", i)))
@@ -122,7 +109,6 @@ func TestStatsCumulativeCountersAndPerShard(t *testing.T) {
 
 func BenchmarkStats(b *testing.B) {
 	o := DefaultOptions(b.TempDir())
-	o.ShardCount = 4
 	o.NoSync = true
 	db, err := Open(o)
 	require.NoError(b, err)

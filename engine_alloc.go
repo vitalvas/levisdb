@@ -2,8 +2,8 @@ package levisdb
 
 import "sync/atomic"
 
-// Allocator is a monotonic uint32 file-number source shared across all shards,
-// so every table, WAL segment, and manifest gets a globally-unique number.
+// Allocator is a monotonic uint32 file-number source, so every table, WAL
+// segment, and manifest gets a globally-unique number.
 //
 // The uint32 namespace is exhausted after ~4.3B lifetime files; allocation
 // then stops rather than wrapping. Widen to uint64 before approaching it.

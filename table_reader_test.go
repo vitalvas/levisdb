@@ -478,8 +478,8 @@ func TestTableMetadataEvictedWithDescriptor(t *testing.T) {
 		return filepath.Join(dir, fmt.Sprintf("%08x.sst", num)), nil
 	}
 	pool := newFDPool(3)
-	cfg := shardConfigT{MemtableSize: 1 << 20, BloomBits: 10, BlockSize: 256, FreshCodecName: "none", FDs: pool}
-	s := newShard(cfg, newAllocator(0), tablePath, 1)
+	cfg := engineConfigT{MemtableSize: 1 << 20, BloomBits: 10, BlockSize: 256, FreshCodecName: "none", FDs: pool}
+	s := newEngine(cfg, newAllocator(0), tablePath)
 	defer s.Close()
 
 	const tables = 12

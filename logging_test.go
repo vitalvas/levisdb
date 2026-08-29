@@ -59,7 +59,6 @@ func TestLoggingEmitsStorageEvents(t *testing.T) {
 
 	db := openTestDB(t, func(o *Options) {
 		o.Logger = logger
-		o.ShardCount = 1
 		o.MemtableSize = 1024 // tiny so a modest write count flushes and compacts
 	})
 	for i := 0; i < 800; i++ {

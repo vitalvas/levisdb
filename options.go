@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
-	"runtime"
 	"time"
 )
 
@@ -23,7 +22,6 @@ const (
 // consumer that retains them must copy.
 type WALEntry struct {
 	Seq   uint64        // monotonic log sequence number; a stable resume point
-	Shard int           // owning shard index
 	Kind  EntryKind     // EntryPut or EntryDelete
 	Key   []byte        // mutation key
 	Value []byte        // value for EntryPut; nil for EntryDelete
@@ -48,38 +46,9 @@ type WALObserver interface {
 	Observe(batch []WALEntry)
 }
 
-// Partitioner maps a key to one of numShards shards.
-//
-// The partitioner and shard count are baked into on-disk data: they decide
-// which shard owns each key. Reopening a database with a different partitioner
-// would misroute reads, so Name is persisted and verified on open.
-type Partitioner interface {
-	// Shard returns the owning shard index in [0, numShards). It must be
-	// deterministic and safe for concurrent use.
-	Shard(key []byte, numShards int) int
-
-	// Name is a stable identity persisted in the manifest and checked on open.
-	Name() string
-}
-
-// ShardRanger is an optional interface a Partitioner may implement when it is
-// order-preserving (shards own contiguous key ranges). A range iterator then
-// scans only the shards a query range can touch instead of all of them. A hash
-// partitioner scatters adjacent keys across every shard, so it must NOT implement
-// this; the iterator falls back to scanning all shards for those.
-type ShardRanger interface {
-	// ShardRange returns the half-open shard index range [lo, hi) that a key range
-	// [start, end) can touch. A nil start means from the smallest key; a nil end
-	// means unbounded above. The result must cover every shard that Shard would
-	// return for any key in [start, end); returning the full [0, numShards) is
-	// always correct but forgoes pruning.
-	ShardRange(start, end []byte, numShards int) (lo, hi int)
-}
-
 // Default option values. All are tunable so the engine can be calibrated
 // against a real spindle.
 const (
-	DefaultShardCount   = 8
 	DefaultMemtableSize = 2 << 20 // 2 MiB, matched to the fresh-tier file size
 	DefaultTierRatio    = 4
 	// DefaultTombstoneCompactionRatio compacts a tier once half its entries are
@@ -87,24 +56,17 @@ const (
 	// trigger. A negative value in Options disables it.
 	DefaultTombstoneCompactionRatio = 0.5
 	// DefaultL0SlowdownTables and DefaultL0StopTables set write backpressure a
-	// few multiples above TierRatio: writes slow once a shard's fresh tier is
-	// several compactions behind, and stop before the backlog grows unbounded.
-	DefaultL0SlowdownTables      = 16
-	DefaultL0StopTables          = 24
-	DefaultFileSizeBase          = 2 << 20 // 2 MiB
-	DefaultFileSizeMultiplier    = 2
-	DefaultFileSizeMax           = 16 << 20 // 16 MiB
-	DefaultBloomBits             = 10
-	DefaultBlockSize             = 4 << 10   // 4 KiB
-	DefaultBlockCacheSize        = 256 << 20 // 256 MiB
-	DefaultCompactionConcurrency = 1
-	DefaultMaxOpenFiles          = 1024 // bounded open table descriptors
-
-	// CompactionConcurrencyAuto, when set as CompactionConcurrency, resolves to
-	// one compactor per CPU (capped at ShardCount). Use only on fast or
-	// multi-disk storage; a single HDD wants the default of 1 to keep the head
-	// on one sequential stream.
-	CompactionConcurrencyAuto = -1
+	// few multiples above TierRatio: writes slow once the fresh tier is several
+	// compactions behind, and stop before the backlog grows unbounded.
+	DefaultL0SlowdownTables   = 16
+	DefaultL0StopTables       = 24
+	DefaultFileSizeBase       = 2 << 20 // 2 MiB
+	DefaultFileSizeMultiplier = 2
+	DefaultFileSizeMax        = 16 << 20 // 16 MiB
+	DefaultBloomBits          = 10
+	DefaultBlockSize          = 4 << 10   // 4 KiB
+	DefaultBlockCacheSize     = 256 << 20 // 256 MiB
+	DefaultMaxOpenFiles       = 1024      // bounded open table descriptors
 	DefaultFreshCodec         = CodecS2
 	// DefaultBottomCodec is S2 too: zstd's slow encode dominated compaction on
 	// large, compressible values (bottom-tier merges stalled). S2 keeps compaction
@@ -129,16 +91,16 @@ const (
 	// tables that together exceed 128 MiB yet stay below the count of 4.
 	defaultTierByteTriggerFiles = 8
 
-	// maxMemtableSize caps the per-shard flush threshold. The skiplist arena
-	// addresses nodes by uint32 offset and grows slightly faster than the tracked
-	// entry size (per-node header + level links), so the arena must never reach
-	// 2^32. 2 GiB leaves ample headroom below that boundary.
+	// maxMemtableSize caps the flush threshold. The skiplist arena addresses
+	// nodes by uint32 offset and grows slightly faster than the tracked entry
+	// size (per-node header + level links), so the arena must never reach 2^32.
+	// 2 GiB leaves ample headroom below that boundary.
 	maxMemtableSize = 2 << 30 // 2 GiB
 )
 
 // maxEntrySize caps a single key+value AND the cumulative bytes one batch may
-// add to a single shard (writeBatch), because a whole batch is applied before
-// any flush check. The skiplist arena (uint32 offsets) and the data-block
+// add (writeBatch), because a whole batch is applied before any flush check.
+// The skiplist arena (uint32 offsets) and the data-block
 // restart array (uint32 in-block offsets) both address data with 32-bit offsets,
 // so data approaching those limits would wrap and silently corrupt. Together
 // with the per-batch bound, mid-replay flushing on recovery, and MemtableSize <=
@@ -154,17 +116,7 @@ type Options struct {
 	// Dir is the data directory. Required.
 	Dir string
 
-	// Partitioner selects a built-in key-to-shard mapping: PartitionerHash
-	// (default, even spread via FNV-1a), PartitionerMurmur3 (even spread via
-	// MurmurHash3, better distribution for structured keys), or PartitionerRange
-	// (scan-local). Ignored when CustomPartitioner is set.
-	Partitioner string
-	// CustomPartitioner overrides Partitioner when non-nil.
-	CustomPartitioner Partitioner
-	// ShardCount is the number of shards. Baked into data; verified on open.
-	ShardCount int
-
-	// MemtableSize is the per-shard memtable flush threshold in bytes.
+	// MemtableSize is the memtable flush threshold in bytes.
 	MemtableSize int64
 	// TierRatio is the size-tiered compaction fan-out.
 	TierRatio int
@@ -186,14 +138,13 @@ type Options struct {
 	// value disables the trigger, leaving only the table-count trigger.
 	TombstoneCompactionRatio float64
 
-	// L0SlowdownTables and L0StopTables apply write backpressure per shard based
-	// on the number of fresh-tier (depth 0) tables, so a write burst cannot
-	// outrun the single serialized compactor and grow the tier ladder without
-	// bound. When a shard's depth-0 table count reaches L0SlowdownTables, writes
-	// to it are briefly delayed; at L0StopTables they block until the scheduler
-	// drains the shard below the slowdown mark. L0StopTables must be >=
-	// L0SlowdownTables. Zero uses the defaults; a negative value disables that
-	// threshold.
+	// L0SlowdownTables and L0StopTables apply write backpressure based on the
+	// number of fresh-tier (depth 0) tables, so a write burst cannot outrun the
+	// serialized compactor and grow the tier ladder without bound. When the
+	// depth-0 table count reaches L0SlowdownTables, writes are briefly delayed; at
+	// L0StopTables they block until the scheduler drains below the slowdown mark.
+	// L0StopTables must be >= L0SlowdownTables. Zero uses the defaults; a negative
+	// value disables that threshold.
 	L0SlowdownTables int
 	L0StopTables     int
 
@@ -234,12 +185,6 @@ type Options struct {
 	// default; a negative value keeps every table open (unbounded).
 	MaxOpenFiles int
 
-	// CompactionConcurrency bounds how many shards compact at once. Default 1
-	// keeps a single spindle to one sequential stream. Set it to
-	// CompactionConcurrencyAuto for one compactor per CPU (capped at
-	// ShardCount) on fast or multi-disk storage.
-	CompactionConcurrency int
-
 	// FreshCodec compresses fresh (upper) tiers: CodecS2, CodecZstd, or CodecNone.
 	FreshCodec string
 	// BottomCodec compresses the bottom (oldest) tier: CodecZstd, CodecS2, or
@@ -273,12 +218,12 @@ type Options struct {
 	// with no overhead beyond a cheap level check. Events are emitted at Debug for
 	// routine per-operation detail and Info for lifecycle milestones; attach a
 	// leveled handler to filter. The engine adds a "component"="levisdb" attribute
-	// and, per event, an "op" plus context like the shard index and table numbers.
+	// and, per event, an "op" plus context like table numbers.
 	Logger *slog.Logger
 
 	// CompactionFilter, if non-nil, is called for each non-deleted, unexpired
-	// value rewritten by compaction. It may be called concurrently by different
-	// shard compactors and must not call back into this DB. A panic fails compaction.
+	// value rewritten by compaction. It must not call back into this DB. A panic
+	// fails compaction.
 	// Filtering is deferred while snapshots, iterators, or point reads are live
 	// so their stable view cannot change underneath them. The database may force
 	// a WAL checkpoint before filtering to make discarded values crash-safe.
@@ -317,12 +262,6 @@ func DefaultOptions(dir string) Options {
 
 // fillDefaults sets any unset field to its default. It does not validate.
 func (o *Options) fillDefaults() {
-	if o.Partitioner == "" {
-		o.Partitioner = PartitionerHash
-	}
-	if o.ShardCount == 0 {
-		o.ShardCount = DefaultShardCount
-	}
 	if o.TierRatio == 0 {
 		o.TierRatio = DefaultTierRatio
 	}
@@ -378,18 +317,6 @@ func (o *Options) fillDefaults() {
 	if o.MaxOpenFiles == 0 {
 		o.MaxOpenFiles = DefaultMaxOpenFiles
 	}
-	switch o.CompactionConcurrency {
-	case 0:
-		o.CompactionConcurrency = DefaultCompactionConcurrency
-	case CompactionConcurrencyAuto:
-		// Auto: one compactor per CPU, but never more than there are shards to
-		// compact. Only sensible on fast/parallel storage; on a single spindle
-		// keep the spindle-safe default of 1 (see roadmap).
-		o.CompactionConcurrency = runtime.NumCPU()
-		if o.CompactionConcurrency > o.ShardCount {
-			o.CompactionConcurrency = o.ShardCount
-		}
-	}
 	if o.FreshCodec == "" {
 		o.FreshCodec = DefaultFreshCodec
 	}
@@ -401,31 +328,18 @@ func (o *Options) fillDefaults() {
 // validCodecs are the codec names accepted for FreshCodec and BottomCodec.
 var validCodecs = map[string]bool{CodecNone: true, CodecS2: true, CodecZstd: true}
 
-// validPartitioners are the built-in partitioner names accepted for Partitioner
-// when no CustomPartitioner is set.
-var validPartitioners = map[string]bool{PartitionerHash: true, PartitionerRange: true, PartitionerMurmur3: true}
-
 // validate checks that the options are internally consistent. It assumes
 // fillDefaults has already run.
 func (o *Options) validate() error {
 	if o.Dir == "" {
 		return fmt.Errorf("levisdb: Dir is required")
 	}
-	if o.CustomPartitioner == nil && !validPartitioners[o.Partitioner] {
-		return fmt.Errorf("levisdb: unknown partitioner %q", o.Partitioner)
-	}
-	if o.CustomPartitioner != nil && o.CustomPartitioner.Name() == "" {
-		return fmt.Errorf("levisdb: custom partitioner Name must not be empty")
-	}
-	if o.ShardCount < 1 {
-		return fmt.Errorf("levisdb: ShardCount must be >= 1, got %d", o.ShardCount)
-	}
 	if o.MemtableSize < 1 {
 		return fmt.Errorf("levisdb: MemtableSize must be positive, got %d", o.MemtableSize)
 	}
 	// The skiplist arena addresses nodes by uint32 offset, and the arena grows
 	// slightly faster than the tracked size (per-node header + links). Cap well
-	// under 4 GiB so one shard's memtable can never push the arena past 2^32 and
+	// under 4 GiB so the memtable can never push the arena past 2^32 and
 	// wrap an offset. See memtable_skiplist.go.
 	if o.MemtableSize > maxMemtableSize {
 		return fmt.Errorf("levisdb: MemtableSize must be <= %d (skiplist arena uses uint32 offsets), got %d", maxMemtableSize, o.MemtableSize)
@@ -457,9 +371,6 @@ func (o *Options) validate() error {
 	if o.BlockCacheSize < 0 {
 		return fmt.Errorf("levisdb: BlockCacheSize must be non-negative, got %d", o.BlockCacheSize)
 	}
-	if o.CompactionConcurrency < 1 {
-		return fmt.Errorf("levisdb: CompactionConcurrency must be >= 1, got %d", o.CompactionConcurrency)
-	}
 	if !validCodecs[o.FreshCodec] {
 		return fmt.Errorf("levisdb: unknown FreshCodec %q", o.FreshCodec)
 	}
@@ -472,12 +383,4 @@ func (o *Options) validate() error {
 		}
 	}
 	return nil
-}
-
-// partitionerName returns the identity that is persisted and verified on open.
-func (o *Options) partitionerName() string {
-	if o.CustomPartitioner != nil {
-		return o.CustomPartitioner.Name()
-	}
-	return builtinPartitioner(o.Partitioner).Name()
 }

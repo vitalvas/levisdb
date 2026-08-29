@@ -38,12 +38,18 @@ type tableWriter struct {
 	data       dataBlockBuilder
 	index      blockBuilder
 	hashes     []uint32
-	pendingBH  *blockHandle // handle of last flushed data block awaiting an index entry
-	firstKey   []byte       // first internal key added, for the table's min-key bound
+	pendingBH  blockHandle // handle of last flushed data block awaiting an index entry
+	hasPending bool        // whether pendingBH holds a block awaiting an index entry
+	firstKey   []byte      // first internal key added, for the table's min-key bound
 	lastKey    []byte
 	entries    int // total entries added
 	tombstones int // entries added that are tombstones (deletes)
-	err        error
+	// compScratch is the reusable compression-output buffer for finishBlock, so a
+	// flush or compaction does not allocate a fresh block buffer per data block.
+	// writeBlock consumes each block (writes it to tw.w) before the next call, so
+	// reusing this across blocks is safe.
+	compScratch []byte
+	err         error
 }
 
 // entryCount and tombstoneCount report how many entries were written and how
@@ -120,9 +126,9 @@ func (tw *tableWriter) Add(internalKey, value []byte) error {
 	// If a previous block was flushed, emit its index entry now. The index key
 	// is that block's full last internal key, so it remains a valid internal
 	// key and index lookups can compare it with ikeyCompare.
-	if tw.pendingBH != nil {
+	if tw.hasPending {
 		tw.index.add(tw.lastKey, tw.pendingBH.encode(nil))
-		tw.pendingBH = nil
+		tw.hasPending = false
 	}
 
 	tw.data.add(internalKey, value)
@@ -149,7 +155,8 @@ func (tw *tableWriter) flushDataBlock() {
 	// finish() appends the restart trailer to data.buf; reset() clears it after.
 	bh := tw.writeBlock(tw.data.finish(), tw.c)
 	tw.data.reset()
-	tw.pendingBH = &bh
+	tw.pendingBH = bh
+	tw.hasPending = true
 }
 
 // writeBlock finishes and writes a block, returning its handle.
@@ -157,7 +164,8 @@ func (tw *tableWriter) writeBlock(payload []byte, c blockCodec) blockHandle {
 	if tw.err != nil {
 		return blockHandle{}
 	}
-	block := finishBlock(payload, c, tw.entropySkip)
+	block := finishBlock(tw.compScratch, payload, c, tw.entropySkip)
+	tw.compScratch = block // retain the (possibly grown) backing array for reuse
 	if err := writeAll(tw.w, block); err != nil {
 		tw.err = err
 	}
@@ -175,10 +183,10 @@ func (tw *tableWriter) finish() (int64, error) {
 		return 0, tw.err
 	}
 	tw.flushDataBlock()
-	if tw.pendingBH != nil {
+	if tw.hasPending {
 		// Index the last data block with its own last key as separator.
 		tw.index.add(tw.lastKey, tw.pendingBH.encode(nil))
-		tw.pendingBH = nil
+		tw.hasPending = false
 	}
 
 	// Filter block: bloom is always stored uncompressed for direct access.
@@ -213,7 +221,8 @@ func (tw *tableWriter) writeRawBlock(payload []byte) blockHandle {
 	}
 	none, _ := codecFromID(codecNone)
 	// The none codec never triggers the entropy pre-check, so its setting is moot.
-	block := finishBlock(payload, none, false)
+	block := finishBlock(tw.compScratch, payload, none, false)
+	tw.compScratch = block // retain the backing array for reuse
 	if err := writeAll(tw.w, block); err != nil {
 		tw.err = err
 	}

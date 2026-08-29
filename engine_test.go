@@ -11,27 +11,26 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// newTestShard builds a standalone shard rooted in a temp dir, with a small
+// newTestEngine builds a standalone engine rooted in a temp dir, with a small
 // memtable threshold so flushes are easy to trigger.
-func newTestShard(t *testing.T, memSize int64) *shardT {
+func newTestEngine(t *testing.T, memSize int64) *engineT {
 	t.Helper()
 	dir := t.TempDir()
 	tablePath := func(num uint32) (string, error) {
 		return filepath.Join(dir, fmt.Sprintf("%08x.sst", num)), nil
 	}
-	cfg := shardConfigT{
-		Index:          0,
+	cfg := engineConfigT{
 		MemtableSize:   memSize,
 		BloomBits:      10,
 		BlockSize:      256,
 		FreshCodecName: "none",
 	}
-	s := newShard(cfg, newAllocator(0), tablePath, 1)
+	s := newEngine(cfg, newAllocator(0), tablePath)
 	t.Cleanup(func() { s.Close() })
 	return s
 }
 
-func mustGet(t *testing.T, s *shardT, seq uint64, key string) []byte {
+func mustGet(t *testing.T, s *engineT, seq uint64, key string) []byte {
 	t.Helper()
 	v, found, deleted, err := s.get(seq, []byte(key))
 	require.NoError(t, err)
@@ -40,9 +39,9 @@ func mustGet(t *testing.T, s *shardT, seq uint64, key string) []byte {
 	return v
 }
 
-func TestShardPutGet(t *testing.T) {
+func TestEnginePutGet(t *testing.T) {
 	t.Parallel()
-	s := newTestShard(t, 1<<20)
+	s := newTestEngine(t, 1<<20)
 
 	t.Run("memtable read", func(t *testing.T) {
 		s.Put(1, []byte("a"), []byte("1"))
@@ -73,9 +72,9 @@ func TestShardPutGet(t *testing.T) {
 	})
 }
 
-func TestShardMemState(t *testing.T) {
+func TestEngineMemState(t *testing.T) {
 	t.Parallel()
-	s := newTestShard(t, 64)
+	s := newTestEngine(t, 64)
 	assert.True(t, s.memEmpty())
 	assert.False(t, s.needFlush())
 
@@ -87,9 +86,9 @@ func TestShardMemState(t *testing.T) {
 	assert.True(t, s.needFlush())
 }
 
-func TestShardFlush(t *testing.T) {
+func TestEngineFlush(t *testing.T) {
 	t.Parallel()
-	s := newTestShard(t, 1<<20)
+	s := newTestEngine(t, 1<<20)
 
 	t.Run("empty flush is a no-op", func(t *testing.T) {
 		require.NoError(t, s.Flush())
@@ -111,9 +110,9 @@ func TestShardFlush(t *testing.T) {
 	})
 }
 
-func TestShardReadThroughLayers(t *testing.T) {
+func TestEngineReadThroughLayers(t *testing.T) {
 	t.Parallel()
-	s := newTestShard(t, 1<<20)
+	s := newTestEngine(t, 1<<20)
 
 	// v1 in a flushed table.
 	s.Put(1, []byte("k"), []byte("v1"))
@@ -125,13 +124,13 @@ func TestShardReadThroughLayers(t *testing.T) {
 	assert.Equal(t, []byte("v1"), mustGet(t, s, 1, "k"), "old snapshot reads the table version")
 }
 
-// TestShardFlushErrors covers writeTable's reachable failure branches (bad
+// TestEngineFlushErrors covers writeTable's reachable failure branches (bad
 // codec, tablePath error, os.OpenFile error).
 //
 // note: writeTable's f.Sync, w.Add/w.finish, and newCachedTableReader error
 // branches are unreachable in tests without syscall-failure injection, since
 // they only fire on I/O faults writing/reading a valid, freshly-created file.
-func TestShardFlushErrors(t *testing.T) {
+func TestEngineFlushErrors(t *testing.T) {
 	t.Parallel()
 
 	t.Run("bad codec surfaces from writeTable", func(t *testing.T) {
@@ -139,8 +138,8 @@ func TestShardFlushErrors(t *testing.T) {
 		tablePath := func(num uint32) (string, error) {
 			return filepath.Join(dir, fmt.Sprintf("%08x.sst", num)), nil
 		}
-		cfg := shardConfigT{MemtableSize: 1 << 20, BloomBits: 10, BlockSize: 256, FreshCodecName: "bogus"}
-		s := newShard(cfg, newAllocator(0), tablePath, 1)
+		cfg := engineConfigT{MemtableSize: 1 << 20, BloomBits: 10, BlockSize: 256, FreshCodecName: "bogus"}
+		s := newEngine(cfg, newAllocator(0), tablePath)
 		t.Cleanup(func() { s.Close() })
 
 		s.Put(1, []byte("k"), []byte("v"))
@@ -149,8 +148,8 @@ func TestShardFlushErrors(t *testing.T) {
 
 	t.Run("tablePath error", func(t *testing.T) {
 		want := errors.New("no path")
-		cfg := shardConfigT{MemtableSize: 1 << 20, BloomBits: 10, BlockSize: 256, FreshCodecName: "none"}
-		s := newShard(cfg, newAllocator(0), func(uint32) (string, error) { return "", want }, 1)
+		cfg := engineConfigT{MemtableSize: 1 << 20, BloomBits: 10, BlockSize: 256, FreshCodecName: "none"}
+		s := newEngine(cfg, newAllocator(0), func(uint32) (string, error) { return "", want })
 		t.Cleanup(func() { s.Close() })
 
 		s.Put(1, []byte("k"), []byte("v"))
@@ -160,10 +159,10 @@ func TestShardFlushErrors(t *testing.T) {
 	t.Run("open error on bad path", func(t *testing.T) {
 		dir := t.TempDir()
 		// A path whose parent is a file, not a directory, so os.OpenFile fails.
-		cfg := shardConfigT{MemtableSize: 1 << 20, BloomBits: 10, BlockSize: 256, FreshCodecName: "none"}
-		s := newShard(cfg, newAllocator(0), func(uint32) (string, error) {
+		cfg := engineConfigT{MemtableSize: 1 << 20, BloomBits: 10, BlockSize: 256, FreshCodecName: "none"}
+		s := newEngine(cfg, newAllocator(0), func(uint32) (string, error) {
 			return filepath.Join(dir, "missing-dir", "x.sst"), nil
-		}, 1)
+		})
 		t.Cleanup(func() { s.Close() })
 
 		s.Put(1, []byte("k"), []byte("v"))
@@ -171,9 +170,9 @@ func TestShardFlushErrors(t *testing.T) {
 	})
 }
 
-func TestShardGetImmutable(t *testing.T) {
+func TestEngineGetImmutable(t *testing.T) {
 	t.Parallel()
-	s := newTestShard(t, 1<<20)
+	s := newTestEngine(t, 1<<20)
 
 	// Seal the active memtable as immutable without flushing, then read through
 	// the imm layer. rotate installs a fresh empty active memtable.
@@ -184,7 +183,7 @@ func TestShardGetImmutable(t *testing.T) {
 	assert.Equal(t, []byte("v1"), mustGet(t, s, 10, "k"), "read served from immutable memtable")
 }
 
-func TestShardGetCorruptTableErrors(t *testing.T) {
+func TestEngineGetCorruptTableErrors(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	var wrote string
@@ -192,8 +191,8 @@ func TestShardGetCorruptTableErrors(t *testing.T) {
 		wrote = filepath.Join(dir, fmt.Sprintf("%08x.sst", num))
 		return wrote, nil
 	}
-	cfg := shardConfigT{MemtableSize: 1 << 20, BloomBits: 10, BlockSize: 4096, FreshCodecName: "none"}
-	s := newShard(cfg, newAllocator(0), tablePath, 1)
+	cfg := engineConfigT{MemtableSize: 1 << 20, BloomBits: 10, BlockSize: 4096, FreshCodecName: "none"}
+	s := newEngine(cfg, newAllocator(0), tablePath)
 	defer s.Close()
 
 	s.Put(1, []byte("present"), []byte("value"))
@@ -207,7 +206,7 @@ func TestShardGetCorruptTableErrors(t *testing.T) {
 	data[3] ^= 0xff
 	require.NoError(t, os.WriteFile(wrote, data, 0o644))
 
-	s2 := newShard(cfg, newAllocator(100), tablePath, 1)
+	s2 := newEngine(cfg, newAllocator(100), tablePath)
 	defer s2.Close()
 	require.NoError(t, s2.openTable(tableSpec{num: 1, depth: 0, path: wrote}))
 
@@ -242,9 +241,9 @@ func TestTableMetaMayContainAndOverlaps(t *testing.T) {
 	assert.True(t, unknown.overlapsRange([]byte("x"), []byte("y")))
 }
 
-func TestShardTableBoundsPopulatedAndReadSkip(t *testing.T) {
+func TestEngineTableBoundsPopulatedAndReadSkip(t *testing.T) {
 	t.Parallel()
-	s := newTestShard(t, 1<<20)
+	s := newTestEngine(t, 1<<20)
 	defer s.Close()
 
 	for _, k := range []string{"k10", "k20", "k30"} {

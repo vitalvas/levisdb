@@ -17,18 +17,18 @@ func TestEncodeDecodeBatch(t *testing.T) {
 	}{
 		{"empty", 1, nil},
 		{"single-put", 5, []walEntry{
-			{Shard: 3, Kind: walKindPut, Key: []byte("k"), Value: []byte("v")},
+			{Kind: walKindPut, Key: []byte("k"), Value: []byte("v")},
 		}},
 		{"delete-has-no-value", 10, []walEntry{
-			{Shard: 1, Kind: walKindDelete, Key: []byte("gone"), Value: []byte("ignored")},
+			{Kind: walKindDelete, Key: []byte("gone"), Value: []byte("ignored")},
 		}},
 		{"mixed", 100, []walEntry{
-			{Shard: 0, Kind: walKindPut, Key: []byte("a"), Value: []byte("1")},
-			{Shard: 7, Kind: walKindDelete, Key: []byte("b")},
-			{Shard: 255, Kind: walKindPut, Key: []byte(""), Value: []byte("")},
+			{Kind: walKindPut, Key: []byte("a"), Value: []byte("1")},
+			{Kind: walKindDelete, Key: []byte("b")},
+			{Kind: walKindPut, Key: []byte(""), Value: []byte("")},
 		}},
 		{"ttl", 200, []walEntry{
-			{Shard: 4, Kind: walKindPutTTL, Key: []byte("ttl"), Value: []byte("value"), ExpiresAt: 123456789},
+			{Kind: walKindPutTTL, Key: []byte("ttl"), Value: []byte("value"), ExpiresAt: 123456789},
 		}},
 	}
 	for _, tc := range cases {
@@ -39,7 +39,6 @@ func TestEncodeDecodeBatch(t *testing.T) {
 			require.Len(t, got, len(tc.entries))
 			for i, e := range tc.entries {
 				assert.Equal(t, tc.baseSeq+uint64(i), got[i].Seq)
-				assert.Equal(t, e.Shard, got[i].Shard)
 				assert.Equal(t, e.Kind, got[i].Kind)
 				assert.Equal(t, e.Key, got[i].Key)
 				assert.Equal(t, e.ExpiresAt, got[i].ExpiresAt)
@@ -67,7 +66,7 @@ func TestEncodeBatchAppendsToDst(t *testing.T) {
 func TestDecodeBatchErrors(t *testing.T) {
 	t.Parallel()
 	valid := encodeBatch(nil, 1, []walEntry{
-		{Shard: 1, Kind: walKindPut, Key: []byte("key"), Value: []byte("val")},
+		{Kind: walKindPut, Key: []byte("key"), Value: []byte("val")},
 	})
 
 	// rec builds a record with an 8-byte baseSeq header followed by payload.
@@ -84,14 +83,12 @@ func TestDecodeBatchErrors(t *testing.T) {
 		{"truncated-after-count", valid[:9]},
 		// count uvarint unreadable (empty payload): "bad entry count".
 		{"bad-entry-count", rec()},
-		// count=1, then kind byte, then nothing: readShardKey "bad shard".
-		{"bad-shard", rec(1, byte(walKindPut))},
-		// count=1, kind, shard=0, then nothing: readBytes "bad length" on key.
-		{"bad-key-length", rec(1, byte(walKindPut), 0)},
-		// count=1, kind, shard=0, keylen=5 but no key bytes: "truncated data".
-		{"truncated-key-data", rec(1, byte(walKindPut), 0, 5)},
-		// count=1, kind=put, shard=0, keylen=0, then nothing for value length.
-		{"bad-value-length", rec(1, byte(walKindPut), 0, 0)},
+		// count=1, then kind byte, then nothing: readBytes "bad length" on key.
+		{"bad-key-length", rec(1, byte(walKindPut))},
+		// count=1, kind, keylen=5 but no key bytes: "truncated data".
+		{"truncated-key-data", rec(1, byte(walKindPut), 5)},
+		// count=1, kind=put, keylen=0, then nothing for value length.
+		{"bad-value-length", rec(1, byte(walKindPut), 0)},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -105,7 +102,6 @@ func BenchmarkEncodeBatch(b *testing.B) {
 	entries := make([]walEntry, 10)
 	for i := range entries {
 		entries[i] = walEntry{
-			Shard: i,
 			Kind:  walKindPut,
 			Key:   []byte("some-key"),
 			Value: []byte("some-value-payload"),
@@ -126,9 +122,10 @@ func FuzzWALRecordRoundTrip(f *testing.F) {
 
 	f.Fuzz(func(t *testing.T, k, v []byte, seq uint64, shardByte, kindByte uint8) {
 		// Build 1-3 entries derived from the inputs and assert encode->decode
-		// reconstructs them exactly.
+		// reconstructs them exactly. shardByte is unused since sharding was removed
+		// but kept so existing fuzz corpus entries still apply.
+		_ = shardByte
 		base := seq % 1_000_000
-		shard := int(shardByte % 64)
 		kind := walKindPut
 		switch kindByte % 3 {
 		case 1:
@@ -142,7 +139,6 @@ func FuzzWALRecordRoundTrip(f *testing.F) {
 		for i := range entries {
 			entries[i] = walEntry{
 				Seq:       base + uint64(i),
-				Shard:     shard + i,
 				Kind:      kind,
 				Key:       append([]byte{byte(i)}, k...),
 				Value:     v,
@@ -158,7 +154,6 @@ func FuzzWALRecordRoundTrip(f *testing.F) {
 		require.Len(t, got, len(entries))
 		for i, e := range entries {
 			assert.Equal(t, e.Seq, got[i].Seq)
-			assert.Equal(t, e.Shard, got[i].Shard)
 			assert.Equal(t, e.Kind, got[i].Kind)
 			assert.Equal(t, e.ExpiresAt, got[i].ExpiresAt)
 			assert.True(t, bytes.Equal(e.Key, got[i].Key))
@@ -173,9 +168,9 @@ func FuzzWALRecordRoundTrip(f *testing.F) {
 }
 
 func FuzzDecodeBatch(f *testing.F) {
-	f.Add(encodeBatch(nil, 1, []walEntry{{Shard: 0, Kind: walKindPut, Key: []byte("k"), Value: []byte("v")}}))
-	f.Add(encodeBatch(nil, 5, []walEntry{{Shard: 2, Kind: walKindDelete, Key: []byte("d")}}))
-	f.Add(encodeBatch(nil, 7, []walEntry{{Shard: 1, Kind: walKindPutTTL, Key: []byte("ttl"), Value: []byte("v"), ExpiresAt: 99}}))
+	f.Add(encodeBatch(nil, 1, []walEntry{{Kind: walKindPut, Key: []byte("k"), Value: []byte("v")}}))
+	f.Add(encodeBatch(nil, 5, []walEntry{{Kind: walKindDelete, Key: []byte("d")}}))
+	f.Add(encodeBatch(nil, 7, []walEntry{{Kind: walKindPutTTL, Key: []byte("ttl"), Value: []byte("v"), ExpiresAt: 99}}))
 	f.Add([]byte{})
 	f.Add(make([]byte, 8))
 

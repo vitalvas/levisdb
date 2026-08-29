@@ -100,9 +100,9 @@ func (s *snapshots) release(seq uint64) {
 }
 
 // acquireIteratorTime pins the wall-clock view used by an iterator. Unlike
-// point reads, an iterator acquires its shard sources incrementally and may run
-// for an arbitrary time. Compaction must not reclaim a TTL value that was live
-// at this instant until the iterator has acquired and released every source.
+// point reads, an iterator holds its table sources for an arbitrary time.
+// Compaction must not reclaim a TTL value that was live at this instant until
+// the iterator has released every source.
 func (s *snapshots) acquireIteratorTime(readTime int64) {
 	s.mu.Lock()
 	s.iteratorTimes[readTime]++

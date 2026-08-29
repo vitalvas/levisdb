@@ -1,7 +1,6 @@
-// The shard engine assembles per-shard storage: an in-memory write buffer
-// that flushes to on-disk SSTables, and the read path that merges them. Shards
-// are the unit of the token-ring partitioning; compaction and the shared WAL
-// live above them.
+// The engine assembles the storage core: an in-memory write buffer that
+// flushes to on-disk SSTables, and the read path that merges them. Compaction
+// and the WAL live above it.
 
 package levisdb
 
@@ -107,9 +106,8 @@ type fileAllocator interface {
 	Next() uint32
 }
 
-// Config holds the per-shard tuning derived from the database options.
-type shardConfigT struct {
-	Index          int // shard index
+// Config holds the engine tuning derived from the database options.
+type engineConfigT struct {
 	MemtableSize   int64
 	BloomBits      int
 	BlockSize      int
@@ -124,14 +122,14 @@ type shardConfigT struct {
 	Commit func(inputs, outputs []*tableMeta, install func()) error
 }
 
-// Shard is one partition's storage. Writes go to the active memtable; when it
-// fills it becomes immutable and is flushed to a fresh L0 table. Reads consult
-// the active memtable, then the flushing memtable, then every overlapping table
-// by visible sequence.
-type shardT struct {
-	cfg   shardConfigT
+// Engine is the storage core. Writes go to the active memtable; when it fills
+// it becomes immutable and is flushed to a fresh L0 table. Reads consult the
+// active memtable, then the flushing memtable, then every overlapping table by
+// visible sequence.
+type engineT struct {
+	cfg   engineConfigT
 	alloc fileAllocator
-	// tablePath returns the on-disk path for a table number in this shard.
+	// tablePath returns the on-disk path for a table number.
 	tablePath func(num uint32) (string, error)
 
 	mu  sync.RWMutex
@@ -144,50 +142,54 @@ type shardT struct {
 	tables       []*tableMeta // file-creation order; compaction means this is not version order
 	seed         int64
 
-	// flushMu serializes Flush and Compact so at most one runs per shard; the
+	// flushMu serializes Flush and Compact so at most one runs at a time; the
 	// finer mu guards the fields those operations read and swap.
 	flushMu sync.Mutex
 }
 
-// NewShard creates an empty shard. seed varies memtable RNGs deterministically.
-func newShard(cfg shardConfigT, alloc fileAllocator, tablePath func(uint32) (string, error), seed int64) *shardT {
+// engineSeed fixes the memtable skiplist RNG so memtable layout is
+// deterministic across runs.
+const engineSeed int64 = 1
+
+// newEngine creates an empty engine.
+func newEngine(cfg engineConfigT, alloc fileAllocator, tablePath func(uint32) (string, error)) *engineT {
 	if cfg.FDs == nil {
 		// Default to an unbounded pool so callers that do not share one (tests)
 		// still get working table handles.
 		cfg.FDs = newFDPool(-1)
 	}
-	return &shardT{
+	return &engineT{
 		cfg:       cfg,
 		alloc:     alloc,
 		tablePath: tablePath,
-		mem:       newMemtable(seed),
-		seed:      seed,
+		mem:       newMemtable(engineSeed),
+		seed:      engineSeed,
 	}
 }
 
 // Put buffers a set into the active memtable at seq.
-func (s *shardT) Put(seq uint64, key, value []byte) {
+func (s *engineT) Put(seq uint64, key, value []byte) {
 	s.mu.Lock()
 	s.mem.Put(seq, key, value)
 	s.mu.Unlock()
 }
 
 // putTTL buffers a set with an absolute Unix-nanosecond expiration.
-func (s *shardT) putTTL(seq uint64, key, value []byte, expiresAt int64) {
+func (s *engineT) putTTL(seq uint64, key, value []byte, expiresAt int64) {
 	s.mu.Lock()
 	s.mem.putTTL(seq, key, value, expiresAt)
 	s.mu.Unlock()
 }
 
 // Delete buffers a tombstone into the active memtable at seq.
-func (s *shardT) del(seq uint64, key []byte) {
+func (s *engineT) del(seq uint64, key []byte) {
 	s.mu.Lock()
 	s.mem.del(seq, key)
 	s.mu.Unlock()
 }
 
 // MemEmpty reports whether the active memtable holds no entries.
-func (s *shardT) memEmpty() bool {
+func (s *engineT) memEmpty() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.mem.empty()
@@ -195,7 +197,7 @@ func (s *shardT) memEmpty() bool {
 
 // memSize returns the active memtable's approximate encoded size, for flush
 // logging.
-func (s *shardT) memSize() int64 {
+func (s *engineT) memSize() int64 {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.mem.Size()
@@ -203,7 +205,7 @@ func (s *shardT) memSize() int64 {
 
 // NeedFlush reports whether the active memtable has reached the flush
 // threshold and no flush is already in progress.
-func (s *shardT) needFlush() bool {
+func (s *engineT) needFlush() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.imm == nil && s.mem.Size() >= s.cfg.MemtableSize
@@ -211,7 +213,7 @@ func (s *shardT) needFlush() bool {
 
 // depth0Count returns the number of fresh-tier (depth 0) tables, the backlog
 // signal write backpressure throttles on.
-func (s *shardT) depth0Count() int {
+func (s *engineT) depth0Count() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	n := 0
@@ -225,7 +227,7 @@ func (s *shardT) depth0Count() int {
 
 // tierTableCount returns the number of live tables at the given tier depth. Used
 // by the flush/compaction logging to report input/output sizes.
-func (s *shardT) tierTableCount(depth int) int {
+func (s *engineT) tierTableCount(depth int) int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	n := 0
@@ -239,7 +241,7 @@ func (s *shardT) tierTableCount(depth int) int {
 
 // tierTableStats returns the count and total on-disk bytes of live tables at the
 // given tier depth, for compaction logging.
-func (s *shardT) tierTableStats(depth int) (count int, bytes int64) {
+func (s *engineT) tierTableStats(depth int) (count int, bytes int64) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	for _, t := range s.tables {
@@ -253,11 +255,11 @@ func (s *shardT) tierTableStats(depth int) (count int, bytes int64) {
 
 // Get resolves key at snapshot seq, returning the value or that it is absent or
 // deleted. It reads memtable, then the flushing memtable, then tables.
-func (s *shardT) get(seq uint64, key []byte) (value []byte, found, deleted bool, err error) {
+func (s *engineT) get(seq uint64, key []byte) (value []byte, found, deleted bool, err error) {
 	return s.getAtTime(seq, key, time.Now().UnixNano())
 }
 
-func (s *shardT) getAtTime(seq uint64, key []byte, now int64) (value []byte, found, deleted bool, err error) {
+func (s *engineT) getAtTime(seq uint64, key []byte, now int64) (value []byte, found, deleted bool, err error) {
 	// Hold the read lock for the whole lookup so a concurrent compaction cannot
 	// close and remove a table file mid-read; the compaction swap runs under
 	// the write lock.
@@ -323,11 +325,11 @@ func (s *shardT) getAtTime(seq uint64, key []byte, now int64) (value []byte, fou
 
 // has reports whether key exists at snapshot seq, and whether the newest
 // visible version is a tombstone, without copying the value.
-func (s *shardT) has(seq uint64, key []byte) (found, deleted bool, err error) {
+func (s *engineT) has(seq uint64, key []byte) (found, deleted bool, err error) {
 	return s.hasAtTime(seq, key, time.Now().UnixNano())
 }
 
-func (s *shardT) hasAtTime(seq uint64, key []byte, now int64) (found, deleted bool, err error) {
+func (s *engineT) hasAtTime(seq uint64, key []byte, now int64) (found, deleted bool, err error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -381,7 +383,7 @@ func (s *shardT) hasAtTime(seq uint64, key []byte, now int64) (found, deleted bo
 // rotate seals the active memtable as immutable and installs a fresh active
 // one, so writes continue while the sealed table is flushed. It reports whether
 // there is anything to flush.
-func (s *shardT) rotate() bool {
+func (s *engineT) rotate() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.imm != nil || s.mem.empty() {
@@ -395,7 +397,7 @@ func (s *shardT) rotate() bool {
 // sealReadOnlyRecoveryMemtable moves the active recovery memtable into an
 // immutable in-memory list and installs a fresh one. Read-only WAL replay uses
 // this instead of Flush so it can bound arena growth without creating files.
-func (s *shardT) sealReadOnlyRecoveryMemtable() {
+func (s *engineT) sealReadOnlyRecoveryMemtable() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.mem.empty() {
@@ -407,8 +409,8 @@ func (s *shardT) sealReadOnlyRecoveryMemtable() {
 
 // Flush seals the active memtable (if needed) and writes the immutable one to a
 // fresh L0 SSTable. It is called by the flush worker; only one flush runs at a
-// time per shard.
-func (s *shardT) Flush() error {
+// time.
+func (s *engineT) Flush() error {
 	s.flushMu.Lock()
 	defer s.flushMu.Unlock()
 	if !s.rotate() {
@@ -454,7 +456,7 @@ func (s *shardT) Flush() error {
 
 // writeTable writes all entries from a memtable iterator into a new table file
 // at the given tier depth and opens it for reading.
-func (s *shardT) writeTable(num uint32, depth int, path string, it *memtableIterator) (*tableMeta, error) {
+func (s *engineT) writeTable(num uint32, depth int, path string, it *memtableIterator) (*tableMeta, error) {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o644)
 	if err != nil {
 		return nil, err
@@ -529,7 +531,7 @@ type tableSpec struct {
 }
 
 // openTableMeta creates a pooled read handle for a table file and its reader.
-func (s *shardT) openTableMeta(spec tableSpec) (*tableMeta, error) {
+func (s *engineT) openTableMeta(spec tableSpec) (*tableMeta, error) {
 	handle := s.cfg.FDs.newHandle(spec.path)
 	r, err := newCachedTableReader(handle, spec.size, s.cfg.Cache, spec.num)
 	if err != nil {
@@ -556,7 +558,7 @@ func (s *shardT) openTableMeta(spec tableSpec) (*tableMeta, error) {
 }
 
 // Close releases all open table files.
-func (s *shardT) Close() error {
+func (s *engineT) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var firstErr error

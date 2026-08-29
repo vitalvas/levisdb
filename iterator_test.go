@@ -1,7 +1,6 @@
 package levisdb
 
 import (
-	"container/heap"
 	"fmt"
 	"sort"
 	"testing"
@@ -13,7 +12,6 @@ import (
 func openIterDB(t *testing.T) *DB {
 	t.Helper()
 	o := DefaultOptions(t.TempDir())
-	o.ShardCount = 4
 	o.MemtableSize = 512 // small, so some data still flushes to several tables
 	// High tier ratio so those tables are not compacted away mid-test: iterators
 	// then genuinely merge across several on-disk tables, and the test avoids the
@@ -39,7 +37,7 @@ func drainDBIter(t *testing.T, it Iterator) (keys, vals []string) {
 	return keys, vals
 }
 
-func TestDBIteratorSortedAcrossShards(t *testing.T) {
+func TestDBIteratorSorted(t *testing.T) {
 	t.Parallel()
 	db := openIterDB(t)
 
@@ -56,54 +54,12 @@ func TestDBIteratorSortedAcrossShards(t *testing.T) {
 	require.NoError(t, err)
 	keys, vals := drainDBIter(t, it)
 
-	require.Equal(t, want, keys, "merged stream is globally ascending across shards")
+	require.Equal(t, want, keys, "merged stream is globally ascending")
 	for i, k := range keys {
 		var idx int
 		fmt.Sscanf(k, "key%03d", &idx)
 		assert.Equal(t, fmt.Sprintf("v%d", idx), vals[i])
 	}
-}
-
-// TestRangePartitionerScanPruningCorrect verifies that pruning a range scan to
-// the shards ShardRange selects returns exactly the keys in the range - i.e. the
-// optimization never drops a key that lives in a shard it skipped. Keys are
-// spread across the first-byte space so the range genuinely spans a shard subset.
-func TestRangePartitionerScanPruningCorrect(t *testing.T) {
-	t.Parallel()
-	o := DefaultOptions(t.TempDir())
-	o.ShardCount = 8
-	o.Partitioner = PartitionerRange
-	// Pruning correctness (which shards a range touches) is independent of table
-	// count, so a large memtable keeps the test cheap without weakening it.
-	o.MemtableSize = 1 << 20
-	db, err := Open(o)
-	require.NoError(t, err)
-	defer db.Close()
-
-	// One key per first byte so every shard is populated.
-	for b := 0; b < 256; b++ {
-		require.NoError(t, db.Put(PutOptions{Key: []byte{byte(b)}, Value: []byte{byte(b)}}))
-	}
-	db.sched.drain()
-
-	// Scan a middle slice that spans a subset of shards. Brute-force the expected
-	// keys, then assert the pruned scan returns exactly them in order.
-	start, end := []byte{0x40}, []byte{0xa0}
-	var want []string
-	for b := 0x40; b < 0xa0; b++ {
-		want = append(want, string([]byte{byte(b)}))
-	}
-
-	it, err := db.NewRangeIterator(start, end)
-	require.NoError(t, err)
-	keys, _ := drainDBIter(t, it)
-	require.Equal(t, want, keys, "pruned scan must return every key in [start,end) and no more")
-
-	// A full scan still returns all 256 keys (pruning to all shards).
-	full, err := db.NewIterator()
-	require.NoError(t, err)
-	fk, _ := drainDBIter(t, full)
-	assert.Len(t, fk, 256)
 }
 
 func TestDBIteratorEmpty(t *testing.T) {
@@ -149,24 +105,4 @@ func TestDBRangeIteratorBoundsDistinguishNilAndEmpty(t *testing.T) {
 	require.NoError(t, err)
 	keys, _ = drainDBIter(t, it)
 	assert.Equal(t, []string{"a", "b", "c"}, keys, "nil end bound is unbounded")
-}
-
-func TestDBIterHeapPush(t *testing.T) {
-	t.Parallel()
-	db := openTestDB(t, nil)
-	require.NoError(t, db.Put(PutOptions{Key: []byte("z"), Value: []byte("1")}))
-	require.NoError(t, db.Put(PutOptions{Key: []byte("a"), Value: []byte("2")}))
-
-	var h iterHeap
-	for _, s := range db.shards {
-		it := s.NewIterator(db.readSeq.Load())
-		if it.Next() {
-			heap.Push(&h, it)
-		}
-	}
-	require.Positive(t, h.Len())
-	front := string(h[0].Key())
-	for _, si := range h {
-		assert.LessOrEqual(t, front, string(si.Key()))
-	}
 }

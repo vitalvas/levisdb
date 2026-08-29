@@ -8,8 +8,7 @@ import (
 
 // Stats is a point-in-time snapshot of database state for monitoring.
 type Stats struct {
-	Shards        int   // configured shard count
-	Tables        int   // total live SSTables across all shards
+	Tables        int   // total live SSTables
 	TablesSize    int64 // total on-disk size of live tables in bytes
 	LiveSnapshots int   // read sequences pinned by snapshots, iterators, and active point reads
 	CacheBlocks   int   // blocks resident in the block cache
@@ -33,18 +32,6 @@ type Stats struct {
 	FlushBytesWritten      int64
 	WALBytesWritten        int64
 	WriteStalls            int64 // times a write was throttled by backpressure
-
-	// PerShard breaks the table counts and sizes down by shard so an operator can
-	// spot partition skew and target CompactShard at the bloated one.
-	PerShard []ShardStats
-}
-
-// ShardStats is the per-shard slice of Stats.
-type ShardStats struct {
-	Index          int
-	Tables         int
-	TablesSize     int64
-	TablesPerDepth map[int]int
 }
 
 // Stats returns a snapshot of database state. It is safe to call concurrently.
@@ -57,11 +44,10 @@ func (db *DB) Stats() (Stats, error) {
 
 	hits, misses := db.cache.stats()
 	var walBytes int64
-	for _, sw := range db.wals { // empty in read-only mode
-		walBytes += sw.wal.bytesWritten()
+	if db.wal != nil { // nil in read-only mode
+		walBytes = db.wal.wal.bytesWritten()
 	}
 	st := Stats{
-		Shards:                 db.opts.ShardCount,
 		LiveSnapshots:          db.snaps.live(),
 		CacheBlocks:            db.cache.Len(),
 		CacheBytes:             db.cache.Size(),
@@ -75,24 +61,16 @@ func (db *DB) Stats() (Stats, error) {
 		FlushBytesWritten:      db.metrics.flushBytesWritten.Load(),
 		WALBytesWritten:        walBytes,
 		WriteStalls:            db.metrics.writeStalls.Load(),
-		PerShard:               make([]ShardStats, len(db.shards)),
 	}
 	st.BackgroundError = db.backgroundError()
 	db.fds.mu.Lock()
 	st.OpenFiles = db.fds.open
 	db.fds.mu.Unlock()
 
-	for i, s := range db.shards {
-		ss := ShardStats{Index: i, TablesPerDepth: map[int]int{}}
-		for _, t := range s.Tables() {
-			st.Tables++
-			st.TablesSize += t.Size
-			st.TablesPerDepth[t.Depth]++
-			ss.Tables++
-			ss.TablesSize += t.Size
-			ss.TablesPerDepth[t.Depth]++
-		}
-		st.PerShard[i] = ss
+	for _, t := range db.eng.Tables() {
+		st.Tables++
+		st.TablesSize += t.Size
+		st.TablesPerDepth[t.Depth]++
 	}
 	return st, nil
 }

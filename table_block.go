@@ -169,19 +169,26 @@ func sampledEntropy(data []byte) float64 {
 // actually smaller than the raw payload; a block is never stored larger than raw.
 // The per-block codec id records which path was taken so the reader decompresses
 // correctly.
-func finishBlock(payload []byte, c blockCodec, entropySkip bool) []byte {
+// finishBlock compresses payload, appends the codec id and CRC trailer, and
+// returns the on-disk block. dst is a reusable scratch buffer the caller owns
+// (pass nil for a one-off); the returned slice reuses dst's backing array, so
+// the caller must consume the block before calling finishBlock again with the
+// same dst. Reusing dst avoids a per-block compression-output allocation on the
+// flush and compaction write paths.
+func finishBlock(dst, payload []byte, c blockCodec, entropySkip bool) []byte {
 	use := c
 	if entropySkip && c.id() != codecNone && len(payload) >= entropyMinSize &&
 		sampledEntropy(payload) >= entropySkipBitsPerByte {
 		use = noneCodec{} // effectively incompressible: skip the codec
 	}
-	out := use.compress(nil, payload)
+	out := use.compress(dst[:0], payload)
 	// Size-check fallback: never ship a block larger than its raw payload, even
 	// when the entropy estimate said "compress". Both forms gain the same 1-byte
 	// id + 4-byte crc, so comparing the pre-trailer payloads is exact.
 	if use.id() != codecNone && len(out) >= len(payload) {
 		use = noneCodec{}
-		out = append([]byte(nil), payload...)
+		// Reuse out's backing array (it already aliases dst) to hold the raw payload.
+		out = append(out[:0], payload...)
 	}
 	out = append(out, byte(use.id()))
 	crc := crc32.Checksum(out, tableCastagnoli)
@@ -397,6 +404,23 @@ func splitDataBlock(payload []byte) (entries, restarts []byte, numRestarts int, 
 func newDataBlockIter(payload []byte) *dataBlockIter {
 	entries, restarts, n, err := splitDataBlock(payload)
 	return &dataBlockIter{entries: entries, restarts: restarts, nRestart: n, err: err}
+}
+
+// resetEntries reinitializes the iterator over a new block's entry region while
+// retaining the two key buffers, so a table scan that walks block after block
+// (compaction, full iteration) does not reallocate the key-reconstruction
+// buffers for every block. Only the per-block cursor state is cleared; bufs are
+// kept and reused. The caller has already split the payload's restart trailer
+// off, so restart-seek is unavailable on a reset iterator (scans do not seek).
+func (it *dataBlockIter) resetEntries(entries []byte) {
+	it.entries = entries
+	it.restarts = nil
+	it.nRestart = 0
+	it.pos = 0
+	it.which = 0
+	it.key = nil
+	it.value = nil
+	it.err = nil
 }
 
 // restartOffset returns the entry offset recorded at restart index i, or -1 if

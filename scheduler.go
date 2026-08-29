@@ -2,119 +2,85 @@ package levisdb
 
 import "sync"
 
-// scheduler serializes shard flush and compaction across the database. Writers
-// signal a shard as dirty; a fixed pool of workers drains dirty shards, running
-// at most CompactionConcurrency at once so a single-spindle deployment sees one
-// sequential compaction stream (concurrency 1).
+// scheduler serializes flush and compaction off the write path. Writers signal
+// that work is pending; a single worker drains it, so at most one flush or
+// compaction runs at a time (the single-engine store has one compaction stream).
+// A signal that arrives while work is already queued or running is coalesced,
+// and one that arrives during processing re-arms the worker so it is not lost.
 type scheduler struct {
-	run     func(shard int) // flush + compaction for one shard
-	workers int
+	run func() // flush + compaction for the engine
 
 	mu      sync.Mutex
 	cond    *sync.Cond
-	dirty   map[int]bool // shards awaiting work
-	queue   []int        // FIFO order of dirty shards for fairness
-	active  map[int]bool // shards currently being processed
+	pending bool // work awaiting the worker
+	active  bool // worker currently running
 	closed  bool
-	pending sync.WaitGroup // outstanding queued work, for graceful drain
+	wg      sync.WaitGroup // outstanding work, for graceful drain
 }
 
-func newScheduler(workers int, run func(int)) *scheduler {
-	s := &scheduler{
-		run:     run,
-		workers: workers,
-		dirty:   map[int]bool{},
-		active:  map[int]bool{},
-	}
+func newScheduler(run func()) *scheduler {
+	s := &scheduler{run: run}
 	s.cond = sync.NewCond(&s.mu)
-	for i := 0; i < workers; i++ {
-		go s.worker()
-	}
+	go s.worker()
 	return s
 }
 
-// Signal marks a shard dirty. It is non-blocking and idempotent: a shard
-// already queued or active is coalesced, and if it is currently active it is
-// re-queued so work triggered during processing is not lost.
-func (s *scheduler) Signal(shard int) {
+// Signal marks work pending. It is non-blocking and idempotent: a signal
+// arriving while work is queued is coalesced, and one arriving while the worker
+// is active re-arms it so work triggered during processing is not lost.
+func (s *scheduler) Signal() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed || s.dirty[shard] {
+	if s.closed || s.pending {
 		return
 	}
-	s.dirty[shard] = true
-	s.queue = append(s.queue, shard)
-	s.pending.Add(1)
+	s.pending = true
+	s.wg.Add(1)
 	s.cond.Signal()
 }
 
-// worker pulls dirty shards and runs work for them, never two workers on the
-// same shard at once.
+// worker drains pending work, never running two passes concurrently.
 func (s *scheduler) worker() {
 	for {
 		s.mu.Lock()
-		for !s.closed && !s.hasRunnable() {
+		for !s.closed && (!s.pending || s.active) {
 			s.cond.Wait()
 		}
-		if s.closed && !s.hasRunnable() {
+		if s.closed && !s.pending {
 			s.mu.Unlock()
 			return
 		}
-		shard := s.takeRunnable()
+		s.pending = false
+		s.active = true
 		s.mu.Unlock()
 
-		s.run(shard)
+		s.run()
 
 		s.mu.Lock()
-		delete(s.active, shard)
-		s.pending.Done()
-		// Another worker may be waiting for this shard to free up.
+		s.active = false
+		s.wg.Done()
 		s.cond.Broadcast()
 		s.mu.Unlock()
 	}
 }
 
-// hasRunnable reports whether a queued shard is not currently active.
-func (s *scheduler) hasRunnable() bool {
-	for _, shard := range s.queue {
-		if !s.active[shard] {
-			return true
-		}
-	}
-	return false
-}
-
-// takeRunnable removes and returns the first queued shard not already active.
-func (s *scheduler) takeRunnable() int {
-	for i, shard := range s.queue {
-		if s.active[shard] {
-			continue
-		}
-		s.queue = append(s.queue[:i], s.queue[i+1:]...)
-		delete(s.dirty, shard)
-		s.active[shard] = true
-		return shard
-	}
-	return -1
-}
-
-// Drain blocks until all signaled work has completed.
+// drain blocks until all signaled work has completed.
 func (s *scheduler) drain() {
-	s.pending.Wait()
+	s.wg.Wait()
 }
 
-// Close drains outstanding work and stops the workers.
+// Close drains outstanding work and stops the worker.
 func (s *scheduler) Close() {
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
-		s.pending.Wait()
+		s.wg.Wait()
 		return
 	}
 	s.closed = true
 	s.cond.Broadcast()
 	s.mu.Unlock()
 	// Marking closed first prevents a concurrent Signal from calling Add while
-	// Wait is in progress. Workers continue draining the queue before exiting.
-	s.pending.Wait()
+	// Wait is in progress. The worker continues draining before it exits.
+	s.wg.Wait()
 }

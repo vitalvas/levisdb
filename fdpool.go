@@ -14,7 +14,7 @@ import (
 // (second-chance) sweep, reopening on demand for a later read.
 //
 // Reads never touch the pool mutex: a read only sets the handle's atomic
-// recently-used flag, so parallel reads across shards do not serialize. The
+// recently-used flag, so parallel reads do not serialize. The
 // pool mutex guards the clock ring and open counter, taken only on the
 // infrequent open/evict/close paths.
 type fdPool struct {

@@ -23,10 +23,8 @@ func scrapeLevisdbExpvar(t *testing.T) map[string]map[string]any {
 
 func TestExpvarReportsOpenDBStats(t *testing.T) {
 	// Not parallel: asserts on the process-global expvar registry.
-	// One shard + tiny memtable so a small burst deterministically flushes
-	// (rather than spreading thinly across many shards).
+	// Tiny memtable so a small burst deterministically flushes.
 	db := openTestDB(t, func(o *Options) {
-		o.ShardCount = 1
 		o.MemtableSize = 256
 	})
 	dir := db.opts.Dir
@@ -60,7 +58,6 @@ func TestExpvarDeregistersOnClose(t *testing.T) {
 	dir := t.TempDir()
 	db, err := Open(func() Options {
 		o := DefaultOptions(dir)
-		o.ShardCount = 2
 		return o
 	}())
 	require.NoError(t, err)

@@ -10,8 +10,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// collect drains a shard iterator into key/value string slices.
-func collect(it *shardIterator) (keys, vals []string) {
+// collect drains an engine iterator into key/value string slices.
+func collect(it *engineIterator) (keys, vals []string) {
 	for it.Next() {
 		keys = append(keys, string(it.Key()))
 		vals = append(vals, string(it.Value()))
@@ -19,9 +19,9 @@ func collect(it *shardIterator) (keys, vals []string) {
 	return keys, vals
 }
 
-func TestShardIterator(t *testing.T) {
+func TestEngineIterator(t *testing.T) {
 	t.Parallel()
-	s := newTestShard(t, 1<<20)
+	s := newTestEngine(t, 1<<20)
 	// b, d live in a flushed table; a, c, e in the live memtable.
 	s.Put(1, []byte("b"), []byte("2"))
 	s.Put(1, []byte("d"), []byte("4"))
@@ -42,9 +42,9 @@ func TestShardIterator(t *testing.T) {
 	})
 }
 
-func TestShardIteratorSnapshotAndDeletes(t *testing.T) {
+func TestEngineIteratorSnapshotAndDeletes(t *testing.T) {
 	t.Parallel()
-	s := newTestShard(t, 1<<20)
+	s := newTestEngine(t, 1<<20)
 	s.Put(1, []byte("k"), []byte("v1"))
 	s.Put(3, []byte("k"), []byte("v3"))
 	s.Put(2, []byte("gone"), []byte("x"))
@@ -63,9 +63,9 @@ func TestShardIteratorSnapshotAndDeletes(t *testing.T) {
 	})
 }
 
-func TestShardIteratorMany(t *testing.T) {
+func TestEngineIteratorMany(t *testing.T) {
 	t.Parallel()
-	s := newTestShard(t, 1<<20)
+	s := newTestEngine(t, 1<<20)
 	for i := 0; i < 100; i++ {
 		s.Put(uint64(i+1), []byte(fmt.Sprintf("k%03d", i)), []byte(fmt.Sprintf("v%d", i)))
 	}
@@ -83,9 +83,9 @@ func TestShardIteratorMany(t *testing.T) {
 	assert.Equal(t, "new", vals[0], "memtable overwrite wins")
 }
 
-func TestShardIteratorWithImmutable(t *testing.T) {
+func TestEngineIteratorWithImmutable(t *testing.T) {
 	t.Parallel()
-	s := newTestShard(t, 1<<20)
+	s := newTestEngine(t, 1<<20)
 	defer s.Close()
 
 	s.Put(1, []byte("a"), []byte("1"))
@@ -102,13 +102,13 @@ func TestShardIteratorWithImmutable(t *testing.T) {
 	assert.Equal(t, []string{"a", "b"}, keys)
 }
 
-func BenchmarkShardScan(b *testing.B) {
+func BenchmarkEngineScan(b *testing.B) {
 	dir := b.TempDir()
 	tablePath := func(num uint32) (string, error) {
 		return filepath.Join(dir, fmt.Sprintf("%08x.sst", num)), nil
 	}
-	cfg := shardConfigT{MemtableSize: 1 << 20, BloomBits: 10, BlockSize: 4096, FreshCodecName: "none"}
-	s := newShard(cfg, newAllocator(0), tablePath, 1)
+	cfg := engineConfigT{MemtableSize: 1 << 20, BloomBits: 10, BlockSize: 4096, FreshCodecName: "none"}
+	s := newEngine(cfg, newAllocator(0), tablePath)
 	defer s.Close()
 
 	// Several flushed tables plus a live memtable, so the scan merges multiple

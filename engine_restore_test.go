@@ -12,7 +12,7 @@ import (
 
 func TestTablesSnapshot(t *testing.T) {
 	t.Parallel()
-	s := newTestShard(t, 1<<20)
+	s := newTestEngine(t, 1<<20)
 	assert.Empty(t, s.Tables())
 
 	flushSingle(t, s, 1, "a", "1")
@@ -30,7 +30,7 @@ func TestTablesSnapshot(t *testing.T) {
 
 func TestPickCompactionDelegates(t *testing.T) {
 	t.Parallel()
-	s := newTestShard(t, 1<<20)
+	s := newTestEngine(t, 1<<20)
 	assert.Equal(t, -1, s.pickCompaction(2, 0, 0))
 	flushSingle(t, s, 1, "a", "1")
 	flushSingle(t, s, 2, "b", "2")
@@ -39,14 +39,14 @@ func TestPickCompactionDelegates(t *testing.T) {
 
 func TestOpenTableRestore(t *testing.T) {
 	t.Parallel()
-	// Build a shard, flush data, capture the table path, then close it.
+	// Build an engine, flush data, capture the table path, then close it.
 	dir := t.TempDir()
 	tablePath := func(num uint32) (string, error) {
 		return filepath.Join(dir, fmt.Sprintf("%08x.sst", num)), nil
 	}
-	cfg := shardConfigT{MemtableSize: 1 << 20, BloomBits: 10, BlockSize: 256, FreshCodecName: "none"}
+	cfg := engineConfigT{MemtableSize: 1 << 20, BloomBits: 10, BlockSize: 256, FreshCodecName: "none"}
 
-	src := newShard(cfg, newAllocator(0), tablePath, 1)
+	src := newEngine(cfg, newAllocator(0), tablePath)
 	for i := 0; i < 30; i++ {
 		src.Put(uint64(i+1), []byte(fmt.Sprintf("k%02d", i)), []byte(fmt.Sprintf("v%d", i)))
 	}
@@ -58,7 +58,7 @@ func TestOpenTableRestore(t *testing.T) {
 	require.NoError(t, src.Close())
 
 	t.Run("restore with known size", func(t *testing.T) {
-		dst := newShard(cfg, newAllocator(0), tablePath, 1)
+		dst := newEngine(cfg, newAllocator(0), tablePath)
 		t.Cleanup(func() { dst.Close() })
 		require.NoError(t, dst.openTable(tableSpec{
 			num:    snap[0].Num,
@@ -75,7 +75,7 @@ func TestOpenTableRestore(t *testing.T) {
 	})
 
 	t.Run("size 0 stats the file", func(t *testing.T) {
-		dst := newShard(cfg, newAllocator(0), tablePath, 1)
+		dst := newEngine(cfg, newAllocator(0), tablePath)
 		t.Cleanup(func() { dst.Close() })
 		require.NoError(t, dst.openTable(tableSpec{
 			num:    snap[0].Num,
@@ -88,7 +88,7 @@ func TestOpenTableRestore(t *testing.T) {
 	})
 
 	t.Run("missing file errors", func(t *testing.T) {
-		dst := newShard(cfg, newAllocator(0), tablePath, 1)
+		dst := newEngine(cfg, newAllocator(0), tablePath)
 		t.Cleanup(func() { dst.Close() })
 		err := dst.openTable(tableSpec{num: 999, depth: 0, path: filepath.Join(dir, "nope.sst")})
 		assert.Error(t, err)
@@ -98,7 +98,7 @@ func TestOpenTableRestore(t *testing.T) {
 		garbage := filepath.Join(dir, "garbage.sst")
 		require.NoError(t, os.WriteFile(garbage, []byte("not a valid sstable file at all"), 0o644))
 
-		dst := newShard(cfg, newAllocator(0), tablePath, 1)
+		dst := newEngine(cfg, newAllocator(0), tablePath)
 		t.Cleanup(func() { dst.Close() })
 		// size 0 => Stat succeeds, but newCachedTableReader rejects the bad magic.
 		assert.Error(t, dst.openTable(tableSpec{num: 998, depth: 0, path: garbage}))

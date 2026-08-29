@@ -39,7 +39,7 @@ type compactionConfigT struct {
 	Filter       CompactionFilter
 	// FilterThrough is the highest sequence safe for physical filtering because
 	// its recovery WAL has been retired. Zero disables the bound for direct
-	// shard users, which do not have a DB WAL.
+	// engine users, which do not have a DB WAL.
 	FilterThrough uint64
 	// MaxCompactionBytes caps the total input bytes merged in one non-bottom
 	// compaction so a single merge does not monopolize the spindle. Zero disables
@@ -59,7 +59,7 @@ type compactionConfigT struct {
 // count threshold), OR (when tombstoneRatio > 0) when it holds >= 2 tables and
 // its tombstone fraction meets tombstoneRatio (reclaim delete-heavy tiers early).
 // The shallowest ready tier is chosen so fresh data is merged first.
-func (s *shardT) pickCompaction(ratio int, byteTrigger int64, tombstoneRatio float64) int {
+func (s *engineT) pickCompaction(ratio int, byteTrigger int64, tombstoneRatio float64) int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	counts := map[int]int{}
@@ -101,7 +101,7 @@ func (s *shardT) pickCompaction(ratio int, byteTrigger int64, tombstoneRatio flo
 // with seq >= retainSeq so live read snapshots still see them, and, when the
 // output is the deepest tier, drops tombstones and fully shadowed versions to
 // reclaim space. Pass retainSeq 0 (or MaxSeq for "keep only newest") per policy.
-func (s *shardT) Compact(depth int, retainSeq uint64, cc compactionConfigT) error {
+func (s *engineT) Compact(depth int, retainSeq uint64, cc compactionConfigT) error {
 	s.flushMu.Lock()
 	defer s.flushMu.Unlock()
 	s.mu.RLock()
@@ -126,8 +126,8 @@ func (s *shardT) Compact(depth int, retainSeq uint64, cc compactionConfigT) erro
 	var inputs []*tableMeta
 	// deeper holds the key bounds of every table at or below the output tier that
 	// is NOT an input, so writeMerged can reclaim a tombstone at an intermediate
-	// tier when no such table can hold the key. flushMu serializes compaction per
-	// shard, so this snapshot stays valid for the whole merge.
+	// tier when no such table can hold the key. flushMu serializes compaction,
+	// so this snapshot stays valid for the whole merge.
 	var deeper [][2][]byte
 	for _, t := range s.tables {
 		if t.depth == depth {
@@ -336,7 +336,7 @@ func capCompactionInputs(inputs []*tableMeta, maxBytes int64) []*tableMeta {
 // commitCompaction records the replacement durably before installing it in
 // memory and removing the source files. A crash therefore sees either the old
 // manifest and all old inputs, or the new manifest and the complete output.
-func (s *shardT) commitCompaction(inputs, metas []*tableMeta) error {
+func (s *engineT) commitCompaction(inputs, metas []*tableMeta) error {
 	install := func() {
 		s.mu.Lock()
 		kept := s.tables[:0:0]
@@ -372,11 +372,11 @@ func (s *shardT) commitCompaction(inputs, metas []*tableMeta) error {
 	return nil
 }
 
-// CompactAll merges every table in the shard, regardless of tier, into
+// CompactAll merges every table in the engine, regardless of tier, into
 // bottom-tier tables. Because the output is the bottom, tombstones and dead
 // versions (older than retainSeq) are reclaimed. Used by CompactRange for an
 // operator-triggered full compaction.
-func (s *shardT) CompactAll(retainSeq uint64, cc compactionConfigT) error {
+func (s *engineT) CompactAll(retainSeq uint64, cc compactionConfigT) error {
 	s.flushMu.Lock()
 	defer s.flushMu.Unlock()
 
@@ -431,14 +431,14 @@ type mergeWrite struct {
 // writeMerged writes the merged stream to a new table, dropping older versions
 // of each user key and, at the bottom tier, tombstones as well. Output rolls at
 // user-key boundaries according to the configured per-depth file-size curve.
-func (s *shardT) writeMerged(mw mergeWrite) ([]*tableMeta, error) {
+func (s *engineT) writeMerged(mw mergeWrite) ([]*tableMeta, error) {
 	codecName := resolveLevelCodec(mw.cc.LevelCodecs, mw.depth, mw.cc.FreshCodecName, mw.cc.BottomCodecName, mw.bottomCodec)
 	c, err := codecFromName(codecName)
 	if err != nil {
 		return nil, err
 	}
 	sink := compactionSink{
-		shard:       s,
+		eng:         s,
 		depth:       mw.depth,
 		codec:       c,
 		bloomBits:   mw.cc.BloomBits,
@@ -580,7 +580,7 @@ type compactionOutput struct {
 }
 
 type compactionSink struct {
-	shard                *shardT
+	eng                  *engineT
 	depth                int
 	codec                blockCodec
 	bloomBits, blockSize int
@@ -591,11 +591,11 @@ type compactionSink struct {
 }
 
 func (s *compactionSink) start() error {
-	num := s.shard.alloc.Next()
+	num := s.eng.alloc.Next()
 	if num == 0 {
 		return ErrFileNumberExhausted
 	}
-	path, err := s.shard.tablePath(num)
+	path, err := s.eng.tablePath(num)
 	if err != nil {
 		return err
 	}
@@ -664,7 +664,7 @@ func (s *compactionSink) finish() error {
 		_ = removeFileDurable(out.path)
 		return err
 	}
-	meta, err := s.shard.openTableMeta(tableSpec{
+	meta, err := s.eng.openTableMeta(tableSpec{
 		num:        out.num,
 		depth:      s.depth,
 		path:       out.path,

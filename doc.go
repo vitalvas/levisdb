@@ -1,9 +1,8 @@
-// Package levisdb is an embedded, sharded key-value storage engine for Go,
-// modeled on LevelDB. The keyspace is split into independent shards that each
-// have their own write-ahead log and flush and compact on their own, so
-// concurrent writes to different shards do not serialize on a single committer.
-// A global scheduler keeps compaction concurrency bounded (default one), so a
-// single spinning disk sees mostly sequential I/O while fast storage can raise it.
+// Package levisdb is an embedded key-value storage engine for Go, modeled on
+// LevelDB. Writes land in an in-memory memtable backed by a write-ahead log,
+// flush to sorted on-disk tables, and merge through size-tiered compaction. A
+// scheduler serializes flush and compaction off the write path, so a single
+// spinning disk sees mostly sequential I/O.
 //
 // # Basic use
 //
@@ -33,19 +32,6 @@
 // locking and directory fsync behind explicit "linux || darwin" build
 // constraints; other operating systems are deliberately excluded.
 //
-// # Sharding and partitioning
-//
-// A Partitioner maps each key to one of ShardCount shards. Its Name and the
-// shard count are baked into the on-disk data and verified on open, so reopening
-// with a different mapping fails with ErrPartitionerMismatch. Built-ins:
-//
-//   - PartitionerHash (default): FNV-1a, even spread, no locality.
-//   - PartitionerMurmur3: MurmurHash3, even spread, better on structured keys.
-//   - PartitionerRange: routes by key prefix for range-scan locality.
-//
-// Set Options.CustomPartitioner to supply your own; it must be deterministic,
-// concurrency-safe, and return a stable non-empty Name.
-//
 // # Compaction and backpressure
 //
 // Compaction is size-tiered: a tier merges into the next once it holds TierRatio
@@ -58,10 +44,10 @@
 // the bottom tier always merges whole so tombstone GC stays correct.
 // TombstoneCompactionRatio compacts a delete-heavy tier early to reclaim space.
 //
-// Writes are throttled per shard by fresh-tier table count so a burst cannot
-// outrun the single serialized compactor: at L0SlowdownTables writes are delayed,
-// and at L0StopTables they block until the shard drains. CompactRange,
-// CompactShard, and CompactShardRange force compaction on demand.
+// Writes are throttled by fresh-tier table count so a burst cannot outrun the
+// serialized compactor: at L0SlowdownTables writes are delayed, and at
+// L0StopTables they block until the tier drains. CompactRange forces compaction
+// on demand.
 //
 // # Compression
 //
@@ -76,13 +62,12 @@
 //
 // # Durability and recovery
 //
-// Every mutation is appended to its shard's WAL before it is visible. Concurrent
-// writes to one shard are coalesced into one grouped journal write and one fsync
-// (group commit); writes to different shards commit in parallel. By default a
-// returned write is crash-durable. NoSync trades that for speed, leaving
-// durability to the OS page cache; a background goroutine then fsyncs every
-// WALSyncInterval to bound the loss window. On open each shard's WAL replays into
-// its memtable. A torn crash tail is always tolerated, and by default recovery
+// Every mutation is appended to the WAL before it is visible. Concurrent writes
+// are coalesced into one grouped journal write and one fsync (group commit). By
+// default a returned write is crash-durable. NoSync trades that for speed,
+// leaving durability to the OS page cache; a background goroutine then fsyncs
+// every WALSyncInterval to bound the loss window. On open the WAL replays into
+// the memtable. A torn crash tail is always tolerated, and by default recovery
 // is lenient about deeper corruption, keeping the intact prefix; set
 // StrictWALRecovery to fail the open instead. A WALObserver taps the committed
 // stream in order for replication or change-data capture.
@@ -107,7 +92,7 @@
 // # Size limits
 //
 // A single key plus value must be at most 1 GiB, and one batch may add at most
-// 1 GiB to any one shard. The block format and memtable arena address data with
+// 1 GiB to the memtable. The block format and memtable arena address data with
 // 32-bit offsets, so an oversized entry would wrap and corrupt; it is rejected at
 // the write boundary with ErrEntryTooLarge or ErrBatchTooLarge. These are hard
 // format limits, not tunables.
@@ -115,8 +100,8 @@
 // # Monitoring
 //
 // Stats returns a point-in-time snapshot (table counts and sizes, cache
-// hits/misses, cumulative compaction/flush/WAL bytes, write stalls, per-shard
-// breakdown). GetProperty returns individual values by LevelDB-style name.
+// hits/misses, cumulative compaction/flush/WAL bytes, write stalls).
+// GetProperty returns individual values by LevelDB-style name.
 // Opening a database also publishes a process-wide expvar named "levisdb" mapping
 // each data directory to its stats.
 //

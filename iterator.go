@@ -1,19 +1,13 @@
 package levisdb
 
-import (
-	"bytes"
-	"container/heap"
-	"time"
-)
+import "time"
 
-// dbIterator merges per-shard iterators into a single ascending user-key
-// stream. TTL is evaluated at iterator creation, so a long scan is internally
-// consistent even if a value's deadline passes while it runs. Each shard
-// already yields deduplicated, live entries at the snapshot,
-// and shards own disjoint key spaces under both built-in partitioners, so a
-// simple key-ordered merge across shards is sufficient.
+// dbIterator wraps the engine iterator to manage the snapshot pin and iterator-
+// time lifecycle and to hand out stable key/value copies. TTL is evaluated at
+// iterator creation, so a long scan is internally consistent even if a value's
+// deadline passes while it runs.
 type dbIterator struct {
-	h           iterHeap
+	src         *engineIterator
 	curK        []byte
 	curV        []byte
 	err         error
@@ -26,52 +20,25 @@ type dbIterator struct {
 func (db *DB) newRangeIterator(seq uint64, start, end []byte) (Iterator, error) {
 	readTime := time.Now().UnixNano()
 	db.snaps.acquireIteratorTime(readTime)
-	it := &dbIterator{snaps: db.snaps, seq: seq, readTime: readTime}
-	// Prune to the shards the range can touch when the partitioner is order-
-	// preserving (implements ShardRanger). A hash partitioner scatters adjacent
-	// keys across all shards and does not implement it, so lo,hi span every shard.
-	lo, hi := 0, len(db.shards)
-	if r, ok := db.part.(ShardRanger); ok {
-		l, h := r.ShardRange(start, end, len(db.shards))
-		// Clamp: a custom ShardRanger is user code, so never let bad bounds panic
-		// the slice or silently drop shards a key could live in.
-		if l >= 0 && h <= len(db.shards) && l <= h {
-			lo, hi = l, h
-		}
-	}
-	for _, s := range db.shards[lo:hi] {
-		si := s.newRangeIteratorAt(seq, start, end, readTime)
-		if si.Next() {
-			it.h = append(it.h, si)
-		} else if err := si.Error(); err != nil {
-			_ = it.Close()
-			return nil, err
-		} else {
-			_ = si.Close()
-		}
-	}
-	heap.Init(&it.h)
-	return it, nil
+	src := db.eng.newRangeIteratorAt(seq, start, end, readTime)
+	return &dbIterator{src: src, snaps: db.snaps, seq: seq, readTime: readTime}, nil
 }
 
 // Next advances to the next key and reports whether one exists.
 func (it *dbIterator) Next() bool {
-	if it.err != nil || len(it.h) == 0 {
+	if it.err != nil {
 		it.releasePin()
 		return false
 	}
-	top := it.h[0]
-	it.curK = append(it.curK[:0], top.Key()...)
-	it.curV = append(it.curV[:0], top.Value()...)
-	if top.Next() {
-		heap.Fix(&it.h, 0)
-	} else {
-		heap.Pop(&it.h)
-		if err := top.Error(); err != nil {
+	if !it.src.Next() {
+		if err := it.src.Error(); err != nil {
 			it.err = err
-			_ = it.Close()
 		}
+		it.releasePin()
+		return false
 	}
+	it.curK = append(it.curK[:0], it.src.Key()...)
+	it.curV = append(it.curV[:0], it.src.Value()...)
 	return true
 }
 
@@ -79,11 +46,8 @@ func (it *dbIterator) Key() []byte   { return it.curK }
 func (it *dbIterator) Value() []byte { return it.curV }
 func (it *dbIterator) Error() error  { return it.err }
 func (it *dbIterator) Close() error {
-	for len(it.h) > 0 {
-		si := heap.Pop(&it.h).(*shardIterator)
-		if err := si.Close(); err != nil && it.err == nil {
-			it.err = err
-		}
+	if err := it.src.Close(); err != nil && it.err == nil {
+		it.err = err
 	}
 	it.releasePin()
 	return it.err
@@ -95,19 +59,4 @@ func (it *dbIterator) releasePin() {
 		it.snaps.release(it.seq)
 		it.snaps.releaseIteratorTime(it.readTime)
 	}
-}
-
-// iterHeap orders shard iterators by their current key ascending.
-type iterHeap []*shardIterator
-
-func (h iterHeap) Len() int           { return len(h) }
-func (h iterHeap) Less(i, j int) bool { return bytes.Compare(h[i].Key(), h[j].Key()) < 0 }
-func (h iterHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
-func (h *iterHeap) Push(x any)        { *h = append(*h, x.(*shardIterator)) }
-func (h *iterHeap) Pop() any {
-	old := *h
-	n := len(old)
-	item := old[n-1]
-	*h = old[:n-1]
-	return item
 }

@@ -6,11 +6,11 @@ import (
 	"time"
 )
 
-// ShardIterator yields the live user key/value pairs of a shard at a snapshot
-// sequence, in ascending user-key order. It merges the memtable, the flushing
-// memtable, and all tables, keeps the newest version at or below seq for each
-// user key, and skips tombstones.
-type shardIterator struct {
+// engineIterator yields the live user key/value pairs of the engine at a
+// snapshot sequence, in ascending user-key order. It merges the memtable, the
+// flushing memtable, and all tables, keeps the newest version at or below seq
+// for each user key, and skips tombstones.
+type engineIterator struct {
 	merge    *mergeIter
 	seq      uint64
 	readTime int64
@@ -25,18 +25,18 @@ type shardIterator struct {
 	closed   bool
 }
 
-// NewIterator returns an iterator over the shard at snapshot seq.
-func (s *shardT) NewIterator(seq uint64) *shardIterator {
+// NewIterator returns an iterator over the engine at snapshot seq.
+func (s *engineT) NewIterator(seq uint64) *engineIterator {
 	return s.NewRangeIterator(seq, nil, nil)
 }
 
 // NewRangeIterator returns an iterator over [start, end) at snapshot seq. A nil
 // bound is unbounded on that side.
-func (s *shardT) NewRangeIterator(seq uint64, start, end []byte) *shardIterator {
+func (s *engineT) NewRangeIterator(seq uint64, start, end []byte) *engineIterator {
 	return s.newRangeIteratorAt(seq, start, end, time.Now().UnixNano())
 }
 
-func (s *shardT) newRangeIteratorAt(seq uint64, start, end []byte, readTime int64) *shardIterator {
+func (s *engineT) newRangeIteratorAt(seq uint64, start, end []byte, readTime int64) *engineIterator {
 	s.mu.RLock()
 	sources := make([]entrySource, 0, len(s.tables)+len(s.recoveryMems)+2)
 	refs := make([]*tableMeta, 0, len(s.tables))
@@ -62,7 +62,7 @@ func (s *shardT) newRangeIteratorAt(seq uint64, start, end []byte, readTime int6
 	// bytes.Clone preserves the nil/non-nil distinction: a non-nil empty end
 	// bound stays non-nil (an exclusive upper bound of "" matching nothing),
 	// whereas append([]byte(nil), end...) would collapse it to nil (unbounded).
-	return &shardIterator{
+	return &engineIterator{
 		merge:    newMergeIter(sources...),
 		seq:      seq,
 		readTime: readTime,
@@ -73,7 +73,7 @@ func (s *shardT) newRangeIteratorAt(seq uint64, start, end []byte, readTime int6
 }
 
 // Next advances to the next live user key and reports whether one exists.
-func (it *shardIterator) Next() bool {
+func (it *engineIterator) Next() bool {
 	if it.closed || it.err != nil {
 		return false
 	}
@@ -130,8 +130,8 @@ func (it *shardIterator) Next() bool {
 		// Return the merge iterator's buffers directly rather than copying: they are
 		// stable until this iterator advances again (it.merge.Next in the loop
 		// above), which is exactly the "valid until the next Next" contract Key and
-		// Value promise. The dbIterator merge across shards copies out before it
-		// advances a shard, so the public value the caller sees is still stable.
+		// Value promise. The dbIterator wraps this and copies out before it
+		// advances, so the public value the caller sees is still stable.
 		it.key = user
 		it.value = value
 		return true
@@ -143,15 +143,15 @@ func (it *shardIterator) Next() bool {
 
 // Key returns the current user key. The slice is valid only until the next call
 // to Next; copy it to retain.
-func (it *shardIterator) Key() []byte { return it.key }
+func (it *engineIterator) Key() []byte { return it.key }
 
 // Value returns the current value. The slice is valid only until the next call
 // to Next; copy it to retain.
-func (it *shardIterator) Value() []byte { return it.value }
+func (it *engineIterator) Value() []byte { return it.value }
 
-func (it *shardIterator) Error() error { return it.err }
+func (it *engineIterator) Error() error { return it.err }
 
-func (it *shardIterator) Close() error {
+func (it *engineIterator) Close() error {
 	if it.closed {
 		return it.err
 	}

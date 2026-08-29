@@ -22,20 +22,14 @@ var (
 	ErrEntryTooLarge = errors.New("levisdb: key/value too large")
 
 	// ErrBatchTooLarge is returned when a single batch would add more than
-	// maxEntrySize bytes to one shard's memtable. A whole batch is applied to a
-	// shard before the flush check runs, so an unbounded batch could push the
-	// skiplist arena past its uint32 offset limit even when each entry is small
-	// enough on its own.
-	ErrBatchTooLarge = errors.New("levisdb: batch too large for one shard")
+	// maxEntrySize bytes to the memtable. A whole batch is applied before the
+	// flush check runs, so an unbounded batch could push the skiplist arena past
+	// its uint32 offset limit even when each entry is small enough on its own.
+	ErrBatchTooLarge = errors.New("levisdb: batch too large")
 
 	// ErrInvalidTTL is returned when a put has a negative TTL or its absolute
 	// expiration cannot be represented as a Unix nanosecond timestamp.
 	ErrInvalidTTL = errors.New("levisdb: invalid TTL")
-
-	// ErrPartitionerMismatch is returned by Open when the configured
-	// partitioner name or shard count does not match what the existing data
-	// was written with. Reopening with a mismatch would misroute reads.
-	ErrPartitionerMismatch = errors.New("levisdb: partitioner or shard count does not match existing data")
 
 	// ErrFileNumberExhausted is returned rather than wrapping the uint32 file
 	// namespace and risking replacement of an existing database file.

@@ -16,7 +16,7 @@ func TestOpenStorageCreatesLayout(t *testing.T) {
 	require.NoError(t, err)
 	defer s.Close()
 
-	assert.DirExists(t, filepath.Join(dir, shardsDir))
+	assert.DirExists(t, dir)
 	assert.FileExists(t, filepath.Join(dir, lockName))
 }
 
@@ -27,23 +27,16 @@ func TestStoragePaths(t *testing.T) {
 	require.NoError(t, err)
 	defer s.Close()
 
-	t.Run("shardDir", func(t *testing.T) {
-		p, err := s.shardDir(10)
-		require.NoError(t, err)
-		assert.Equal(t, filepath.Join(dir, shardsDir, "0a"), p)
-		assert.DirExists(t, p)
-	})
-
 	t.Run("tablePath", func(t *testing.T) {
-		p, err := s.tablePath(1, 255)
+		p, err := s.tablePath(255)
 		require.NoError(t, err)
-		assert.Equal(t, filepath.Join(dir, shardsDir, "01", "000000ff.sst"), p)
+		assert.Equal(t, filepath.Join(dir, "000000ff.sst"), p)
 	})
 
 	t.Run("logPath", func(t *testing.T) {
-		p, err := s.logPath(0, 1)
+		p, err := s.logPath(1)
 		require.NoError(t, err)
-		assert.Equal(t, filepath.Join(dir, shardsDir, "00", "00000001.log"), p)
+		assert.Equal(t, filepath.Join(dir, "00000001.log"), p)
 	})
 
 	t.Run("manifestPath", func(t *testing.T) {
@@ -58,25 +51,24 @@ func TestStorageListAndRemoveLogs(t *testing.T) {
 	require.NoError(t, err)
 	defer s.Close()
 
-	shardDir, err := s.shardDir(0)
-	require.NoError(t, err)
+	data := s.dir
 	for _, n := range []uint32{5, 1, 3} {
-		p, perr := s.logPath(0, n)
+		p, perr := s.logPath(n)
 		require.NoError(t, perr)
 		require.NoError(t, os.WriteFile(p, []byte("x"), 0o644))
 	}
 	// A non-log file and a bad name must be ignored.
-	require.NoError(t, os.WriteFile(filepath.Join(shardDir, "notes.txt"), []byte("x"), 0o644))
-	require.NoError(t, os.WriteFile(filepath.Join(shardDir, "zz.log"), []byte("x"), 0o644))
-	require.NoError(t, os.WriteFile(filepath.Join(shardDir, "1.log"), []byte("x"), 0o644))
-	require.NoError(t, os.WriteFile(filepath.Join(shardDir, "0000000A.log"), []byte("x"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(data, "notes.txt"), []byte("x"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(data, "zz.log"), []byte("x"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(data, "1.log"), []byte("x"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(data, "0000000A.log"), []byte("x"), 0o644))
 
-	logs, err := s.listLogs(0)
+	logs, err := s.listLogs()
 	require.NoError(t, err)
 	assert.Equal(t, []uint32{1, 3, 5}, logs)
 
-	require.NoError(t, s.removeLog(0, 3))
-	logs, err = s.listLogs(0)
+	require.NoError(t, s.removeLog(3))
+	logs, err = s.listLogs()
 	require.NoError(t, err)
 	assert.Equal(t, []uint32{1, 5}, logs)
 }
@@ -88,23 +80,17 @@ func TestStorageListTablesCanonicalOnly(t *testing.T) {
 	require.NoError(t, err)
 	defer s.Close()
 
-	shardDir, err := s.shardDir(3)
-	require.NoError(t, err)
+	data := s.dir
 	for _, name := range []string{
 		"00000005.sst", "00000001.sst", "notes.txt", "1.sst",
 		"0000000A.sst", "00000003.SST",
 	} {
-		require.NoError(t, os.WriteFile(filepath.Join(shardDir, name), []byte("x"), 0o644))
+		require.NoError(t, os.WriteFile(filepath.Join(data, name), []byte("x"), 0o644))
 	}
 
-	nums, err := s.listTables(3)
+	nums, err := s.listTables()
 	require.NoError(t, err)
 	assert.Equal(t, []uint32{1, 5}, nums)
-
-	missing, err := s.listTables(4)
-	require.NoError(t, err)
-	assert.Empty(t, missing)
-	assert.NoDirExists(t, filepath.Join(dir, shardsDir, "04"), "listing must not create a shard directory")
 }
 
 func TestStorageCurrent(t *testing.T) {
@@ -163,24 +149,6 @@ func TestOpenStorageErrors(t *testing.T) {
 		_, err = openStorage(dir) // second open cannot acquire the lock
 		assert.Error(t, err)
 	})
-}
-
-func TestStorageShardDirError(t *testing.T) {
-	t.Parallel()
-	dir := t.TempDir()
-	s, err := openStorage(dir)
-	require.NoError(t, err)
-	defer s.Close()
-
-	// Put a regular file where the shard dir "shards/0a" would be created so
-	// MkdirAll fails in shardDir (and thus tablePath).
-	require.NoError(t, os.WriteFile(filepath.Join(dir, shardsDir, "0a"), []byte("x"), 0o644))
-
-	_, err = s.shardDir(10)
-	assert.Error(t, err)
-
-	_, err = s.tablePath(10, 1)
-	assert.Error(t, err)
 }
 
 func TestStorageReadCurrentBadSuffix(t *testing.T) {
