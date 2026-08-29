@@ -211,6 +211,30 @@ func (RangePartitioner) Shard(key []byte, numShards int) int {
 	return idx
 }
 
+// ShardRange returns the shards a scan of [start, end) can touch. Because the
+// mapping is monotone in the first byte, the touched shards are the contiguous
+// run from the shard owning start to the shard owning the largest key below end.
+func (p RangePartitioner) ShardRange(start, end []byte, numShards int) (lo, hi int) {
+	lo = 0
+	if len(start) > 0 {
+		lo = p.Shard(start, numShards)
+	}
+	hi = numShards
+	if len(end) > 0 {
+		// end is exclusive, but a key can share end's first byte and still be < end
+		// (e.g. end=[5,0], key=[5]), so the shard owning end's first byte is still
+		// in range: hi is that shard's index + 1.
+		hi = p.Shard(end, numShards) + 1
+		if hi > numShards {
+			hi = numShards
+		}
+	}
+	if lo > hi {
+		lo = hi // empty range (start >= end); scan nothing
+	}
+	return lo, hi
+}
+
 // builtinPartitioner returns the built-in partitioner for a config name.
 func builtinPartitioner(name string) Partitioner {
 	switch name {

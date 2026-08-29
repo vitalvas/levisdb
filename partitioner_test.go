@@ -1,6 +1,7 @@
 package levisdb
 
 import (
+	"bytes"
 	"fmt"
 	"math"
 	"math/bits"
@@ -21,6 +22,58 @@ func TestHashPartitionerDeterministicAndInRange(t *testing.T) {
 		assert.GreaterOrEqual(t, s1, 0)
 		assert.Less(t, s1, 16)
 	}
+}
+
+// TestRangePartitionerShardRange verifies the scan-pruning bounds: the returned
+// [lo,hi) must cover the shard of every key that can fall in [start,end), and it
+// must be tight (skip shards no in-range key can reach).
+func TestRangePartitionerShardRange(t *testing.T) {
+	t.Parallel()
+	p := RangePartitioner{}
+	const numShards = 8
+
+	// Property: for every first byte b, if a key starting with b is in [start,end),
+	// then p.Shard(that key) is within [lo,hi). Checked by brute force over bytes.
+	check := func(start, end []byte) {
+		lo, hi := p.ShardRange(start, end, numShards)
+		for b := 0; b < 256; b++ {
+			key := []byte{byte(b)}
+			inRange := (start == nil || bytes.Compare(key, start) >= 0) && (end == nil || bytes.Compare(key, end) < 0)
+			if !inRange {
+				continue
+			}
+			s := p.Shard(key, numShards)
+			assert.GreaterOrEqualf(t, s, lo, "key %d shard %d below lo %d", b, s, lo)
+			assert.Lessf(t, s, hi, "key %d shard %d at/above hi %d", b, s, hi)
+		}
+	}
+
+	check(nil, nil)                   // full scan -> all shards
+	check([]byte{0x00}, []byte{0xff}) // near-full
+	check([]byte{0x40}, []byte{0x80}) // a middle slice
+	check([]byte{0x10}, []byte{0x11}) // single first-byte
+	check(nil, []byte{0x40})          // unbounded start
+	check([]byte{0xc0}, nil)          // unbounded end
+
+	// Full scan spans every shard; a narrow slice spans fewer.
+	lo, hi := p.ShardRange(nil, nil, numShards)
+	assert.Equal(t, 0, lo)
+	assert.Equal(t, numShards, hi)
+	lo2, hi2 := p.ShardRange([]byte{0x10}, []byte{0x11}, numShards)
+	assert.Less(t, hi2-lo2, numShards, "a one-byte-wide range prunes to fewer shards")
+}
+
+// TestHashPartitionersAreNotShardRangers pins that hash partitioners do NOT
+// implement ShardRanger: their tokens are not key-ordered, so scan-pruning would
+// drop keys. The iterator must scan all shards for them.
+func TestHashPartitionersAreNotShardRangers(t *testing.T) {
+	t.Parallel()
+	_, hashOK := any(HashPartitioner{}).(ShardRanger)
+	_, murmurOK := any(Murmur3Partitioner{}).(ShardRanger)
+	_, rangeOK := any(RangePartitioner{}).(ShardRanger)
+	assert.False(t, hashOK, "hash (FNV-1a) must not be a ShardRanger")
+	assert.False(t, murmurOK, "murmur3 token ring must not be a ShardRanger")
+	assert.True(t, rangeOK, "range partitioner is order-preserving and must prune")
 }
 
 func TestHashPartitionerSpread(t *testing.T) {

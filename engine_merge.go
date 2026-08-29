@@ -51,11 +51,14 @@ func (m *mergeIter) Next() bool {
 	if m.err != nil || len(m.h) == 0 {
 		return false
 	}
-	// Capture the current entry before advancing. The slices point into the
-	// source's block payload, which stays valid while the source advances.
+	// Copy the current entry into our own buffers before advancing. The source's
+	// key/value slices point into its block payload, which a source may reuse
+	// across a block boundary when it advances (table iterators decompress into a
+	// reused scratch buffer), so holding the raw slices across top.src.Next would
+	// read overwritten bytes.
 	top := m.h[0]
-	m.curKey = top.key
-	m.curVal = top.val
+	m.curKey = append(m.curKey[:0], top.key...)
+	m.curVal = append(m.curVal[:0], top.val...)
 
 	// Advance the source and update its heap node in place rather than
 	// allocating a new mergeSource on every step; a compaction calls Next

@@ -410,6 +410,12 @@ type tableIterator struct {
 	// fill a block each would otherwise cost a syscall apiece.
 	win    []byte
 	winOff uint64 // file offset of win[0]
+
+	// rawScratch and decScratch are reused across blocks: block N is fully
+	// consumed before block N+1 is read, so one buffer each avoids a per-block
+	// allocation for the raw copy and the decompressed payload.
+	rawScratch []byte
+	decScratch []byte
 }
 
 // tableReadAheadSize is the read-ahead window for iterator scans. It matches the
@@ -449,7 +455,10 @@ func (it *tableIterator) blockRaw(h blockHandle) ([]byte, error) {
 		it.winOff = h.offset
 	}
 	start := h.offset - it.winOff
-	return append([]byte(nil), it.win[start:start+h.length]...), nil
+	// Copy the block out of the shared window into a reused scratch buffer: the
+	// window is refilled as the scan advances, so the payload must not alias it.
+	it.rawScratch = append(it.rawScratch[:0], it.win[start:start+h.length]...)
+	return it.rawScratch, nil
 }
 
 // NewIterator returns an iterator positioned before the first entry.
@@ -503,10 +512,16 @@ func (it *tableIterator) Next() bool {
 			it.err = err
 			return false
 		}
-		payload, err := decodeBlock(raw)
+		payload, usedDst, err := decodeBlockInto(it.decScratch, raw)
 		if err != nil {
 			it.err = err
 			return false
+		}
+		// Retain the decompressed buffer for reuse next block, but only when it was
+		// used: an uncompressed payload aliases raw, and keeping that as decScratch
+		// would let the next decompress write into raw's backing array mid-read.
+		if usedDst {
+			it.decScratch = payload
 		}
 		entries, _, _, splitErr := splitDataBlock(payload)
 		if splitErr != nil {

@@ -21,6 +21,15 @@ func (db *DB) recoverWAL(shardLogs [][]uint32, startSeq uint64) (uint64, error) 
 	return db.recoverWALMode(shardLogs, startSeq, true)
 }
 
+// logRecovered reports the outcome of WAL replay. Extracted so recoverWALMode
+// stays under the cyclomatic-complexity limit.
+func (db *DB) logRecovered(startSeq, maxSeq uint64) {
+	if maxSeq > startSeq {
+		db.log.Info("wal recovery replayed entries",
+			"op", "recover", "start_seq", startSeq, "recovered_seq", maxSeq)
+	}
+}
+
 // errWALStop signals a recoverable stop point during lenient WAL replay: the
 // intact prefix up to here is kept and no further segments are replayed.
 var errWALStop = fmt.Errorf("wal: recoverable stop")
@@ -120,6 +129,8 @@ func (db *DB) recoverWALMode(shardLogs [][]uint32, startSeq uint64, flush bool) 
 				if closeErr != nil {
 					return maxSeq, closeErr
 				}
+				db.log.Warn("wal recovery stopped at corruption; kept intact prefix",
+					"op", "recover", "shard", shard, "segment", num, "recovered_seq", maxSeq)
 				stopped = true
 				break
 			}
@@ -141,6 +152,7 @@ func (db *DB) recoverWALMode(shardLogs [][]uint32, startSeq uint64, flush bool) 
 	if maxSeq > db.readSeq.Load() {
 		db.readSeq.Store(maxSeq)
 	}
+	db.logRecovered(startSeq, maxSeq)
 	if !flush {
 		return maxSeq, nil
 	}

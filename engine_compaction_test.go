@@ -10,6 +10,120 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// TestPickCompactionCapTierIsTerminal guards the fix for the compaction
+// depth-runaway (which hung Close forever on large, compressible values). The
+// cap tier (maxTierDepth) is terminal: there is nowhere deeper to push, so
+// count/byte triggers there must NOT fire - re-merging its distinct data
+// reclaims nothing and loops forever. Only a tombstone-heavy cap tier is picked.
+// Below the cap, the count trigger still fires normally.
+func TestPickCompactionCapTierIsTerminal(t *testing.T) {
+	t.Parallel()
+	s := newTestShard(t, 1<<30)
+	// Stub TierRatio (=8) tables at the cap tier with distinct data, no tombstones.
+	// These are metadata-only stubs (no file handle); clear them before the shard's
+	// Cleanup Close so it does not try to release a nil handle.
+	s.mu.Lock()
+	for i := 0; i < 8; i++ {
+		s.tables = append(s.tables, &tableMeta{depth: maxTierDepth, size: 1 << 20, entries: 1000})
+	}
+	s.mu.Unlock()
+	t.Cleanup(func() { s.mu.Lock(); s.tables = nil; s.mu.Unlock() })
+	assert.Equal(t, -1, s.pickCompaction(4, 1<<10, 0),
+		"cap tier must not be picked by count or bytes (terminal, would loop)")
+
+	// A cap tier that is tombstone-heavy IS worth compacting (it shrinks).
+	s.mu.Lock()
+	for _, tb := range s.tables {
+		tb.tombstones = tb.entries // all deletes
+	}
+	s.mu.Unlock()
+	assert.Equal(t, maxTierDepth, s.pickCompaction(4, 0, 0.5),
+		"tombstone-heavy cap tier is still reclaimed")
+
+	// A tier BELOW the cap with >= ratio tables is picked by count as usual.
+	s2 := newTestShard(t, 1<<30)
+	s2.mu.Lock()
+	for i := 0; i < 4; i++ {
+		s2.tables = append(s2.tables, &tableMeta{depth: maxTierDepth - 1, size: 1 << 20, entries: 1000})
+	}
+	s2.mu.Unlock()
+	t.Cleanup(func() { s2.mu.Lock(); s2.tables = nil; s2.mu.Unlock() })
+	assert.Equal(t, maxTierDepth-1, s2.pickCompaction(4, 0, 0),
+		"a non-cap tier at the count ratio is still picked")
+}
+
+// TestCompactOutputDepthCapped verifies the output-depth clamp: compacting a tier
+// at (or past) the cap merges IN PLACE at maxTierDepth instead of creating an
+// ever-deeper tier. Two real tables are placed at the cap tier via flush+compact,
+// then a compaction there must keep every output table at the cap, never deeper.
+func TestCompactOutputDepthCapped(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	tablePath := func(num uint32) (string, error) {
+		return filepath.Join(dir, fmt.Sprintf("%08x.sst", num)), nil
+	}
+	cfg := shardConfigT{MemtableSize: 1 << 30, BloomBits: 10, BlockSize: 256, FreshCodecName: "none"}
+	s := newShard(cfg, newAllocator(0), tablePath, 1)
+	t.Cleanup(func() { s.Close() })
+
+	// Write two real L0 tables, then relocate them to the cap tier with openTable so
+	// they are genuine (mergeable) tables sitting AT maxTierDepth.
+	flushSingle(t, s, 1, "a", "1")
+	flushSingle(t, s, 2, "b", "2")
+	s.mu.Lock()
+	for _, tb := range s.tables {
+		tb.depth = maxTierDepth
+	}
+	s.mu.Unlock()
+
+	// Compact the cap tier: it must merge in place, output staying at the cap.
+	require.NoError(t, s.Compact(maxTierDepth, uint64(1)<<62, testCompactionConfig()))
+	s.mu.RLock()
+	maxd := 0
+	for _, tb := range s.tables {
+		if tb.depth > maxd {
+			maxd = tb.depth
+		}
+	}
+	s.mu.RUnlock()
+	assert.LessOrEqual(t, maxd, maxTierDepth, "compaction must not produce a tier deeper than the cap")
+	assert.Equal(t, []byte("1"), mustGet(t, s, 100, "a"))
+	assert.Equal(t, []byte("2"), mustGet(t, s, 100, "b"))
+}
+
+// TestCompactionRollsOnCompressedSize verifies compaction rolls output on the
+// COMPRESSED on-disk size, not raw key+value bytes: highly compressible data
+// whose RAW size is many multiples of the target must still fit in ONE output
+// table because its compressed size stays under target. Rolling on raw bytes
+// would spray many tiny/near-empty SSTs. (LevelDB rolls on Writer.BytesLen, the
+// file offset - the same basis.)
+func TestCompactionRollsOnCompressedSize(t *testing.T) {
+	t.Parallel()
+	s := newTestShard(t, 1<<30)
+
+	// Two L0 tables of all-zero values: raw bytes far exceed the target, but they
+	// compress to almost nothing, so the merged output must be a single table.
+	cc := testCompactionConfig()
+	cc.FreshCodecName = "s2"
+	cc.BottomCodecName = "s2"
+	cc.FileSizeBase = 64 << 10 // small target so raw size would force many rolls
+	cc.FileSizeMax = 64 << 10
+	zero := make([]byte, 2048)
+	for f := 0; f < 2; f++ {
+		for i := 0; i < 500; i++ { // 500*2KB = 1 MB raw per table, >> 64 KiB target
+			s.Put(uint64(f*1000+i+1), []byte(fmt.Sprintf("k%02d%05d", f, i)), zero)
+		}
+		require.NoError(t, s.Flush())
+	}
+	require.NoError(t, s.Compact(0, uint64(1)<<62, cc))
+
+	tabs := s.Tables()
+	require.Len(t, tabs, 1,
+		"1 MB+ of zero data compresses under the 64 KiB target, so it must roll into one table, not many")
+	assert.Less(t, tabs[0].Size, int64(64<<10),
+		"the single output table's on-disk size is under target (compressed)")
+}
+
 func testCompactionConfig() compactionConfigT {
 	return compactionConfigT{
 		TierRatio:          2,
@@ -62,15 +176,269 @@ func TestPickCompaction(t *testing.T) {
 	s := newTestShard(t, 1<<20)
 
 	t.Run("nothing ready", func(t *testing.T) {
-		assert.Equal(t, -1, s.pickCompaction(2, 0))
+		assert.Equal(t, -1, s.pickCompaction(2, 0, 0))
 	})
 
 	t.Run("ready at ratio", func(t *testing.T) {
 		flushSingle(t, s, 1, "a", "1")
-		assert.Equal(t, -1, s.pickCompaction(2, 0), "one table below ratio")
+		assert.Equal(t, -1, s.pickCompaction(2, 0, 0), "one table below ratio")
 		flushSingle(t, s, 2, "b", "2")
-		assert.Equal(t, 0, s.pickCompaction(2, 0), "two L0 tables meet ratio 2")
+		assert.Equal(t, 0, s.pickCompaction(2, 0, 0), "two L0 tables meet ratio 2")
 	})
+}
+
+// flushLarge writes many rows so the resulting L0 table is a few hundred KiB,
+// then flushes it. Repeated calls build a tier of few-but-large tables.
+func flushLarge(t *testing.T, s *shardT, seqBase uint64, keyPrefix string, rows int) {
+	t.Helper()
+	val := make([]byte, 512)
+	for i := 0; i < rows; i++ {
+		s.Put(seqBase+uint64(i), []byte(fmt.Sprintf("%s%06d", keyPrefix, i)), val)
+	}
+	require.NoError(t, s.Flush())
+}
+
+// TestPickCompactionLargeTableStall documents the size-tiered picker's baseline
+// weakness (the UCS "large SSTable accumulation" problem): a tier holding a few
+// large tables never reaches the count threshold, so it is never compacted no
+// matter how many bytes it holds. This is the before-side the density trigger
+// (roadmap milestone 3) must fix; when TierByteTrigger lands, an equivalent tier
+// must instead be picked. Baseline numbers on this workload: 3 tables at depth 0,
+// ~1.5 MiB of tier bytes, picker returns -1 at ratio 4.
+func TestPickCompactionLargeTableStall(t *testing.T) {
+	t.Parallel()
+	s := newTestShard(t, 1<<30) // large memtable so only explicit Flush rolls a table
+
+	const tables = 3 // below the default TierRatio of 4
+	for i := 0; i < tables; i++ {
+		flushLarge(t, s, uint64(i*1000+1), fmt.Sprintf("t%d-k", i), 1000)
+	}
+
+	s.mu.RLock()
+	var depth0 int
+	var bytes int64
+	for _, tbl := range s.tables {
+		if tbl.depth == 0 {
+			depth0++
+			bytes += tbl.size
+		}
+	}
+	s.mu.RUnlock()
+
+	require.Equal(t, tables, depth0, "each Flush produced one L0 table")
+	assert.Greater(t, bytes, int64(1<<20), "the tier holds well over a MiB")
+	assert.Equal(t, -1, s.pickCompaction(4, 0, 0),
+		"count-based picker stalls: a few large tables never reach the ratio")
+}
+
+// TestPickCompactionDensityTrigger is the after-side of the large-table stall:
+// with TierByteTrigger set below the tier's bytes, the same few-but-large tier
+// that the count trigger ignores is now picked (roadmap milestone 3). A sparse
+// tier below the byte trigger still returns -1, and a single large table is never
+// compacted alone.
+func TestPickCompactionDensityTrigger(t *testing.T) {
+	t.Parallel()
+
+	t.Run("large tier picked below count ratio", func(t *testing.T) {
+		s := newTestShard(t, 1<<30)
+		for i := 0; i < 3; i++ { // below ratio 4
+			flushLarge(t, s, uint64(i*1000+1), fmt.Sprintf("t%d-k", i), 1000)
+		}
+		s.mu.RLock()
+		var bytes int64
+		for _, tbl := range s.tables {
+			bytes += tbl.size
+		}
+		s.mu.RUnlock()
+
+		// Count trigger alone still stalls; the density trigger fires.
+		assert.Equal(t, -1, s.pickCompaction(4, 0, 0), "count trigger stalls")
+		assert.Equal(t, 0, s.pickCompaction(4, bytes, 0),
+			"density trigger picks the tier once its bytes reach the threshold")
+	})
+
+	t.Run("sparse tier below trigger stays idle", func(t *testing.T) {
+		s := newTestShard(t, 1<<30)
+		flushSingle(t, s, 1, "a", "1")
+		flushSingle(t, s, 2, "b", "2") // two tiny tables, well under any real trigger
+		assert.Equal(t, -1, s.pickCompaction(4, 1<<30, 0),
+			"a couple of tiny tables are below the byte trigger")
+	})
+
+	t.Run("single table never compacted alone", func(t *testing.T) {
+		s := newTestShard(t, 1<<30)
+		flushLarge(t, s, 1, "k", 2000) // one big table
+		s.mu.RLock()
+		bytes := s.tables[0].size
+		s.mu.RUnlock()
+		assert.Equal(t, -1, s.pickCompaction(4, bytes, 0),
+			"byte trigger requires >= 2 tables, so a lone table is left")
+	})
+}
+
+// tbl builds a tableMeta with only the key bounds set (empty = nil = unknown).
+func tbl(lo, hi string) *tableMeta {
+	var mn, mx []byte
+	if lo != "" {
+		mn = []byte(lo)
+	}
+	if hi != "" {
+		mx = []byte(hi)
+	}
+	return &tableMeta{minKey: mn, maxKey: mx}
+}
+
+func TestOverlapSets(t *testing.T) {
+	t.Parallel()
+
+	// setKeys renders each group as its members' "min-max" for stable comparison.
+	setKeys := func(sets [][]*tableMeta) [][]string {
+		out := make([][]string, len(sets))
+		for i, g := range sets {
+			for _, m := range g {
+				out[i] = append(out[i], fmt.Sprintf("%s-%s", m.minKey, m.maxKey))
+			}
+		}
+		return out
+	}
+
+	t.Run("empty", func(t *testing.T) {
+		assert.Nil(t, overlapSets(nil))
+	})
+
+	t.Run("single", func(t *testing.T) {
+		sets := overlapSets([]*tableMeta{tbl("a", "z")})
+		assert.Len(t, sets, 1)
+		assert.Len(t, sets[0], 1)
+	})
+
+	t.Run("disjoint ranges split", func(t *testing.T) {
+		// a-c | e-g | i-k: three non-overlapping tables -> three groups.
+		sets := overlapSets([]*tableMeta{tbl("i", "k"), tbl("a", "c"), tbl("e", "g")})
+		assert.Equal(t, [][]string{{"a-c"}, {"e-g"}, {"i-k"}}, setKeys(sets),
+			"non-overlapping tables never share a group; sorted by min")
+	})
+
+	t.Run("transitive chain groups together", func(t *testing.T) {
+		// UCS worked example A:0-3, B:2-7, C:6-9, D:1-8. All chain-overlap, so for
+		// COMPACTION SELECTION they form one connected group (this differs from UCS's
+		// shared-boundary read-amp sets {A,B,D},{B,C,D} by design).
+		a, b, c, d := tbl("0", "3"), tbl("2", "7"), tbl("6", "9"), tbl("1", "8")
+		sets := overlapSets([]*tableMeta{c, a, d, b})
+		require.Len(t, sets, 1, "A-D-B-C all connect through overlaps")
+		assert.Len(t, sets[0], 4)
+	})
+
+	t.Run("two clusters separated by a gap", func(t *testing.T) {
+		// {a-c, b-d} overlap; gap; {m-p, n-q} overlap.
+		sets := overlapSets([]*tableMeta{tbl("a", "c"), tbl("b", "d"), tbl("m", "p"), tbl("n", "q")})
+		assert.Equal(t, [][]string{{"a-c", "b-d"}, {"m-p", "n-q"}}, setKeys(sets))
+	})
+
+	t.Run("abutting ranges overlap", func(t *testing.T) {
+		// c is both max of the first and min of the second -> they connect.
+		sets := overlapSets([]*tableMeta{tbl("a", "c"), tbl("c", "e")})
+		assert.Len(t, sets, 1, "shared boundary key counts as overlap")
+	})
+
+	t.Run("nil low bound overlaps up to its max", func(t *testing.T) {
+		// ("",b) has an unknown start but a known end b, so it overlaps a-c (which
+		// starts at a <= b) yet not m-p (which starts above b).
+		sets := overlapSets([]*tableMeta{tbl("m", "p"), tbl("a", "c"), tbl("", "b")})
+		require.Len(t, sets, 2, "unknown-low table joins the low cluster, not the far one")
+		assert.Len(t, sets[0], 2, "(,b) and a-c connect")
+		assert.Equal(t, []*tableMeta{tbl("m", "p")}[0].minKey, sets[1][0].minKey)
+	})
+
+	t.Run("nil high bound absorbs everything after", func(t *testing.T) {
+		// An open-ended table covers all higher keys, so later tables join its group.
+		sets := overlapSets([]*tableMeta{tbl("a", ""), tbl("m", "p"), tbl("x", "z")})
+		require.Len(t, sets, 1, "unknown high bound is conservatively treated as overlapping")
+		assert.Len(t, sets[0], 3)
+	})
+}
+
+// TestOverlapScopedCompaction verifies that with OverlapSelection on, a tier
+// holding two disjoint key ranges compacts only one overlapping group, leaving
+// the unrelated range untouched (roadmap milestone 5). Two tables share key "a"
+// (overlap) and two others share key "z" (a separate overlap); the compaction
+// merges one group and leaves the other tables in place.
+func TestOverlapScopedCompaction(t *testing.T) {
+	t.Parallel()
+	s := newTestShard(t, 1<<30)
+
+	// Seed a deeper tier so the depth-0 compaction below is NOT the bottom (overlap
+	// selection is exempt at the bottom, which must merge wholly for tombstone GC).
+	flushSingle(t, s, 1, "m", "seed1")
+	flushSingle(t, s, 2, "m", "seed2")
+	require.NoError(t, s.Compact(0, uint64(1)<<62, testCompactionConfig())) // -> one depth-1 table
+
+	// Now two disjoint overlap groups at depth 0: {a,a} and {z,z}.
+	flushSingle(t, s, 3, "a", "a1")
+	flushSingle(t, s, 4, "a", "a2")
+	flushSingle(t, s, 5, "z", "z1")
+	flushSingle(t, s, 6, "z", "z2")
+
+	var d0 int
+	for _, tb := range s.Tables() {
+		if tb.Depth == 0 {
+			d0++
+		}
+	}
+	require.Equal(t, 4, d0, "four L0 tables before compaction")
+
+	cc := testCompactionConfig()
+	cc.OverlapSelection = true
+	require.NoError(t, s.Compact(0, uint64(1)<<62, cc))
+
+	// Only the largest overlap group (2 tables) merged; the other 2 L0 tables stay.
+	var depth0 int
+	for _, tb := range s.Tables() {
+		if tb.Depth == 0 {
+			depth0++
+		}
+	}
+	assert.Equal(t, 2, depth0, "the unrelated range's L0 tables stay; only one group merged")
+
+	// Every key still reads correctly (newest version wins).
+	assert.Equal(t, []byte("a2"), mustGet(t, s, 100, "a"))
+	assert.Equal(t, []byte("z2"), mustGet(t, s, 100, "z"))
+	assert.Equal(t, []byte("seed2"), mustGet(t, s, 100, "m"))
+}
+
+// TestOverlapScopedCompactionSurvivesCrash ensures overlap-scoped compaction is
+// crash-safe end to end: after a DB-level compaction that used overlap selection,
+// a crash and reopen returns every key.
+func TestOverlapScopedCompactionSurvivesCrash(t *testing.T) {
+	dir := t.TempDir()
+	opts := func() Options {
+		o := DefaultOptions(dir)
+		o.ShardCount = 1
+		o.NoSync = true
+		o.MemtableSize = 4096 // small so writes flush to several L0 tables
+		return o
+	}
+	db, err := Open(opts())
+	require.NoError(t, err)
+
+	// Two interleaved key ranges so the tier has both overlap groups.
+	const n = 400
+	for i := 0; i < n; i++ {
+		require.NoError(t, db.Put(PutOptions{Key: []byte(fmt.Sprintf("lo-%05d", i)), Value: []byte("v")}))
+		require.NoError(t, db.Put(PutOptions{Key: []byte(fmt.Sprintf("hi-%05d", i)), Value: []byte("v")}))
+	}
+	require.NoError(t, db.CompactShard(0)) // exercises the overlap-scoped path
+	db.crash()
+
+	db, err = Open(opts())
+	require.NoError(t, err)
+	defer db.Close()
+	for i := 0; i < n; i++ {
+		_, e1 := db.Get([]byte(fmt.Sprintf("lo-%05d", i)))
+		_, e2 := db.Get([]byte(fmt.Sprintf("hi-%05d", i)))
+		require.NoErrorf(t, e1, "lost lo-%05d", i)
+		require.NoErrorf(t, e2, "lost hi-%05d", i)
+	}
 }
 
 func TestCompactCollapsesVersions(t *testing.T) {
@@ -266,6 +634,120 @@ func BenchmarkCompactAll(b *testing.B) {
 		if err := s.CompactAll(uint64(1)<<62, cc); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+// benchCompactConfig returns a compaction config with overlap selection toggled.
+func benchCompactConfig(overlap bool) compactionConfigT {
+	return compactionConfigT{
+		TierRatio:        4,
+		BloomBits:        10,
+		BlockSize:        4096,
+		FreshCodecName:   "s2",
+		BottomCodecName:  "zstd",
+		OverlapSelection: overlap,
+	}
+}
+
+// buildDisjointTier builds a non-bottom L0 tier of `ranges` disjoint key ranges
+// (each in its own flushed table) over a pre-existing depth-1 seed table, so a
+// depth-0 compaction is intermediate (overlap selection applies) and only one
+// range's tables actually overlap. Returns the shard ready to Compact(0,...).
+func buildDisjointTier(b *testing.B, ranges, tablesPerRange, rows int) *shardT {
+	b.Helper()
+	s := newBenchShard(b)
+	val := make([]byte, 100)
+	var seq uint64
+	put := func(prefix string) {
+		for i := 0; i < rows; i++ {
+			seq++
+			s.Put(seq, []byte(fmt.Sprintf("%s%06d", prefix, i)), val)
+		}
+		if err := s.Flush(); err != nil {
+			b.Fatal(err)
+		}
+	}
+	// Seed a depth-1 table so the depth-0 compaction below is not the bottom tier.
+	put("seed")
+	put("seed")
+	if err := s.Compact(0, uint64(1)<<62, benchCompactConfig(false)); err != nil {
+		b.Fatal(err)
+	}
+	// Now `ranges` disjoint key ranges at depth 0, each with tablesPerRange
+	// overlapping tables (same prefix => same key span => one overlap group).
+	for r := 0; r < ranges; r++ {
+		prefix := fmt.Sprintf("r%02d-", r)
+		for t := 0; t < tablesPerRange; t++ {
+			put(prefix)
+		}
+	}
+	return s
+}
+
+// BenchmarkCompactOverlapSelection compares a non-bottom tier compaction with
+// overlap-scoped selection on vs off. With several disjoint ranges present,
+// overlap selection merges only one range's tables while the off case rewrites
+// the whole tier, so "on" moves far fewer bytes per compaction. mergedBytes is
+// reported so the difference in work is visible, not just wall time.
+func BenchmarkCompactOverlapSelection(b *testing.B) {
+	const ranges, tablesPerRange, rows = 6, 2, 3000
+	for _, overlap := range []bool{true, false} {
+		name := "overlap-off"
+		if overlap {
+			name = "overlap-on"
+		}
+		b.Run(name, func(b *testing.B) {
+			cc := benchCompactConfig(overlap)
+			var mergedBytes int64
+			b.ResetTimer()
+			for n := 0; n < b.N; n++ {
+				b.StopTimer()
+				s := buildDisjointTier(b, ranges, tablesPerRange, rows)
+				var before int64
+				for _, t := range s.Tables() {
+					if t.Depth == 0 {
+						before += t.Size
+					}
+				}
+				b.StartTimer()
+
+				if err := s.Compact(0, uint64(1)<<62, cc); err != nil {
+					b.Fatal(err)
+				}
+
+				b.StopTimer()
+				var after int64
+				for _, t := range s.Tables() {
+					if t.Depth == 0 {
+						after += t.Size
+					}
+				}
+				mergedBytes += before - after // L0 bytes consumed by this compaction
+				b.StartTimer()
+			}
+			b.ReportMetric(float64(mergedBytes)/float64(b.N), "mergedBytes/op")
+		})
+	}
+}
+
+// BenchmarkPickCompaction measures the picker itself (count + density + tombstone
+// scan over a tier) since it runs on the compaction hot path per shard.
+func BenchmarkPickCompaction(b *testing.B) {
+	s := newBenchShard(b)
+	val := make([]byte, 100)
+	var seq uint64
+	for t := 0; t < 8; t++ {
+		for i := 0; i < 1000; i++ {
+			seq++
+			s.Put(seq, []byte(fmt.Sprintf("k%06d", i)), val)
+		}
+		if err := s.Flush(); err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.ResetTimer()
+	for n := 0; n < b.N; n++ {
+		_ = s.pickCompaction(4, 128<<20, 0.5)
 	}
 }
 
@@ -519,16 +1001,16 @@ func TestTombstoneRatioTriggersCompaction(t *testing.T) {
 
 	// 4 tombstones / 6 entries ~= 0.67. Below the count threshold, only the
 	// tombstone trigger can mark this tier ready.
-	assert.Equal(t, -1, s.pickCompaction(1000, 0), "no trigger without tombstone ratio")
-	assert.Equal(t, -1, s.pickCompaction(1000, 0.9), "ratio too high to trigger")
-	assert.Equal(t, 0, s.pickCompaction(1000, 0.5), "delete-heavy tier triggers at 0.5")
+	assert.Equal(t, -1, s.pickCompaction(1000, 0, 0), "no trigger without tombstone ratio")
+	assert.Equal(t, -1, s.pickCompaction(1000, 0, 0.9), "ratio too high to trigger")
+	assert.Equal(t, 0, s.pickCompaction(1000, 0, 0.5), "delete-heavy tier triggers at 0.5")
 
 	// A single table cannot compact alone even if delete-heavy (needs >= 2).
 	s2 := newTestShard(t, 1<<20)
 	defer s2.Close()
 	s2.del(1, []byte("x"))
 	require.NoError(t, s2.Flush())
-	assert.Equal(t, -1, s2.pickCompaction(1000, 0.1), "single table not compacted alone")
+	assert.Equal(t, -1, s2.pickCompaction(1000, 0, 0.1), "single table not compacted alone")
 }
 
 func TestTombstoneCompactionReclaimsDeletedSpace(t *testing.T) {
@@ -553,7 +1035,7 @@ func TestTombstoneCompactionReclaimsDeletedSpace(t *testing.T) {
 
 	// Count trigger off (high ratio), tombstone trigger on: the picker must select
 	// the delete-heavy depth-0 tier.
-	depth := s.pickCompaction(1000, 0.5)
+	depth := s.pickCompaction(1000, 0, 0.5)
 	require.Equal(t, 0, depth, "tombstone trigger must select the delete-heavy tier")
 
 	// Compact it to the bottom (retainSeq high so tombstones are reclaimable).

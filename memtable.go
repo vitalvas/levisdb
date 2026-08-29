@@ -143,36 +143,47 @@ func (it *memtableIterator) Value() []byte { return it.list.value(it.n) }
 
 func (it *memtableIterator) Error() error { return nil }
 
-type snapshotEntry struct {
-	key, value []byte
-}
-
 type memtableSnapshotIterator struct {
-	entries []snapshotEntry
-	index   int
+	arena []byte   // arena backing array pinned at snapshot time
+	offs  []uint32 // node offsets present at snapshot, in ascending key order
+	index int
 }
 
-// newSnapshotIterator copies a stable view of a mutable memtable. Public
-// iterators can then run concurrently with writers without retaining a lock or
-// traversing an arena whose backing slice and links are changing.
+// newSnapshotIterator captures a stable view of a (possibly still mutable)
+// memtable without copying key/value bytes. It records the node offsets present
+// now and pins the arena's backing array; the scan then runs lock-free while
+// writers keep appending. This is safe because: node data bytes are immutable
+// once written (a re-Put appends a new node, never overwrites); the arena only
+// grows by append, so a growth reallocates into a NEW array and leaves the pinned
+// one stable; and offsets are captured under the lock, so a concurrent write's
+// node (offset >= boundary) is excluded. Reading links lock-free would race with
+// setNext, so only the offset walk is done under the lock; afterward the iterator
+// touches immutable data via the pinned arena only.
 func (m *memtableT) newSnapshotIterator() *memtableSnapshotIterator {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	var entries []snapshotEntry
+	pinned := m.list.arena
+	boundary := uint32(len(pinned))
+	var offs []uint32
 	for n := m.list.first(); n != nilNode; n = m.list.next(n, 0) {
-		entries = append(entries, snapshotEntry{
-			key:   append([]byte(nil), m.list.key(n)...),
-			value: append([]byte(nil), m.list.value(n)...),
-		})
+		if n >= boundary {
+			break // a node appended after the snapshot boundary; exclude it
+		}
+		offs = append(offs, n)
 	}
-	return &memtableSnapshotIterator{entries: entries, index: -1}
+	return &memtableSnapshotIterator{arena: pinned, offs: offs, index: -1}
 }
 
 func (it *memtableSnapshotIterator) Next() bool {
 	it.index++
-	return it.index < len(it.entries)
+	return it.index < len(it.offs)
 }
 
-func (it *memtableSnapshotIterator) internalKey() []byte { return it.entries[it.index].key }
-func (it *memtableSnapshotIterator) Value() []byte       { return it.entries[it.index].value }
-func (it *memtableSnapshotIterator) Error() error        { return nil }
+func (it *memtableSnapshotIterator) internalKey() []byte {
+	return skiplistKeyAt(it.arena, it.offs[it.index])
+}
+
+func (it *memtableSnapshotIterator) Value() []byte {
+	return skiplistValueAt(it.arena, it.offs[it.index])
+}
+func (it *memtableSnapshotIterator) Error() error { return nil }

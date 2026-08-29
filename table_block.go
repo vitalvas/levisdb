@@ -193,26 +193,39 @@ func finishBlock(payload []byte, c blockCodec, entropySkip bool) []byte {
 // decodeBlock verifies the CRC and decompresses an on-disk block into its
 // entry payload.
 func decodeBlock(raw []byte) ([]byte, error) {
+	payload, _, err := decodeBlockInto(nil, raw)
+	return payload, err
+}
+
+// decodeBlockInto is decodeBlock with a reusable destination for the decompressed
+// payload, so a sequential scan can decompress into one per-iterator scratch
+// buffer instead of allocating a fresh block each step. dst may be nil. usedDst
+// reports whether the payload was decompressed into dst (true) or aliases raw
+// because the block was stored uncompressed (false); the caller reuses dst only
+// when usedDst is true so it never ends up aliasing raw. When usedDst is false
+// the returned payload aliases raw, so raw must stay valid while it is read.
+func decodeBlockInto(dst, raw []byte) (payload []byte, usedDst bool, err error) {
 	if len(raw) < blockTrailerLen {
-		return nil, fmt.Errorf("table: block too short")
+		return nil, false, fmt.Errorf("table: block too short")
 	}
 	body := raw[:len(raw)-4]
 	want := binary.LittleEndian.Uint32(raw[len(raw)-4:])
 	if crc32.Checksum(body, tableCastagnoli) != want {
-		return nil, fmt.Errorf("table: block crc mismatch")
+		return nil, false, fmt.Errorf("table: block crc mismatch")
 	}
 	id := codecID(body[len(body)-1])
 	comp := body[:len(body)-1]
 	if id == codecNone {
 		// Uncompressed: the payload is already a subslice of the caller-owned
 		// read buffer, so return it directly instead of copying it out.
-		return comp, nil
+		return comp, false, nil
 	}
 	c, err := codecFromID(id)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	return c.decompress(nil, comp)
+	out, err := c.decompress(dst[:0], comp)
+	return out, true, err
 }
 
 // blockIter iterates entries within a decoded block payload.

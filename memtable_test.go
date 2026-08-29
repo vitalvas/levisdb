@@ -116,6 +116,40 @@ func TestMemtableIterator(t *testing.T) {
 	assert.Equal(t, []byte("va2"), it2.Value())
 }
 
+// TestMemtableSnapshotIteratorStable verifies the offset-snapshot iterator: a
+// snapshot taken before later writes must (1) see exactly the keys present at
+// creation and none added after (the boundary guard), and (2) keep reading valid
+// bytes even after those writes grow and reallocate the arena (the pinned backing
+// array). This is the safety contract that lets the scan run lock-free without
+// copying every key/value.
+func TestMemtableSnapshotIteratorStable(t *testing.T) {
+	t.Parallel()
+	m := newMemtable(4)
+	const before = 200
+	for i := 0; i < before; i++ {
+		m.Put(uint64(i+1), []byte(fmt.Sprintf("key%05d", i)), []byte("v"))
+	}
+
+	// Take the snapshot, then write many more keys, forcing arena growth/realloc.
+	it := m.newSnapshotIterator()
+	for i := before; i < before+5000; i++ {
+		m.Put(uint64(i+1), []byte(fmt.Sprintf("key%05d", i)), []byte("v"))
+	}
+
+	// The snapshot must yield exactly the `before` keys, in order, with intact
+	// values read from the pinned (now-detached) arena.
+	var keys []string
+	for it.Next() {
+		keys = append(keys, string(ikeyUserKey(it.internalKey())))
+		assert.Equal(t, []byte("v"), it.Value(), "value bytes stay valid after arena realloc")
+	}
+	require.Len(t, keys, before, "snapshot excludes keys written after it was taken")
+	for i := 0; i < before; i++ {
+		assert.Equal(t, fmt.Sprintf("key%05d", i), keys[i])
+	}
+	require.NoError(t, it.Error())
+}
+
 func BenchmarkMemtablePut(b *testing.B) {
 	m := newMemtable(1)
 	val := make([]byte, 100)

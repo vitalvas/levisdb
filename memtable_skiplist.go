@@ -70,25 +70,32 @@ func (s *skiplist) allocNode(key, value []byte, height int) uint32 {
 	return off
 }
 
-func (s *skiplist) keyLen(off uint32) uint32 { return binary.LittleEndian.Uint32(s.arena[off:]) }
-func (s *skiplist) valLen(off uint32) uint32 { return binary.LittleEndian.Uint32(s.arena[off+4:]) }
-func (s *skiplist) nodeHeight(off uint32) int {
-	return int(binary.LittleEndian.Uint16(s.arena[off+8:]))
-}
-
 // key returns the node's key as a subslice of the arena (read-only).
-func (s *skiplist) key(off uint32) []byte {
-	h := s.nodeHeight(off)
-	dataOff := off + nodeHeaderLen + uint32(h)*4
-	return s.arena[dataOff : dataOff+s.keyLen(off)]
-}
+func (s *skiplist) key(off uint32) []byte { return skiplistKeyAt(s.arena, off) }
 
 // value returns the node's value as a subslice of the arena (read-only).
-func (s *skiplist) value(off uint32) []byte {
-	h := s.nodeHeight(off)
-	kl := s.keyLen(off)
+func (s *skiplist) value(off uint32) []byte { return skiplistValueAt(s.arena, off) }
+
+// skiplistKeyAt reads a node's key from an explicit arena backing array rather
+// than s.arena, so a snapshot iterator can read from an arena slice it pinned at
+// snapshot time. Node data bytes are immutable once written and appends realloc
+// into a new array, leaving the pinned one stable, so this is safe to call
+// lock-free after the offset set was captured under the lock.
+func skiplistKeyAt(arena []byte, off uint32) []byte {
+	h := int(binary.LittleEndian.Uint16(arena[off+8:]))
+	kl := binary.LittleEndian.Uint32(arena[off:])
+	dataOff := off + nodeHeaderLen + uint32(h)*4
+	return arena[dataOff : dataOff+kl]
+}
+
+// skiplistValueAt reads a node's value from an explicit arena backing array. See
+// skiplistKeyAt for the safety argument.
+func skiplistValueAt(arena []byte, off uint32) []byte {
+	h := int(binary.LittleEndian.Uint16(arena[off+8:]))
+	kl := binary.LittleEndian.Uint32(arena[off:])
+	vl := binary.LittleEndian.Uint32(arena[off+4:])
 	dataOff := off + nodeHeaderLen + uint32(h)*4 + kl
-	return s.arena[dataOff : dataOff+s.valLen(off)]
+	return arena[dataOff : dataOff+vl]
 }
 
 // next returns the offset of the next node at the given level, or nilNode.

@@ -20,7 +20,8 @@ not supported.
 - durable manifest transactions for flush and compaction
 - FNV-1a, Murmur3, and range partitioners, plus validated custom partitioners
 - snapshot reads and ordered range iterators
-- size-tiered compaction with per-depth output file targets and a per-pass byte cap
+- size-tiered compaction with count and byte-density triggers and per-depth output targets
+- overlap-scoped compaction that merges only key-overlapping tables, bounding read amplification
 - tombstone-density compaction that drains delete-heavy tiers early
 - write backpressure that slows and then stops writers before the tier ladder runs away
 - S2 for fresh data and Zstandard for bottom-tier data, skipped for high-entropy blocks
@@ -102,13 +103,15 @@ target a single slow spinning disk.
 | Option | Default | Purpose |
 | --- | --- | --- |
 | `Dir` | (required) | Data directory. |
-| `ShardCount` | `32` | Number of shards. Baked into data; verified on open. |
+| `ShardCount` | `8` | Number of shards. Baked into data; verified on open. |
 | `Partitioner` / `CustomPartitioner` | `PartitionerHash` | Key-to-shard mapping. See [Partitioning](#partitioning). |
 | `MemtableSize` | `2 MiB` | Per-shard memtable flush threshold in bytes. |
 | `TierRatio` | `4` | Size-tiered compaction fan-out (tables per tier before merge). |
+| `TierByteTrigger` | `8 x FileSizeMax` | Tier bytes that trigger compaction below the count ratio; negative disables. |
 | `TombstoneCompactionRatio` | `0.5` | Delete fraction that triggers early compaction; negative disables. |
 | `L0SlowdownTables` / `L0StopTables` | `16` / `24` | Fresh-tier table counts that slow, then stop, writers. |
 | `MaxCompactionBytes` | `10 x FileSizeMax` | Input byte cap per non-bottom compaction; negative disables. |
+| `DisableOverlapSelection` | `false` | Merge the whole tier instead of only the largest key-overlapping group. |
 | `FileSizeBase` / `FileSizeMultiplier` / `FileSizeMax` | `2 MiB` / `2` / `16 MiB` | Per-depth output size curve. |
 | `FreshCodec` / `BottomCodec` / `LevelCodecs` | `CodecS2` / `CodecZstd` / nil | Compression. See [Compression](#compression). |
 | `EntropyCompression` | `false` | Skip the codec on incompressible blocks via an entropy pre-check. |
@@ -284,9 +287,19 @@ concurrency-safe, and return a stable non-empty `Name`.
 ## Compaction and backpressure
 
 Compaction is size-tiered: a tier compacts into the next once it accumulates
-`TierRatio` tables. `MaxCompactionBytes` caps the input merged in one non-bottom
-pass so a large tier drains in bounded steps rather than one merge that pins the
-disk; the bottom tier always merges whole so tombstone GC stays correct.
+`TierRatio` tables (the count trigger), or once its aggregate on-disk size reaches
+`TierByteTrigger` (the density trigger, defaults to `8 x FileSizeMax`). The density
+trigger bounds read amplification when a few large tables would otherwise sit below
+the count threshold uncompacted; it needs at least two tables in the tier, so a
+lone table is never merged alone. A negative `TierByteTrigger` disables it.
+
+A non-bottom compaction merges only the largest group of key-overlapping tables in
+the tier (overlap-scoped selection), not the whole tier, so unrelated key ranges
+are not rewritten and a lookup touches at most one output table per non-overlapping
+group. The bottom tier still merges wholly because tombstone GC needs the complete
+tier. Set `DisableOverlapSelection` to always merge the whole tier instead.
+`MaxCompactionBytes` then caps the input merged in one non-bottom pass so a large
+group drains in bounded steps rather than one merge that pins the disk.
 
 Target `.sst` size grows with tier depth, so deep (cold) tiers hold fewer, larger
 files and shallow (hot) tiers hold small ones that flush and merge cheaply. As

@@ -31,10 +31,10 @@ func TestTablesSnapshot(t *testing.T) {
 func TestPickCompactionDelegates(t *testing.T) {
 	t.Parallel()
 	s := newTestShard(t, 1<<20)
-	assert.Equal(t, -1, s.pickCompaction(2, 0))
+	assert.Equal(t, -1, s.pickCompaction(2, 0, 0))
 	flushSingle(t, s, 1, "a", "1")
 	flushSingle(t, s, 2, "b", "2")
-	assert.Equal(t, 0, s.pickCompaction(2, 0))
+	assert.Equal(t, 0, s.pickCompaction(2, 0, 0))
 }
 
 func TestOpenTableRestore(t *testing.T) {

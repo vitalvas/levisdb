@@ -52,6 +52,14 @@ type tableWriter struct {
 func (tw *tableWriter) entryCount() int     { return tw.entries }
 func (tw *tableWriter) tombstoneCount() int { return tw.tombstones }
 
+// bytesWritten returns the compressed bytes written to the file so far: every
+// data/index block advances tw.offset by its post-codec length, so this is the
+// actual on-disk size (excluding the not-yet-flushed current block). Compaction
+// rolls output on this, not raw key+value bytes, so highly compressible data does
+// not produce many tiny SSTs and file sizes track real disk footprint (matching
+// LevelDB, which rolls on Writer.BytesLen == the file offset).
+func (tw *tableWriter) bytesWritten() int64 { return int64(tw.offset) }
+
 // minUserKey and maxUserKey return the smallest and largest USER keys written,
 // or nil for an empty table. They are the table's key-range bounds, recorded in
 // the manifest so reads can skip a table whose range excludes the lookup key.

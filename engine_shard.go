@@ -193,6 +193,14 @@ func (s *shardT) memEmpty() bool {
 	return s.mem.empty()
 }
 
+// memSize returns the active memtable's approximate encoded size, for flush
+// logging.
+func (s *shardT) memSize() int64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.mem.Size()
+}
+
 // NeedFlush reports whether the active memtable has reached the flush
 // threshold and no flush is already in progress.
 func (s *shardT) needFlush() bool {
@@ -213,6 +221,34 @@ func (s *shardT) depth0Count() int {
 		}
 	}
 	return n
+}
+
+// tierTableCount returns the number of live tables at the given tier depth. Used
+// by the flush/compaction logging to report input/output sizes.
+func (s *shardT) tierTableCount(depth int) int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	n := 0
+	for _, t := range s.tables {
+		if t.depth == depth {
+			n++
+		}
+	}
+	return n
+}
+
+// tierTableStats returns the count and total on-disk bytes of live tables at the
+// given tier depth, for compaction logging.
+func (s *shardT) tierTableStats(depth int) (count int, bytes int64) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, t := range s.tables {
+		if t.depth == depth {
+			count++
+			bytes += t.size
+		}
+	}
+	return count, bytes
 }
 
 // Get resolves key at snapshot seq, returning the value or that it is absent or

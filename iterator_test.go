@@ -64,6 +64,48 @@ func TestDBIteratorSortedAcrossShards(t *testing.T) {
 	}
 }
 
+// TestRangePartitionerScanPruningCorrect verifies that pruning a range scan to
+// the shards ShardRange selects returns exactly the keys in the range - i.e. the
+// optimization never drops a key that lives in a shard it skipped. Keys are
+// spread across the first-byte space so the range genuinely spans a shard subset.
+func TestRangePartitionerScanPruningCorrect(t *testing.T) {
+	t.Parallel()
+	o := DefaultOptions(t.TempDir())
+	o.ShardCount = 8
+	o.Partitioner = PartitionerRange
+	// Pruning correctness (which shards a range touches) is independent of table
+	// count, so a large memtable keeps the test cheap without weakening it.
+	o.MemtableSize = 1 << 20
+	db, err := Open(o)
+	require.NoError(t, err)
+	defer db.Close()
+
+	// One key per first byte so every shard is populated.
+	for b := 0; b < 256; b++ {
+		require.NoError(t, db.Put(PutOptions{Key: []byte{byte(b)}, Value: []byte{byte(b)}}))
+	}
+	db.sched.drain()
+
+	// Scan a middle slice that spans a subset of shards. Brute-force the expected
+	// keys, then assert the pruned scan returns exactly them in order.
+	start, end := []byte{0x40}, []byte{0xa0}
+	var want []string
+	for b := 0x40; b < 0xa0; b++ {
+		want = append(want, string([]byte{byte(b)}))
+	}
+
+	it, err := db.NewRangeIterator(start, end)
+	require.NoError(t, err)
+	keys, _ := drainDBIter(t, it)
+	require.Equal(t, want, keys, "pruned scan must return every key in [start,end) and no more")
+
+	// A full scan still returns all 256 keys (pruning to all shards).
+	full, err := db.NewIterator()
+	require.NoError(t, err)
+	fk, _ := drainDBIter(t, full)
+	assert.Len(t, fk, 256)
+}
+
 func TestDBIteratorEmpty(t *testing.T) {
 	t.Parallel()
 	db := openIterDB(t)

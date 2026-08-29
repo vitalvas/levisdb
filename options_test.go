@@ -64,6 +64,29 @@ func TestFillDefaultsPreservesSetValues(t *testing.T) {
 	assert.Equal(t, "s2", o.BottomCodec)
 }
 
+func TestFillDefaultsTierByteTrigger(t *testing.T) {
+	t.Parallel()
+
+	t.Run("default derived from FileSizeMax", func(t *testing.T) {
+		o := Options{Dir: "/d"}
+		o.fillDefaults()
+		assert.Equal(t, o.FileSizeMax*defaultTierByteTriggerFiles, o.TierByteTrigger)
+		assert.Positive(t, o.TierByteTrigger)
+	})
+
+	t.Run("negative disables the trigger", func(t *testing.T) {
+		o := Options{Dir: "/d", TierByteTrigger: -1}
+		o.fillDefaults()
+		assert.Zero(t, o.TierByteTrigger, "a negative value disables the density trigger")
+	})
+
+	t.Run("explicit value preserved", func(t *testing.T) {
+		o := Options{Dir: "/d", TierByteTrigger: 5 << 20}
+		o.fillDefaults()
+		assert.Equal(t, int64(5<<20), o.TierByteTrigger)
+	})
+}
+
 func TestValidate(t *testing.T) {
 	t.Parallel()
 	tests := []struct {

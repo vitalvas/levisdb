@@ -2,6 +2,7 @@ package levisdb
 
 import (
 	"fmt"
+	"log/slog"
 	"math"
 	"runtime"
 	"time"
@@ -61,10 +62,24 @@ type Partitioner interface {
 	Name() string
 }
 
+// ShardRanger is an optional interface a Partitioner may implement when it is
+// order-preserving (shards own contiguous key ranges). A range iterator then
+// scans only the shards a query range can touch instead of all of them. A hash
+// partitioner scatters adjacent keys across every shard, so it must NOT implement
+// this; the iterator falls back to scanning all shards for those.
+type ShardRanger interface {
+	// ShardRange returns the half-open shard index range [lo, hi) that a key range
+	// [start, end) can touch. A nil start means from the smallest key; a nil end
+	// means unbounded above. The result must cover every shard that Shard would
+	// return for any key in [start, end); returning the full [0, numShards) is
+	// always correct but forgoes pruning.
+	ShardRange(start, end []byte, numShards int) (lo, hi int)
+}
+
 // Default option values. All are tunable so the engine can be calibrated
 // against a real spindle.
 const (
-	DefaultShardCount   = 32
+	DefaultShardCount   = 8
 	DefaultMemtableSize = 2 << 20 // 2 MiB, matched to the fresh-tier file size
 	DefaultTierRatio    = 4
 	// DefaultTombstoneCompactionRatio compacts a tier once half its entries are
@@ -91,7 +106,10 @@ const (
 	// on one sequential stream.
 	CompactionConcurrencyAuto = -1
 	DefaultFreshCodec         = CodecS2
-	DefaultBottomCodec        = CodecZstd
+	// DefaultBottomCodec is S2 too: zstd's slow encode dominated compaction on
+	// large, compressible values (bottom-tier merges stalled). S2 keeps compaction
+	// fast; zstd stays selectable and decodable for existing data.
+	DefaultBottomCodec = CodecS2
 
 	// DefaultWALSyncInterval bounds the NoSync crash-loss window when the caller
 	// does not set one.
@@ -101,6 +119,15 @@ const (
 	// files by default: large enough that ordinary tiers merge in one pass, small
 	// enough to bound a runaway tier's single merge.
 	defaultMaxCompactionFiles = 10
+
+	// defaultTierByteTriggerFiles sets TierByteTrigger to this many FileSizeMax
+	// files by default: a tier holding this many bytes is compacted even below the
+	// count threshold, catching the "few large tables never reach the ratio" stall
+	// without pre-empting the count trigger on ordinary fresh tiers. It is above
+	// DefaultTierRatio * FileSizeMax (4 * 16 = 64 MiB), so the count trigger fires
+	// first for a normal full tier; the density trigger only engages for 2-3 large
+	// tables that together exceed 128 MiB yet stay below the count of 4.
+	defaultTierByteTriggerFiles = 8
 
 	// maxMemtableSize caps the per-shard flush threshold. The skiplist arena
 	// addresses nodes by uint32 offset and grows slightly faster than the tracked
@@ -142,6 +169,15 @@ type Options struct {
 	// TierRatio is the size-tiered compaction fan-out.
 	TierRatio int
 
+	// TierByteTrigger compacts a tier once its aggregate on-disk size reaches this
+	// many bytes, even if it holds fewer than TierRatio tables. The count trigger
+	// alone lets a few large tables accumulate uncompacted (unbounded read
+	// amplification); this density trigger bounds that. It fires only with at least
+	// two tables in the tier, so a single table is never "compacted" alone. Zero
+	// uses the default; a negative value disables the trigger, leaving only the
+	// count and tombstone triggers.
+	TierByteTrigger int64
+
 	// TombstoneCompactionRatio triggers a tier's compaction once the fraction of
 	// its entries that are tombstones (deletes) reaches this value, even if the
 	// tier has fewer than TierRatio tables. This reclaims delete-heavy tiers early
@@ -174,6 +210,13 @@ type Options struct {
 	// tombstones) always merge the whole tier for GC correctness. Zero uses the
 	// default; a negative value disables the cap.
 	MaxCompactionBytes int64
+
+	// DisableOverlapSelection turns off overlap-scoped compaction. By default a
+	// non-bottom compaction merges only the largest group of key-overlapping tables
+	// in the tier, so unrelated key ranges are not rewritten and a lookup touches at
+	// most one output table per non-overlapping group. Set true to merge the whole
+	// tier every time (the pre-overlap behavior).
+	DisableOverlapSelection bool
 
 	// BloomBits is the bloom filter bits per key.
 	BloomBits int
@@ -221,6 +264,17 @@ type Options struct {
 
 	// WALObserver, if non-nil, receives committed entries for replication/CDC.
 	WALObserver WALObserver
+
+	// Logger, if non-nil, receives structured storage-engine events (open, flush,
+	// compaction, WAL rotation/checkpoint, close) via log/slog, mirroring what
+	// LevelDB writes to its LOG file. The engine never logs to a package-global or
+	// to stderr; all events go through this logger so the caller controls level,
+	// format, and destination with their own slog.Handler. Nil disables logging
+	// with no overhead beyond a cheap level check. Events are emitted at Debug for
+	// routine per-operation detail and Info for lifecycle milestones; attach a
+	// leveled handler to filter. The engine adds a "component"="levisdb" attribute
+	// and, per event, an "op" plus context like the shard index and table numbers.
+	Logger *slog.Logger
 
 	// CompactionFilter, if non-nil, is called for each non-deleted, unexpired
 	// value rewritten by compaction. It may be called concurrently by different
@@ -305,6 +359,12 @@ func (o *Options) fillDefaults() {
 		// Default to a few max-size files so normal tiers merge whole while a
 		// runaway tier is drained in bounded steps.
 		o.MaxCompactionBytes = o.FileSizeMax * defaultMaxCompactionFiles
+	}
+	switch {
+	case o.TierByteTrigger == 0:
+		o.TierByteTrigger = o.FileSizeMax * defaultTierByteTriggerFiles
+	case o.TierByteTrigger < 0:
+		o.TierByteTrigger = 0 // caller disabled the density trigger
 	}
 	if o.BloomBits == 0 {
 		o.BloomBits = DefaultBloomBits

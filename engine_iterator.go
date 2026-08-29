@@ -127,8 +127,13 @@ func (it *shardIterator) Next() bool {
 				continue
 			}
 		}
-		it.key = append(it.key[:0], user...)
-		it.value = append(it.value[:0], value...)
+		// Return the merge iterator's buffers directly rather than copying: they are
+		// stable until this iterator advances again (it.merge.Next in the loop
+		// above), which is exactly the "valid until the next Next" contract Key and
+		// Value promise. The dbIterator merge across shards copies out before it
+		// advances a shard, so the public value the caller sees is still stable.
+		it.key = user
+		it.value = value
 		return true
 	}
 	it.err = it.merge.Error()
@@ -136,10 +141,12 @@ func (it *shardIterator) Next() bool {
 	return false
 }
 
-// Key returns the current user key.
+// Key returns the current user key. The slice is valid only until the next call
+// to Next; copy it to retain.
 func (it *shardIterator) Key() []byte { return it.key }
 
-// Value returns the current value.
+// Value returns the current value. The slice is valid only until the next call
+// to Next; copy it to retain.
 func (it *shardIterator) Value() []byte { return it.value }
 
 func (it *shardIterator) Error() error { return it.err }

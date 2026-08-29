@@ -27,7 +27,19 @@ func (db *DB) newRangeIterator(seq uint64, start, end []byte) (Iterator, error) 
 	readTime := time.Now().UnixNano()
 	db.snaps.acquireIteratorTime(readTime)
 	it := &dbIterator{snaps: db.snaps, seq: seq, readTime: readTime}
-	for _, s := range db.shards {
+	// Prune to the shards the range can touch when the partitioner is order-
+	// preserving (implements ShardRanger). A hash partitioner scatters adjacent
+	// keys across all shards and does not implement it, so lo,hi span every shard.
+	lo, hi := 0, len(db.shards)
+	if r, ok := db.part.(ShardRanger); ok {
+		l, h := r.ShardRange(start, end, len(db.shards))
+		// Clamp: a custom ShardRanger is user code, so never let bad bounds panic
+		// the slice or silently drop shards a key could live in.
+		if l >= 0 && h <= len(db.shards) && l <= h {
+			lo, hi = l, h
+		}
+	}
+	for _, s := range db.shards[lo:hi] {
 		si := s.newRangeIteratorAt(seq, start, end, readTime)
 		if si.Next() {
 			it.h = append(it.h, si)

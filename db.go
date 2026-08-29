@@ -1,7 +1,9 @@
 package levisdb
 
 import (
+	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
@@ -44,6 +46,11 @@ type DB struct {
 	fds   *fdPool      // shared bounded open-table-descriptor pool
 
 	metrics dbMetrics // cumulative counters since open
+
+	// log is the root storage-engine logger (Options.Logger tagged with
+	// component=levisdb, or a discarding logger when none was set). Subsystems
+	// derive child loggers from it (see newRootLogger).
+	log *slog.Logger
 
 	// walSyncStop stops the NoSync background fsync loop; walSyncWG awaits it.
 	walSyncStop chan struct{}
@@ -126,9 +133,11 @@ type batchOp struct {
 type Iterator interface {
 	// Next advances to the next key; it reports whether one exists.
 	Next() bool
-	// Key returns the current key. The slice is valid until the next call.
+	// Key returns the current key. The slice is valid only until the next call to
+	// Next or Close; copy it to retain.
 	Key() []byte
-	// Value returns the current value. The slice is valid until the next call.
+	// Value returns the current value. The slice is valid only until the next call
+	// to Next or Close; copy it to retain.
 	Value() []byte
 	// Error returns any error accumulated during iteration.
 	Error() error
@@ -166,14 +175,20 @@ func Open(opts Options) (*DB, error) {
 		cache:         newBlockCache(cacheSize),
 		fds:           newFDPool(opts.MaxOpenFiles),
 		pendingRanges: map[uint64]uint64{},
+		log:           newRootLogger(opts.Logger),
 	}
+	db.log.Info("opening database",
+		"op", "open", "dir", opts.Dir, "shards", opts.ShardCount,
+		"partitioner", db.part.Name(), "read_only", opts.ReadOnly)
 
 	if err := db.load(); err != nil {
+		db.log.Error("open failed", "op", "open", "err", err)
 		db.closeAfterOpenError()
 		return nil, err
 	}
 	db.startWALSyncLoop()
 	registerMetrics(db)
+	db.log.Info("database opened", "op", "open", "recovered_seq", db.readSeq.Load())
 	return db, nil
 }
 
@@ -481,6 +496,7 @@ func maxCompactionBytes(v int64) int64 {
 func (db *DB) compactionConfig() compactionConfigT {
 	return compactionConfigT{
 		TierRatio:          db.opts.TierRatio,
+		TierByteTrigger:    db.opts.TierByteTrigger,
 		BloomBits:          db.opts.BloomBits,
 		BlockSize:          db.opts.BlockSize,
 		FreshCodecName:     db.opts.FreshCodec,
@@ -493,6 +509,7 @@ func (db *DB) compactionConfig() compactionConfigT {
 		ExpireBefore:       db.snaps.oldestIteratorTime(time.Now().UnixNano()),
 		Filter:             db.opts.CompactionFilter,
 		MaxCompactionBytes: maxCompactionBytes(db.opts.MaxCompactionBytes),
+		OverlapSelection:   !db.opts.DisableOverlapSelection,
 	}
 }
 
@@ -698,6 +715,7 @@ func (db *DB) Close() error {
 	db.closed = true
 	db.mu.Unlock()
 	db.checkpointMu.Unlock()
+	db.log.Info("closing database", "op", "close", "last_seq", db.readSeq.Load())
 	deregisterMetrics(db)
 	// Wait for any background WAL checkpoint to finish before touching the WAL
 	// fields it mutates. closed is now set, so no new checkpoint will start (it
@@ -774,6 +792,11 @@ func (db *DB) Close() error {
 		setErr(s.Close())
 	}
 	setErr(db.store.Close())
+	if firstErr != nil {
+		db.log.Error("database closed with error", "op", "close", "err", firstErr)
+	} else {
+		db.log.Info("database closed", "op", "close")
+	}
 	return firstErr
 }
 
@@ -1364,6 +1387,9 @@ func (db *DB) checkpointWALMode(force bool) (uint64, error) {
 	if force && db.readSeq.Load() <= db.filterSafeSeq.Load() {
 		return db.filterSafeSeq.Load(), nil
 	}
+	ckStart := time.Now()
+	db.log.Debug("wal checkpoint started",
+		"op", "checkpoint", "force", force, "wal_bytes", db.maxWALSegmentSize())
 	// Rotate every shard's WAL to a fresh segment, recording each shard's retired
 	// segment. A per-shard WAL means writes to other shards continue during this.
 	for _, sw := range db.wals {
@@ -1447,6 +1473,8 @@ func (db *DB) checkpointWALMode(force bool) (uint64, error) {
 		db.filterSafeSeq.Store(cutoff)
 		safe = cutoff
 	}
+	db.log.Debug("wal checkpoint done",
+		"op", "checkpoint", "cutoff", cutoff, "filter_safe_seq", safe, "dur", time.Since(ckStart))
 	return safe, nil
 }
 
@@ -1525,9 +1553,23 @@ func (db *DB) flushShard(i int) {
 	// Without this loop, the last oversized memtable in a burst could remain in
 	// memory indefinitely when no later write arrived to signal it again.
 	for {
+		logFlush := db.log.Enabled(context.Background(), slog.LevelDebug)
+		var memSize int64
+		var start time.Time
+		if logFlush {
+			memSize = s.memSize()
+			start = time.Now()
+		}
 		if err := s.Flush(); err != nil {
+			db.log.Error("flush failed", "op", "flush", "shard", i, "err", err)
 			db.setBackgroundError(err)
 			return
+		}
+		if logFlush {
+			_, l0Bytes := s.tierTableStats(0)
+			db.log.Debug("memtable flushed",
+				"op", "flush", "shard", i, "memtable_bytes", memSize,
+				"l0_tables", s.tierTableCount(0), "l0_bytes", l0Bytes, "dur", time.Since(start))
 		}
 		if !s.needFlush() {
 			break
@@ -1548,7 +1590,7 @@ func (db *DB) flushShard(i int) {
 		if db.snaps.oldest(db.readSeq.Load()) < db.readSeq.Load() {
 			tombstoneRatio = 0
 		}
-		depth := s.pickCompaction(db.opts.TierRatio, tombstoneRatio)
+		depth := s.pickCompaction(db.opts.TierRatio, db.opts.TierByteTrigger, tombstoneRatio)
 		if depth < 0 {
 			break
 		}
@@ -1561,11 +1603,28 @@ func (db *DB) flushShard(i int) {
 			}
 			break
 		}
+		logCompaction := db.log.Enabled(context.Background(), slog.LevelDebug)
+		var startTables int
+		var start time.Time
+		if logCompaction {
+			startTables = s.tierTableCount(depth)
+			start = time.Now()
+			db.log.Debug("compaction started",
+				"op", "compaction", "shard", i, "depth", depth, "input_tables", startTables)
+		}
 		err = s.Compact(depth, retain, cc)
 		release()
 		if err != nil {
+			db.log.Error("compaction failed", "op", "compaction", "shard", i, "depth", depth, "err", err)
 			db.setBackgroundError(err)
 			break
+		}
+		if logCompaction {
+			outTables, outBytes := s.tierTableStats(depth + 1)
+			db.log.Debug("compaction done",
+				"op", "compaction", "shard", i, "depth", depth,
+				"input_tables", startTables, "output_tables", outTables,
+				"output_bytes", outBytes, "dur", time.Since(start))
 		}
 	}
 }

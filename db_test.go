@@ -491,7 +491,7 @@ func BenchmarkIteratorScan(b *testing.B) {
 	}
 }
 
-// benchDefaultsDB opens a database with the exact DefaultOptions (32 shards,
+// benchDefaultsDB opens a database with the exact DefaultOptions (8 shards,
 // 2 MiB memtable, durable per-batch fsync, s2/zstd codecs, 256 MiB cache) so the
 // benchmarks below report real out-of-the-box performance.
 func benchDefaultsDB(b *testing.B) *DB {

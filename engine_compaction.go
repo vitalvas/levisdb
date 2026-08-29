@@ -5,13 +5,24 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 )
+
+// maxTierDepth caps the tier ladder (like LevelDB's fixed level count). Output
+// never lands deeper than this; the deepest tier merges in place instead. It
+// bounds compaction depth (so a highly-compressible workload cannot march the
+// bottom tier downward forever), and with it read/recovery fan-out. Seven tiers
+// at the default size curve (2 MiB base, x2, capped at 16 MiB) cover terabytes.
+const maxTierDepth = 7
 
 // CompactionConfig tunes the size-tiered picker and the codecs/file sizes used
 // for merged output.
 type compactionConfigT struct {
-	TierRatio          int
+	TierRatio int
+	// TierByteTrigger compacts a tier once its aggregate on-disk bytes reach this
+	// value, even below TierRatio tables (density trigger). Zero disables it.
+	TierByteTrigger    int64
 	BloomBits          int
 	BlockSize          int
 	FreshCodecName     string
@@ -34,28 +45,46 @@ type compactionConfigT struct {
 	// compaction so a single merge does not monopolize the spindle. Zero disables
 	// the cap (merge the whole tier).
 	MaxCompactionBytes int64
+	// OverlapSelection narrows a non-bottom compaction to the largest group of
+	// key-overlapping tables in the tier (see overlapSets) instead of merging the
+	// whole tier, so a lookup touches at most one output table per non-overlapping
+	// group. The bottom tier still merges wholly (tombstone GC needs it).
+	OverlapSelection bool
 }
 
 // pickCompaction returns the tier depth to compact, or -1 if none is ready. A
-// tier is ready when it holds at least TierRatio tables, OR (when
-// tombstoneRatio > 0) when the tier holds >= 2 tables and its aggregate
-// tombstone fraction meets tombstoneRatio, so a delete-heavy tier is compacted
-// down to reclaim space early instead of waiting for the count threshold. The
-// shallowest ready tier is chosen so fresh data is merged first.
-func (s *shardT) pickCompaction(ratio int, tombstoneRatio float64) int {
+// tier is ready when it holds at least TierRatio tables (count trigger), OR when
+// it holds >= 2 tables and its aggregate on-disk bytes reach byteTrigger (density
+// trigger: bounds read amplification when a few large tables never reach the
+// count threshold), OR (when tombstoneRatio > 0) when it holds >= 2 tables and
+// its tombstone fraction meets tombstoneRatio (reclaim delete-heavy tiers early).
+// The shallowest ready tier is chosen so fresh data is merged first.
+func (s *shardT) pickCompaction(ratio int, byteTrigger int64, tombstoneRatio float64) int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	counts := map[int]int{}
+	bytes := map[int]int64{}
 	entries := map[int]int{}
 	tombstones := map[int]int{}
 	for _, t := range s.tables {
 		counts[t.depth]++
+		bytes[t.depth] += t.size
 		entries[t.depth] += t.entries
 		tombstones[t.depth] += t.tombstones
 	}
 	best := -1
 	for depth, c := range counts {
-		ready := c >= ratio
+		// The cap tier (maxTierDepth) is terminal: there is no deeper tier to push
+		// to, and re-merging its distinct data by count or bytes reclaims nothing
+		// and would loop forever. Only a tombstone/overwrite-heavy cap tier is worth
+		// compacting there, because that genuinely shrinks it.
+		ready := false
+		if depth < maxTierDepth {
+			ready = c >= ratio
+			if !ready && byteTrigger > 0 && c >= 2 {
+				ready = bytes[depth] >= byteTrigger
+			}
+		}
 		if !ready && tombstoneRatio > 0 && c >= 2 && entries[depth] > 0 {
 			ready = float64(tombstones[depth])/float64(entries[depth]) >= tombstoneRatio
 		}
@@ -75,24 +104,40 @@ func (s *shardT) pickCompaction(ratio int, tombstoneRatio float64) int {
 func (s *shardT) Compact(depth int, retainSeq uint64, cc compactionConfigT) error {
 	s.flushMu.Lock()
 	defer s.flushMu.Unlock()
-	outDepth := depth + 1
 	s.mu.RLock()
+	maxDepth := 0
+	for _, t := range s.tables {
+		if t.depth > maxDepth {
+			maxDepth = t.depth
+		}
+	}
+	// Output normally lands one tier deeper, but is capped at maxTierDepth so the
+	// tier ladder cannot grow without bound. At the cap the deepest tier merges IN
+	// PLACE (outDepth == depth). Without the cap, a workload whose live data fits in
+	// fewer than TierRatio tables per tier would relocate the bottom one tier deeper
+	// every compaction cycle, marching the depth downward forever (an infinite
+	// compaction loop that starves flushes). The cap bounds recovery/read fan-out
+	// too. When the source is already at the cap, the merge collapses it in place.
+	outDepth := depth + 1
+	if outDepth > maxTierDepth {
+		outDepth = maxTierDepth
+	}
+	inPlace := outDepth == depth
 	var inputs []*tableMeta
 	// deeper holds the key bounds of every table at or below the output tier that
 	// is NOT an input, so writeMerged can reclaim a tombstone at an intermediate
 	// tier when no such table can hold the key. flushMu serializes compaction per
 	// shard, so this snapshot stays valid for the whole merge.
 	var deeper [][2][]byte
-	maxDepth := 0
 	for _, t := range s.tables {
-		if t.depth > maxDepth {
-			maxDepth = t.depth
-		}
 		if t.depth == depth {
 			inputs = append(inputs, t)
 			continue
 		}
-		if t.depth >= outDepth {
+		// For an in-place merge (outDepth == depth) the inputs are the whole tier
+		// and there is nothing deeper, so no table is "deeper" - the tier == depth
+		// tables are all inputs above.
+		if t.depth >= outDepth && t.depth != depth {
 			deeper = append(deeper, [2][]byte{t.minKey, t.maxKey})
 		}
 	}
@@ -101,9 +146,34 @@ func (s *shardT) Compact(depth int, retainSeq uint64, cc compactionConfigT) erro
 	if len(inputs) < 2 {
 		return nil
 	}
-	// The output is the bottom tier only when no tables live at a deeper tier.
+	// The output is the bottom tier when nothing lives deeper than it. An in-place
+	// merge at the cap is the bottom (its tables are all inputs, nothing is below);
+	// otherwise it is the bottom only when the output tier is at/below the deepest.
 	bottomCodec := outDepth >= maxDepth
-	dropTombstones := outDepth > maxDepth
+	dropTombstones := outDepth > maxDepth || (inPlace && len(deeper) == 0)
+
+	// Overlap-scoped selection: merge only the largest group of key-overlapping
+	// tables rather than the whole tier, so unrelated key ranges are not rewritten
+	// and a lookup touches at most one output table per non-overlapping group. The
+	// bottom tier is exempt (dropTombstones needs the whole tier to GC correctly).
+	// Same-tier tables left out of the group are treated as deeper so an
+	// intermediate-tier tombstone in the group is never dropped over a shadowed
+	// value they still hold.
+	if cc.OverlapSelection && !dropTombstones {
+		groups := overlapSets(inputs)
+		if best := largestGroup(groups); len(best) >= 2 && len(best) < len(inputs) {
+			chosen := make(map[*tableMeta]bool, len(best))
+			for _, t := range best {
+				chosen[t] = true
+			}
+			for _, t := range inputs {
+				if !chosen[t] {
+					deeper = append(deeper, [2][]byte{t.minKey, t.maxKey})
+				}
+			}
+			inputs = best
+		}
+	}
 
 	// Byte-cap: a single compaction should not monopolize the one spindle merging
 	// an unbounded tier. Cap the input bytes and leave the rest for the next
@@ -169,6 +239,83 @@ func rangesMayContain(ranges [][2][]byte, key []byte) bool {
 		return true // within [min,max], or unknown bounds cover it
 	}
 	return false
+}
+
+// overlapSets partitions tables into maximal groups of key-overlapping tables,
+// following the UCS transitive-overlap idea: tables whose key ranges connect
+// (directly or through a chain) belong to one group; disjoint ranges form
+// separate groups. Compacting one group resolves its overlaps without touching
+// unrelated ranges, so a lookup then touches at most one output table per group.
+//
+// Algorithm (O(n log n)): sort by minKey, then sweep, extending the current group
+// while the next table's minKey is <= the group's running maxKey (they overlap or
+// abut), closing the group when a gap appears. A nil minKey (unknown low bound)
+// sorts first and joins the first group; a nil maxKey (unknown high bound) makes
+// the running range cover everything, so all remaining tables join that group -
+// the conservative choice, matching rangesMayContain's nil handling.
+func overlapSets(tables []*tableMeta) [][]*tableMeta {
+	if len(tables) == 0 {
+		return nil
+	}
+	sorted := make([]*tableMeta, len(tables))
+	copy(sorted, tables)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		return compareOptionalMin(sorted[i].minKey, sorted[j].minKey) < 0
+	})
+
+	var sets [][]*tableMeta
+	cur := []*tableMeta{sorted[0]}
+	runMax := sorted[0].maxKey
+	openEnded := sorted[0].maxKey == nil // running range covers everything above
+	for _, t := range sorted[1:] {
+		// t overlaps the current group if the group is open-ended, or t's low bound
+		// is unknown, or t.minKey <= runMax.
+		overlaps := openEnded || t.minKey == nil || bytes.Compare(t.minKey, runMax) <= 0
+		if overlaps {
+			cur = append(cur, t)
+			if !openEnded {
+				if t.maxKey == nil {
+					openEnded = true
+				} else if bytes.Compare(t.maxKey, runMax) > 0 {
+					runMax = t.maxKey
+				}
+			}
+			continue
+		}
+		sets = append(sets, cur)
+		cur = []*tableMeta{t}
+		runMax = t.maxKey
+		openEnded = t.maxKey == nil
+	}
+	sets = append(sets, cur)
+	return sets
+}
+
+// largestGroup returns the group with the most tables (the highest-overlap
+// bucket, matching UCS's highest-overlap-first selection), or nil if none.
+func largestGroup(groups [][]*tableMeta) []*tableMeta {
+	var best []*tableMeta
+	for _, g := range groups {
+		if len(g) > len(best) {
+			best = g
+		}
+	}
+	return best
+}
+
+// compareOptionalMin orders min-key bounds: nil (unknown low) sorts before any
+// concrete key so an unbounded table joins the first group.
+func compareOptionalMin(a, b []byte) int {
+	switch {
+	case a == nil && b == nil:
+		return 0
+	case a == nil:
+		return -1
+	case b == nil:
+		return 1
+	default:
+		return bytes.Compare(a, b)
+	}
 }
 
 // capCompactionInputs returns the longest prefix of inputs whose cumulative size
@@ -426,11 +573,10 @@ func resolveCompactionEntry(cc compactionConfigT, e mergeEntry, now int64) (writ
 }
 
 type compactionOutput struct {
-	num    uint32
-	path   string
-	f      *os.File
-	w      *tableWriter
-	approx int64
+	num  uint32
+	path string
+	f    *os.File
+	w    *tableWriter
 }
 
 type compactionSink struct {
@@ -480,12 +626,18 @@ func (s *compactionSink) add(key, value []byte) error {
 	if err := s.out.w.Add(key, value); err != nil {
 		return err
 	}
-	s.out.approx += int64(len(key) + len(value) + 16)
 	return nil
 }
 
+// rollIfNeeded closes the current output table once its COMPRESSED on-disk size
+// reaches the target, so file sizes track real disk footprint and highly
+// compressible data does not spray many tiny SSTs. bytesWritten counts only
+// blocks already flushed to the file, so a table always holds at least one full
+// block before it can roll (it never produces an almost-empty SST); the current
+// in-memory block adds at most one blockSize of overshoot. Called at user-key
+// boundaries, so a key's versions never split across tables.
 func (s *compactionSink) rollIfNeeded() error {
-	if s.out != nil && s.out.approx >= s.target {
+	if s.out != nil && s.out.w.bytesWritten() >= s.target {
 		return s.finish()
 	}
 	return nil
