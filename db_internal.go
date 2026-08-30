@@ -233,6 +233,7 @@ func (b *observerBridge) observe(batch []walEntry) {
 			Value: e.Value,
 		}
 		if e.ExpiresAt != 0 {
+			out[i].ExpiresAt = e.ExpiresAt
 			out[i].TTL = time.Until(time.Unix(0, e.ExpiresAt))
 		}
 	}

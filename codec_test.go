@@ -176,9 +176,10 @@ func TestLevelCodecsAppliedToFlushedTable(t *testing.T) {
 }
 
 // TestFlateCodecEndToEnd proves the flate codec threads through the on-disk path:
-// a flate-configured DB writes compressible data, the flushed L0 blocks carry the
-// flate codec id, and every value reads back correctly after flush and a forced
-// compaction (which re-encodes through the codec).
+// a flate-configured DB writes compressible data, the on-disk blocks carry the
+// flate codec id, and every value reads back correctly. A forced CompactRange
+// settles the table set deterministically before inspecting codec ids, so the
+// assertion does not race background compaction moving tables between tiers.
 func TestFlateCodecEndToEnd(t *testing.T) {
 	t.Parallel()
 	db := openTestDB(t, func(o *Options) {
@@ -192,18 +193,41 @@ func TestFlateCodecEndToEnd(t *testing.T) {
 	for i := 0; i < n; i++ {
 		require.NoError(t, db.Put(PutOptions{Key: []byte(fmt.Sprintf("k%05d", i)), Value: val}))
 	}
-	db.sched.drain()
+	// CompactRange forces flush + compaction and blocks until done, so the live
+	// table set is stable when we inspect it (no background flush/compaction race).
+	require.NoError(t, db.CompactRange(nil, nil))
 
-	ids := depth0BlockCodecIDs(t, db.eng)
-	require.NotEmpty(t, ids, "expected at least one flushed L0 table")
-	assert.Contains(t, ids, codecFlate, "flushed blocks should use the flate codec")
+	ids := allBlockCodecIDs(t, db.eng)
+	require.NotEmpty(t, ids, "expected at least one on-disk table")
+	assert.Contains(t, ids, codecFlate, "on-disk blocks should use the flate codec")
 
-	require.NoError(t, db.CompactRange(nil, nil)) // re-encode through flate on compaction
 	for i := 0; i < n; i++ {
 		got, err := db.Get([]byte(fmt.Sprintf("k%05d", i)))
 		require.NoError(t, err, "i=%d", i)
 		assert.Equal(t, val, got, "i=%d round-trips through flate on disk", i)
 	}
+}
+
+// allBlockCodecIDs returns the codec ids of the first data block of every live
+// table (any depth). Layout from finishBlock: [payload][codec id][crc32].
+func allBlockCodecIDs(t *testing.T, s *engineT) map[codecID]bool {
+	t.Helper()
+	s.mu.RLock()
+	metas := append([]*tableMeta(nil), s.tables...)
+	s.mu.RUnlock()
+
+	ids := map[codecID]bool{}
+	for _, tbl := range metas {
+		m, err := tbl.reader.ensureMeta()
+		require.NoError(t, err)
+		h := m.blockHandleAt(0)
+		buf := make([]byte, h.length)
+		_, err = tbl.reader.r.ReadAt(buf, int64(h.offset))
+		require.NoError(t, err)
+		body := buf[:len(buf)-4]
+		ids[codecID(body[len(body)-1])] = true
+	}
+	return ids
 }
 
 // depth0BlockCodecIDs reads the first data block of every live depth-0 table in

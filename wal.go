@@ -171,10 +171,23 @@ func (w *walT) commit() {
 		// Install every durable batch in WAL sequence order before invoking user
 		// observers. An observer panic or stall must not leave later records that
 		// are already durable absent from the memtables.
-		for _, pb := range batch {
-			if w.apply != nil {
-				w.apply(pb.entries)
+		//
+		// A panic inside apply (the memtable install) is caught and turned into a
+		// poisoning error, not left to unwind the committer goroutine: an unrecovered
+		// panic here would exit commit() with w.writing still true, so rotate() and
+		// Close() (which wait for w.writing==false) would deadlock forever. The data
+		// is durable on disk but failed to become visible, so it is a genuine engine
+		// failure: poison w.err and fail the whole group, mirroring a write failure.
+		if applyErr := w.applyGroup(batch); applyErr != nil {
+			w.mu.Lock()
+			if w.err == nil {
+				w.err = applyErr
 			}
+			w.mu.Unlock()
+			for _, pb := range batch {
+				pb.done <- applyErr
+			}
+			continue
 		}
 		// Observe per batch. Every batch is already durable and applied, so an
 		// observer failure is scoped to the batch it panicked on: that one caller
@@ -189,6 +202,24 @@ func (w *walT) commit() {
 			pb.done <- observerErr
 		}
 	}
+}
+
+// applyGroup installs every batch into the memtable in seq order, recovering a
+// panic into an error so a memtable-install failure cannot unwind the committer
+// goroutine and leave w.writing set (which would deadlock rotate/Close).
+func (w *walT) applyGroup(batch []*pendingBatch) (err error) {
+	if w.apply == nil {
+		return nil
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("wal: apply panic: %v", recovered)
+		}
+	}()
+	for _, pb := range batch {
+		w.apply(pb.entries)
+	}
+	return nil
 }
 
 func callWALObserver(obs walObserver, entries []walEntry) (err error) {

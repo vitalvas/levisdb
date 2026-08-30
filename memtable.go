@@ -41,6 +41,22 @@ func (m *memtableT) empty() bool {
 	return m.list.first() == nilNode
 }
 
+// overlapsUserRange reports whether any buffered key's user portion falls within
+// [minKey, maxKey] inclusive. Used by SST ingest to reject a file that overlaps
+// unflushed writes. It seeks to the first internal key at or after minKey (using
+// the highest possible trailer so any version of minKey qualifies) and checks its
+// user key against maxKey.
+func (m *memtableT) overlapsUserRange(minKey, maxKey []byte) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	seek := ikeyEncode(nil, minKey, maxIKeySeq, ikeyKindSetTTL)
+	off := m.list.seek(seek)
+	if off == nilNode {
+		return false
+	}
+	return bytes.Compare(ikeyUserKey(m.list.key(off)), maxKey) <= 0
+}
+
 // Put buffers a set of key to value at seq.
 func (m *memtableT) Put(seq uint64, key, value []byte) {
 	m.add(seq, ikeyKindSet, key, value)

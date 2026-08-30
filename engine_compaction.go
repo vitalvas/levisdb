@@ -492,7 +492,12 @@ func (s *engineT) writeMerged(mw mergeWrite) ([]*tableMeta, error) {
 			// rest for this key.
 			continue
 		}
-		lastSeq, lastKind, lastValue = seq, kind, value
+		// lastValue must own its bytes: value aliases the merge iterator's reusable
+		// curVal buffer, which the next Next() overwrites in place, so a borrowed
+		// slice would make the same-seq conflict check above compare a buffer with
+		// itself and silently miss a genuine value conflict. Copy like lastUser.
+		lastSeq, lastKind = seq, kind
+		lastValue = append(lastValue[:0], value...)
 		writeKey, value, kind, err := resolveCompactionEntry(mw.cc, mergeEntry{
 			ik:    ik,
 			user:  user,

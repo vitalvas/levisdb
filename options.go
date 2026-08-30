@@ -21,11 +21,19 @@ const (
 // order. Key and Value are valid only for the duration of the Observe call; a
 // consumer that retains them must copy.
 type WALEntry struct {
-	Seq   uint64        // monotonic log sequence number; a stable resume point
-	Kind  EntryKind     // EntryPut or EntryDelete
-	Key   []byte        // mutation key
-	Value []byte        // value for EntryPut; nil for EntryDelete
-	TTL   time.Duration // remaining lifetime; zero means none, negative means already expired
+	Seq   uint64    // monotonic log sequence number; a stable resume point
+	Kind  EntryKind // EntryPut or EntryDelete
+	Key   []byte    // mutation key
+	Value []byte    // value for EntryPut; nil for EntryDelete
+	// TTL is the remaining lifetime at delivery time (zero means none, negative
+	// means already expired). It is derived from ExpiresAt, so it drifts with the
+	// clock; a replica that must preserve the exact original deadline should apply
+	// ExpiresAt instead.
+	TTL time.Duration
+	// ExpiresAt is the absolute expiration as a Unix-nanosecond timestamp, or zero
+	// when the entry has no TTL. Unlike TTL this is the exact stored deadline, so a
+	// replica can reproduce the original expiry without clock drift.
+	ExpiresAt int64
 }
 
 // WALObserver taps the durable write stream so callers can build replication
@@ -252,6 +260,19 @@ type Options struct {
 	// record on a large disk does not make the whole database unopenable. A torn
 	// tail from a crash is always tolerated regardless of this setting.
 	StrictWALRecovery bool
+
+	// WALRetention and WALRetentionBytes keep flushed WAL segments on disk past
+	// the point they would normally be retired, so GetUpdatesSince can replay the
+	// committed write stream to a lagging consumer (replication / change-data
+	// capture catch-up). A flushed segment is deleted only once it is older than
+	// WALRetention AND the total retained bytes exceed WALRetentionBytes, so both
+	// a time and a size horizon must be crossed. Both default to 0, which disables
+	// retention (segments are retired immediately after flush, as before) and
+	// makes GetUpdatesSince serve only the live segment. A consumer that asks for a
+	// sequence below the retained horizon gets ErrRetentionExpired and must
+	// re-bootstrap from a snapshot. A negative value is treated as 0.
+	WALRetention      time.Duration
+	WALRetentionBytes int64
 }
 
 // DefaultOptions returns Options populated with defaults for the given data
@@ -306,6 +327,14 @@ func (o *Options) fillDefaults() {
 		o.TierByteTrigger = o.FileSizeMax * defaultTierByteTriggerFiles
 	case o.TierByteTrigger < 0:
 		o.TierByteTrigger = 0 // caller disabled the density trigger
+	}
+	// A negative retention bound disables that horizon (treated as 0); both zero
+	// disables WAL retention entirely.
+	if o.WALRetention < 0 {
+		o.WALRetention = 0
+	}
+	if o.WALRetentionBytes < 0 {
+		o.WALRetentionBytes = 0
 	}
 	if o.BloomBits == 0 {
 		o.BloomBits = DefaultBloomBits

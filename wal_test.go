@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -63,6 +64,38 @@ func TestWALPersistsCallerSeqAndObserves(t *testing.T) {
 	assert.Equal(t, uint64(1), got[0].Seq)
 	assert.Equal(t, uint64(2), got[1].Seq)
 	assert.Equal(t, uint64(3), got[2].Seq)
+}
+
+// TestWALApplyPanicDoesNotWedge guards that a panic inside the apply hook (the
+// memtable install) is recovered into an error rather than unwinding the committer
+// goroutine. An unrecovered panic would leave w.writing set, so Close (which waits
+// for w.writing==false) would deadlock forever. The append must return the error,
+// and Close must return promptly.
+func TestWALApplyPanicDoesNotWedge(t *testing.T) {
+	t.Parallel()
+	f, _ := openWALFile(t)
+	w := newWAL(f, nil, walConfig{sync: true})
+	w.apply = func([]walEntry) { panic("boom") }
+
+	appendErr := make(chan error, 1)
+	go func() {
+		appendErr <- w.append([]walEntry{{Kind: walKindPut, Key: []byte("a"), Value: []byte("1"), Seq: 1}})
+	}()
+	select {
+	case err := <-appendErr:
+		require.Error(t, err, "an apply panic must surface as an error to the caller")
+		assert.Contains(t, err.Error(), "apply panic")
+	case <-time.After(5 * time.Second):
+		t.Fatal("append wedged after an apply panic (w.writing left set)")
+	}
+
+	closed := make(chan error, 1)
+	go func() { closed <- w.Close() }()
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close deadlocked after an apply panic")
+	}
 }
 
 func TestWALConcurrentAppend(t *testing.T) {

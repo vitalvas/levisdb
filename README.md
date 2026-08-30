@@ -118,6 +118,7 @@ target a single slow spinning disk.
 | `StrictWALRecovery` | `false` | Fail open on any WAL corruption instead of salvaging the prefix. |
 | `ReadOnly` | `false` | Reject writes; make no filesystem changes. |
 | `WALObserver` | nil | Tap the committed stream for replication/CDC. |
+| `WALRetention` / `WALRetentionBytes` | `0` / `0` | Keep flushed WAL for `GetUpdatesSince` catch-up. `0` disables retention. See [Replication](#replication). |
 | `CompactionFilter` | nil | Drop values during compaction. See [Compaction filtering](#compaction-filtering). |
 
 ## Examples
@@ -212,11 +213,19 @@ Package-level:
 | `NewRangeIterator(start, end []byte) (Iterator, error)` | Ordered scan over `[start, end)`; `nil` end is unbounded. |
 | `Snapshot() (*Snapshot, error)` | Pin a consistent read view. |
 | `CompactRange(start, end []byte) error` | Force compaction over a key range. |
+| `LatestSeq() uint64` | Highest committed sequence; the replication resume point. |
+| `GetUpdatesSince(seq uint64) (*WALUpdates, error)` | Replay committed mutations after `seq` for catch-up. |
+| `IngestExternalFile(path string) error` | Bulk-load a table built by `SstFileWriter`. |
 | `Stats() (Stats, error)` | Point-in-time monitoring snapshot. |
 | `GetProperty(name string) (string, error)` | One named property as a string. |
 | `Close() error` | Flush, retire the WAL, release resources. |
 
 `*Batch`: `Put(PutOptions)`, `Delete(key []byte)`, `Reset()`, `Len() int`.
+
+`*WALUpdates`: `Next() bool`, `Batch() []WALEntry`, `Error() error`, `Close() error`.
+
+`*SstFileWriter`: `NewSstFileWriter(path, SstWriterOptions)`, then `Put`,
+`PutTTL`, `Delete` (keys ascending), `Finish()`.
 
 `*Snapshot`: `Get`, `Has`, `NewIterator`, `NewRangeIterator` (same signatures as
 the `*DB` reads, fixed to the snapshot's sequence), `Seq() uint64`, `Release()`.
@@ -368,7 +377,51 @@ removes it from that view.
 
 Sentinel errors returned by the API, all matchable with `errors.Is`:
 `ErrNotFound`, `ErrClosed`, `ErrReadOnly`, `ErrEmptyKey`, `ErrInvalidTTL`,
-`ErrEntryTooLarge`, `ErrBatchTooLarge`, and `ErrFileNumberExhausted`.
+`ErrEntryTooLarge`, `ErrBatchTooLarge`, `ErrRetentionExpired`, and
+`ErrFileNumberExhausted`.
+
+## Replication
+
+levisdb exposes the committed write stream so a follower or change-data-capture
+consumer can stay in sync. Every mutation carries a monotonic sequence, and a
+consumer records the highest sequence it has durably applied.
+
+- `LatestSeq()` returns the current highest committed sequence without pinning
+  anything (cheaper than `Snapshot().Seq()`).
+- `WALObserver` (above) delivers the live stream synchronously as batches commit.
+- `GetUpdatesSince(seq)` replays every committed mutation after `seq` for a
+  consumer that fell behind. Each `WALEntry` carries `Seq`, `Kind`, `Key`,
+  `Value`, and for TTL puts both `TTL` (remaining at delivery) and `ExpiresAt`
+  (the absolute deadline, so a replica reproduces the exact expiry).
+
+`GetUpdatesSince` serves mutations still in the live WAL for free. To serve
+mutations already flushed and retired, enable retention with `WALRetention` (a
+duration) and/or `WALRetentionBytes`; flushed segments are then kept until they
+are past *both* horizons. A request below the retained horizon returns
+`ErrRetentionExpired`, signalling the consumer to re-bootstrap from a `Snapshot`
+(iterate it, remember `Seq()`) and resume `GetUpdatesSince` from there. Delivery
+is at-least-once: a consumer may re-see entries after a crash, so it must be
+idempotent.
+
+```go
+u, err := db.GetUpdatesSince(lastApplied)
+if err != nil {
+	// errors.Is(err, levisdb.ErrRetentionExpired) -> re-bootstrap from a snapshot
+	return err
+}
+defer u.Close()
+for u.Next() {
+	for _, e := range u.Batch() {
+		apply(e) // e.Seq, e.Kind, e.Key, e.Value, e.ExpiresAt
+	}
+}
+```
+
+For bulk load, build a table offline with `SstFileWriter` (keys ascending) and
+load it with `IngestExternalFile`. The whole file is assigned one fresh sequence
+above every committed write and installed at the bottom tier, so its keys become
+the newest version of whatever they carry. The file's key range must not overlap
+keys still in the memtable; overlapping already-flushed tables is fine.
 
 ## Write-ahead log
 

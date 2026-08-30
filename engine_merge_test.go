@@ -136,3 +136,28 @@ func BenchmarkMergeIterNext(b *testing.B) {
 		}
 	}
 }
+
+// TestWriteMergedDetectsSameSeqValueConflict guards the compaction integrity
+// check: two input tables carrying the same internal key (same user key, seq, and
+// kind) but different values is an impossible-under-normal-operation anomaly that
+// writeMerged must reject. A regression here is silent data corruption: the check
+// compares against lastValue, which must be an owned copy - if it aliases the
+// merge iterator's reused curVal buffer, the comparison is buffer-vs-itself and
+// always passes, swallowing the conflict.
+func TestWriteMergedDetectsSameSeqValueConflict(t *testing.T) {
+	t.Parallel()
+	s := newTestEngine(t, 1<<20)
+	// Two sources, each one entry for key "k" at seq 5, kind Set, DIFFERENT values.
+	a := srcFrom(5, [2]string{"k", "valueA"})
+	b := srcFrom(5, [2]string{"k", "valueB"})
+	m := newMergeIter(a, b)
+
+	_, err := s.writeMerged(mergeWrite{
+		depth:     1,
+		merged:    m,
+		retainSeq: uint64(1) << 62,
+		cc:        testCompactionConfig(),
+	})
+	require.Error(t, err, "same-seq different-value entries must be rejected")
+	assert.Contains(t, err.Error(), "conflicting values")
+}

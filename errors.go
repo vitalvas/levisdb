@@ -31,6 +31,12 @@ var (
 	// expiration cannot be represented as a Unix nanosecond timestamp.
 	ErrInvalidTTL = errors.New("levisdb: invalid TTL")
 
+	// ErrRetentionExpired is returned by GetUpdatesSince when the requested
+	// sequence is below the oldest retained WAL record, so the committed stream
+	// from that point is no longer on disk. The consumer must re-bootstrap from a
+	// snapshot and resume tailing from its sequence.
+	ErrRetentionExpired = errors.New("levisdb: requested sequence below retained WAL horizon")
+
 	// ErrFileNumberExhausted is returned rather than wrapping the uint32 file
 	// namespace and risking replacement of an existing database file.
 	ErrFileNumberExhausted = errors.New("levisdb: file number namespace exhausted")

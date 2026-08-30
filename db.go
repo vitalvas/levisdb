@@ -84,6 +84,13 @@ type dbWAL struct {
 	file    *os.File
 	num     uint32   // live segment file number
 	retired []uint32 // rotated-out segments awaiting removal after their flush
+	// reapedThroughSeq is the highest sequence whose retained segment the reaper
+	// has deleted. GetUpdatesSince cannot serve a sequence at or below it, so a
+	// request there returns ErrRetentionExpired. Only used when WAL retention is
+	// enabled; retained segments themselves live on disk, not in memory. Atomic
+	// because the reaper writes it under db.checkpointMu while GetUpdatesSince
+	// reads it under db.mu - different locks, so a plain field would race.
+	reapedThroughSeq atomic.Uint64
 }
 
 func (db *DB) setBackgroundError(err error) {
@@ -688,8 +695,20 @@ func (db *DB) Close() error {
 		setErr(db.wal.wal.Close())
 	}
 	if firstErr == nil && db.wal != nil {
-		// Flushed above; retire the live + retired segments.
-		for _, num := range append(db.wal.retired, db.wal.num) {
+		// Flushed above; delete every WAL segment on disk. This covers the live and
+		// retired segments and any left on disk for replication retention (all now
+		// captured in tables). Retention is a live-process feature; a consumer
+		// re-bootstraps across a restart. Listing the directory is authoritative, so
+		// no orphan .log file is left behind.
+		nums, listErr := db.store.listLogs()
+		if listErr != nil {
+			// Fall back to the tracked numbers if the listing fails. Build a fresh
+			// slice so db.wal.retired is not mutated by the append.
+			nums = make([]uint32, 0, len(db.wal.retired)+1)
+			nums = append(nums, db.wal.retired...)
+			nums = append(nums, db.wal.num)
+		}
+		for _, num := range nums {
 			if num != 0 {
 				setErr(db.store.removeLog(num))
 			}
@@ -839,6 +858,20 @@ func (db *DB) hasAt(seq uint64, key []byte) (bool, error) {
 		return false, err
 	}
 	return found && !deleted, nil
+}
+
+// LatestSeq returns the highest committed sequence number: every mutation with a
+// sequence at or below it is durable and visible to reads. It is the resume point
+// a WALObserver consumer records, and the sequence a replica has caught up to. A
+// closed database returns 0. Unlike Snapshot().Seq() it pins nothing, so it is a
+// cheap way to read the current write position.
+func (db *DB) LatestSeq() uint64 {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	if db.closed {
+		return 0
+	}
+	return db.readSeq.Load()
 }
 
 // backpressure poll/slowdown tuning. The slowdown delay matches LevelDB's
@@ -1170,12 +1203,22 @@ func (db *DB) checkpointWALMode(force bool) (uint64, error) {
 	if err := db.backgroundError(); err != nil {
 		return db.filterSafeSeq.Load(), err
 	}
-	// Flushed through cutoff; retire the old segments.
+	// Flushed through cutoff; the old segments are now captured in tables. With
+	// retention off they are deleted immediately. With retention on they are left
+	// on disk for GetUpdatesSince and the disk-driven reaper deletes them once past
+	// the age/size horizon.
+	retain := db.opts.WALRetention > 0 || db.opts.WALRetentionBytes > 0
 	for len(db.wal.retired) > 0 {
-		if err := db.store.removeLog(db.wal.retired[0]); err != nil {
-			return db.filterSafeSeq.Load(), err
+		segNum := db.wal.retired[0]
+		if !retain {
+			if err := db.store.removeLog(segNum); err != nil {
+				return db.filterSafeSeq.Load(), err
+			}
 		}
 		db.wal.retired = db.wal.retired[1:]
+	}
+	if retain {
+		db.reapRetainedWAL(db.wal.num)
 	}
 	// Advance filterSafeSeq only forward: a concurrent force checkpoint may already
 	// have stored a higher cutoff, so never move it backward.

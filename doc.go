@@ -91,6 +91,19 @@
 // close them promptly to let compaction reclaim obsolete files. Iterator key and
 // value slices are valid only until the next Next; copy to retain.
 //
+// # Replication
+//
+// The committed write stream is exposed for followers and change-data capture.
+// LatestSeq returns the current highest committed sequence (the resume point). A
+// WALObserver receives the live stream synchronously per batch. GetUpdatesSince
+// replays committed mutations after a given sequence for a consumer that fell
+// behind; enable WALRetention / WALRetentionBytes to keep flushed WAL segments
+// long enough to serve them, or GetUpdatesSince covers only the live segment. A
+// request below the retained horizon returns ErrRetentionExpired, signalling the
+// consumer to re-bootstrap from a Snapshot. Delivery is at-least-once, so
+// consumers must be idempotent. For bulk load, SstFileWriter builds a table
+// offline and IngestExternalFile installs it at one fresh sequence.
+//
 // # Size limits
 //
 // A single key plus value must be at most 1 GiB, and one batch may add at most
