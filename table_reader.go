@@ -19,10 +19,11 @@ import (
 // every table's index+bloom for its whole lifetime. The footer and metadata
 // layout are still validated at open so a corrupt table fails fast.
 type tableReader struct {
-	r        io.ReaderAt
-	size     int64
-	indexBH  blockHandle // metadata block handles from the footer, for lazy loads
-	filterBH blockHandle
+	r          io.ReaderAt
+	size       int64
+	indexBH    blockHandle // metadata block handles from the footer, for lazy loads
+	filterBH   blockHandle
+	rangeDelBH blockHandle // zero when the table has no range tombstones
 
 	metaMu sync.Mutex // serializes metadata (re)building
 	meta   atomic.Pointer[tableMetaBlocks]
@@ -39,6 +40,7 @@ type tableMetaBlocks struct {
 	filter   []byte
 	indexBuf []byte // decoded index block; separators point into it
 	indexEnt []indexEntry
+	rangeDel []rangeTombstone // parsed range tombstones; nil when the table has none
 }
 
 // indexEntry locates a data block compactly: the separator (the block's last
@@ -70,29 +72,44 @@ func newCachedTableReader(r io.ReaderAt, size int64, c *blockCacheT, tableNum ui
 		return nil, fmt.Errorf("table: bad index handle")
 	}
 	filterBH, n2 := decodeHandle(footer[n:])
-	if n2 == 0 || n+n2 > footerLen-8 {
+	if n2 == 0 {
 		return nil, fmt.Errorf("table: bad filter handle")
 	}
-	for _, b := range footer[n+n2 : footerLen-8] {
+	rangeDelBH, n3 := decodeHandle(footer[n+n2:])
+	if n3 == 0 || n+n2+n3 > footerLen-8 {
+		return nil, fmt.Errorf("table: bad range-del handle")
+	}
+	for _, b := range footer[n+n2+n3 : footerLen-8] {
 		if b != 0 {
 			return nil, fmt.Errorf("table: non-zero footer padding")
 		}
 	}
 	dataEnd := uint64(size - footerLen)
+	// Layout: [data...][range-del?][filter][index][footer]. The filter and index
+	// are contiguous and end exactly at dataEnd. The range-del block, when present
+	// (non-zero handle), sits immediately before the filter; when absent the filter
+	// starts anywhere after the data blocks.
 	if filterBH.length > dataEnd || filterBH.offset > dataEnd-filterBH.length ||
 		indexBH.length > dataEnd || indexBH.offset > dataEnd-indexBH.length ||
 		filterBH.offset+filterBH.length != indexBH.offset ||
 		indexBH.offset+indexBH.length != dataEnd {
 		return nil, fmt.Errorf("table: invalid metadata block layout")
 	}
+	if rangeDelBH.length != 0 || rangeDelBH.offset != 0 {
+		if rangeDelBH.length > dataEnd || rangeDelBH.offset > dataEnd-rangeDelBH.length ||
+			rangeDelBH.offset+rangeDelBH.length != filterBH.offset {
+			return nil, fmt.Errorf("table: invalid range-del block layout")
+		}
+	}
 
 	tr := &tableReader{
-		r:        r,
-		size:     size,
-		indexBH:  indexBH,
-		filterBH: filterBH,
-		cache:    c,
-		tableNum: tableNum,
+		r:          r,
+		size:       size,
+		indexBH:    indexBH,
+		filterBH:   filterBH,
+		rangeDelBH: rangeDelBH,
+		cache:      c,
+		tableNum:   tableNum,
 	}
 
 	// Parse the metadata once up front to validate the table (bad filter/index
@@ -128,7 +145,19 @@ func (tr *tableReader) ensureMeta() (*tableMetaBlocks, error) {
 // later read rebuilds it. Any in-flight read keeps its own reference alive.
 func (tr *tableReader) dropMeta() { tr.meta.Store(nil) }
 
-// loadMeta reads and parses the filter and index blocks from disk.
+// rangeTombstones returns this table's parsed range tombstones (nil when it has
+// none). The returned slice is owned by the reader's metadata and must not be
+// mutated; its key bytes are immutable.
+func (tr *tableReader) rangeTombstones() ([]rangeTombstone, error) {
+	m, err := tr.ensureMeta()
+	if err != nil {
+		return nil, err
+	}
+	return m.rangeDel, nil
+}
+
+// loadMeta reads and parses the filter, index, and (when present) range-del
+// blocks from disk.
 func (tr *tableReader) loadMeta() (*tableMetaBlocks, error) {
 	filterRaw, err := tr.readBlockRaw(tr.filterBH)
 	if err != nil {
@@ -142,10 +171,36 @@ func (tr *tableReader) loadMeta() (*tableMetaBlocks, error) {
 		return nil, fmt.Errorf("table: read index: %w", err)
 	}
 	m := &tableMetaBlocks{filter: filterRaw, indexBuf: indexPayload}
+	// Data blocks end where the range-del block starts (if present) or the filter
+	// block starts otherwise; parseIndex bounds the last data block against that.
+	dataEnd := tr.filterBH.offset
+	haveRangeDel := tr.rangeDelBH.length != 0 || tr.rangeDelBH.offset != 0
+	if haveRangeDel {
+		dataEnd = tr.rangeDelBH.offset
+	}
 	// Walk the index payload directly, recording each separator's position so the
 	// entry stores an offset/length instead of a 24-byte slice header.
-	if err := tr.parseIndex(m, indexPayload, tr.filterBH.offset); err != nil {
+	if err := tr.parseIndex(m, indexPayload, dataEnd); err != nil {
 		return nil, fmt.Errorf("table: parse index: %w", err)
+	}
+	if haveRangeDel {
+		rdPayload, err := tr.readBlockRaw(tr.rangeDelBH)
+		if err != nil {
+			return nil, fmt.Errorf("table: read range-del: %w", err)
+		}
+		rts, err := decodeRangeDelBlock(rdPayload)
+		if err != nil {
+			return nil, err
+		}
+		// Copy out: rts aliases rdPayload, which is a transient read buffer.
+		m.rangeDel = make([]rangeTombstone, len(rts))
+		for i := range rts {
+			m.rangeDel[i] = rangeTombstone{
+				start: append([]byte(nil), rts[i].start...),
+				end:   append([]byte(nil), rts[i].end...),
+				seq:   rts[i].seq,
+			}
+		}
 	}
 	return m, nil
 }

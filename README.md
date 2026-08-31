@@ -206,6 +206,7 @@ Package-level:
 | --- | --- |
 | `Put(PutOptions) error` | Set a key, optionally with a TTL. |
 | `Delete(key []byte) error` | Remove a key. |
+| `DeleteRange(start, end []byte) error` | Remove every key in `[start, end)` in one record. |
 | `Get(key []byte) ([]byte, error)` | Read the latest value or `ErrNotFound`. |
 | `Has(key []byte) (bool, error)` | Existence check without copying the value. |
 | `Write(*Batch) error` | Commit a batch atomically. |
@@ -220,7 +221,8 @@ Package-level:
 | `GetProperty(name string) (string, error)` | One named property as a string. |
 | `Close() error` | Flush, retire the WAL, release resources. |
 
-`*Batch`: `Put(PutOptions)`, `Delete(key []byte)`, `Reset()`, `Len() int`.
+`*Batch`: `Put(PutOptions)`, `Delete(key []byte)`, `DeleteRange(start, end []byte)`,
+`Reset()`, `Len() int`.
 
 `*WALUpdates`: `Next() bool`, `Batch() []WALEntry`, `Error() error`, `Close() error`.
 
@@ -377,8 +379,8 @@ removes it from that view.
 
 Sentinel errors returned by the API, all matchable with `errors.Is`:
 `ErrNotFound`, `ErrClosed`, `ErrReadOnly`, `ErrEmptyKey`, `ErrInvalidTTL`,
-`ErrEntryTooLarge`, `ErrBatchTooLarge`, `ErrRetentionExpired`, and
-`ErrFileNumberExhausted`.
+`ErrInvalidRange`, `ErrEntryTooLarge`, `ErrBatchTooLarge`, `ErrRetentionExpired`,
+and `ErrFileNumberExhausted`.
 
 ## Replication
 
@@ -489,6 +491,19 @@ absolute deadline, so recovery does not restart the TTL. Once the newest value
 expires it behaves as a tombstone and never reveals an older value. Point reads
 evaluate wall-clock expiry when called; each iterator captures one time at
 creation so a scan cannot change halfway through.
+
+## Range deletes
+
+`DeleteRange(start, end)` removes every key in the half-open range `[start, end)`
+as one record, so deleting a large or prefix span is O(1) rather than one
+tombstone per key. `end` must be non-empty and strictly greater than `start`,
+else `ErrInvalidRange`. The delete applies at the sequence it commits: a snapshot
+taken earlier still sees the keys, and a write with a key in the range made after
+the call is unaffected. Range deletes persist in a per-table meta-block, shadow
+covered keys on reads and scans, and are reclaimed at the bottom compaction tier
+once no snapshot needs them. A `WALObserver` and `GetUpdatesSince` deliver a range
+delete as a `WALEntry` of kind `EntryDeleteRange` with `Key` = start, `Value` =
+end.
 
 ## Compaction filtering
 

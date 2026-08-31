@@ -1,6 +1,7 @@
 package levisdb
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"time"
@@ -62,6 +63,10 @@ func (db *DB) recoverWALMode(logs []uint32, startSeq uint64, flush bool) (uint64
 				if len(e.Key) == 0 {
 					return fmt.Errorf("wal: empty key")
 				}
+				if e.Kind == walKindRangeDelete &&
+					(len(e.Value) == 0 || bytes.Compare(e.Key, e.Value) >= 0) {
+					return fmt.Errorf("wal: invalid range delete")
+				}
 				if e.Seq > maxIKeySeq {
 					return fmt.Errorf("wal: sequence %d exceeds internal-key limit", e.Seq)
 				}
@@ -78,6 +83,8 @@ func (db *DB) recoverWALMode(logs []uint32, startSeq uint64, flush bool) (uint64
 				switch e.Kind {
 				case walKindDelete:
 					s.del(e.Seq, e.Key)
+				case walKindRangeDelete:
+					s.delRange(e.Seq, e.Key, e.Value)
 				case walKindPutTTL:
 					s.putTTL(e.Seq, e.Key, e.Value, e.ExpiresAt)
 				default:
@@ -241,10 +248,14 @@ func (b *observerBridge) observe(batch []walEntry) {
 }
 
 func publicKind(k walKindType) EntryKind {
-	if k == walKindDelete {
+	switch k {
+	case walKindDelete:
 		return EntryDelete
+	case walKindRangeDelete:
+		return EntryDeleteRange
+	default:
+		return EntryPut
 	}
-	return EntryPut
 }
 
 // commitTableChange durably records a table replacement and then installs it

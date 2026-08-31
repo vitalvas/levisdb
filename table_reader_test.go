@@ -52,11 +52,13 @@ func TestTableReaderRejectsInvalidMetadataLayout(t *testing.T) {
 		raw := append([]byte(nil), original...)
 		footer := raw[len(raw)-footerLen:]
 		index, n := decodeHandle(footer)
-		filter, _ := decodeHandle(footer[n:])
+		filter, n2 := decodeHandle(footer[n:])
+		rangeDel, _ := decodeHandle(footer[n+n2:]) // zero handle for this table
 		filter.offset++
 		clear(footer)
 		encoded := index.encode(nil)
 		encoded = filter.encode(encoded)
+		encoded = rangeDel.encode(encoded)
 		copy(footer, encoded)
 		binary.LittleEndian.PutUint64(footer[footerLen-8:], magic)
 		_, err := newCachedTableReader(bytes.NewReader(raw), int64(len(raw)), nil, 1)
@@ -68,7 +70,8 @@ func TestTableReaderRejectsInvalidMetadataLayout(t *testing.T) {
 		footer := raw[len(raw)-footerLen:]
 		_, n := decodeHandle(footer)
 		_, n2 := decodeHandle(footer[n:])
-		footer[n+n2] = 1
+		_, n3 := decodeHandle(footer[n+n2:]) // skip the zero range-del handle
+		footer[n+n2+n3] = 1                  // corrupt the padding after all three handles
 		_, err := newCachedTableReader(bytes.NewReader(raw), int64(len(raw)), nil, 1)
 		assert.ErrorContains(t, err, "footer padding")
 	})

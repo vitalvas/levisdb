@@ -16,11 +16,13 @@ const tableWriteBufferSize = 256 << 10
 
 // footer is a fixed-size trailer at the end of every table:
 //
-//	[index handle][filter handle][padding][magic: 8]
+//	[index handle][filter handle][range-del handle][padding][magic: 8]
 //
-// Handles are uvarint-encoded and left-padded within the fixed region.
+// Handles are uvarint-encoded and packed at the front of the fixed region. The
+// range-del handle is zero (offset 0, length 0) when the table has no range
+// tombstones. 72 bytes holds three worst-case (20-byte) handles plus the magic.
 const (
-	footerLen = 48
+	footerLen = 72
 	magic     = 0xdb1e_5100_0000_0001
 )
 
@@ -42,8 +44,9 @@ type tableWriter struct {
 	hasPending bool        // whether pendingBH holds a block awaiting an index entry
 	firstKey   []byte      // first internal key added, for the table's min-key bound
 	lastKey    []byte
-	entries    int // total entries added
-	tombstones int // entries added that are tombstones (deletes)
+	entries    int              // total entries added
+	tombstones int              // entries added that are tombstones (deletes)
+	rangeDels  []rangeTombstone // range tombstones to persist in the range-del block
 	// compScratch is the reusable compression-output buffer for finishBlock, so a
 	// flush or compaction does not allocate a fresh block buffer per data block.
 	// writeBlock consumes each block (writes it to tw.w) before the next call, so
@@ -57,6 +60,10 @@ type tableWriter struct {
 // tombstone density and reclaim deleted space early.
 func (tw *tableWriter) entryCount() int     { return tw.entries }
 func (tw *tableWriter) tombstoneCount() int { return tw.tombstones }
+
+// setRangeTombstones records the range tombstones to persist in this table's
+// range-del meta-block. Call before finish. The slice is retained, not copied.
+func (tw *tableWriter) setRangeTombstones(rts []rangeTombstone) { tw.rangeDels = rts }
 
 // bytesWritten returns the compressed bytes written to the file so far: every
 // data/index block advances tw.offset by its post-codec length, so this is the
@@ -189,6 +196,13 @@ func (tw *tableWriter) finish() (int64, error) {
 		tw.hasPending = false
 	}
 
+	// Range-del block (uncompressed, before the filter). Absent when there are no
+	// range tombstones, in which case the footer carries a zero handle.
+	var rangeDelBH blockHandle
+	if len(tw.rangeDels) > 0 {
+		rangeDelBH = tw.writeRawBlock(encodeRangeDelBlock(nil, tw.rangeDels))
+	}
+
 	// Filter block: bloom is always stored uncompressed for direct access.
 	filterBytes := tw.bloom.build(tw.hashes)
 	filterBH := tw.writeRawBlock(filterBytes)
@@ -200,7 +214,7 @@ func (tw *tableWriter) finish() (int64, error) {
 		return 0, tw.err
 	}
 
-	footer := tw.encodeFooter(indexBH, filterBH)
+	footer := tw.encodeFooter(indexBH, filterBH, rangeDelBH)
 	if err := writeAll(tw.w, footer); err != nil {
 		return 0, err
 	}
@@ -233,10 +247,11 @@ func (tw *tableWriter) writeRawBlock(payload []byte) blockHandle {
 	return bh
 }
 
-func (tw *tableWriter) encodeFooter(index, filterBH blockHandle) []byte {
+func (tw *tableWriter) encodeFooter(index, filterBH, rangeDelBH blockHandle) []byte {
 	buf := make([]byte, footerLen)
 	p := index.encode(nil)
 	p = filterBH.encode(p)
+	p = rangeDelBH.encode(p) // zero handle when there are no range tombstones
 	copy(buf, p)
 	binary.LittleEndian.PutUint64(buf[footerLen-8:], magic)
 	return buf

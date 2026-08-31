@@ -15,16 +15,21 @@ const (
 	EntryPut EntryKind = iota
 	// EntryDelete is a key removal (tombstone).
 	EntryDelete
+	// EntryDeleteRange removes every key in a half-open range. In a WALEntry of
+	// this kind, Key is the inclusive range start and Value is the exclusive end.
+	EntryDeleteRange
 )
 
 // WALEntry is one committed mutation delivered to a WALObserver in commit
 // order. Key and Value are valid only for the duration of the Observe call; a
 // consumer that retains them must copy.
 type WALEntry struct {
-	Seq   uint64    // monotonic log sequence number; a stable resume point
-	Kind  EntryKind // EntryPut or EntryDelete
-	Key   []byte    // mutation key
-	Value []byte    // value for EntryPut; nil for EntryDelete
+	Seq  uint64    // monotonic log sequence number; a stable resume point
+	Kind EntryKind // EntryPut, EntryDelete, or EntryDeleteRange
+	Key  []byte    // mutation key; the range start for EntryDeleteRange
+	// Value is the value for EntryPut, nil for EntryDelete, and the exclusive
+	// range end for EntryDeleteRange.
+	Value []byte
 	// TTL is the remaining lifetime at delivery time (zero means none, negative
 	// means already expired). It is derived from ExpiresAt, so it drifts with the
 	// clock; a replica that must preserve the exact original deadline should apply

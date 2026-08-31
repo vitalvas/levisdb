@@ -59,7 +59,12 @@ func (db *DB) reapRetainedWAL(liveNum uint32) {
 	now := time.Now().UnixNano()
 	ret := db.opts.WALRetention
 	maxBytes := db.opts.WALRetentionBytes
-	for _, c := range cands {
+	// Always keep the newest retained segment (the last candidate), even past both
+	// horizons, so a consumer only a little behind the live segment can still catch
+	// up: the newest committed writes flushed out of the live segment live here.
+	// Only older segments are eligible for deletion.
+	for i := 0; i+1 < len(cands); i++ {
+		c := cands[i]
 		ageOK := ret > 0 && time.Duration(now-c.mtime) < ret
 		bytesOK := maxBytes > 0 && total <= maxBytes
 		if ageOK || bytesOK {
@@ -81,7 +86,13 @@ func (db *DB) reapRetainedWAL(liveNum uint32) {
 		}
 		total -= c.size
 	}
-	// Every retained segment was deleted; nothing below the live segment survives.
+	// Every deletable segment was removed; the newest retained segment is kept, so
+	// the horizon is just below its first sequence.
+	if len(cands) > 0 {
+		db.advanceReapHorizon(db.firstSeqBefore(cands[len(cands)-1].num))
+		return
+	}
+	// No retained segments at all; nothing below the live segment survives.
 	// Advance the horizon to just below the live segment's first sequence.
 	db.advanceReapHorizon(db.firstSeqBefore(liveNum))
 }

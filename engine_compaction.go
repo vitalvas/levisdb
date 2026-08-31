@@ -192,6 +192,15 @@ func (s *engineT) Compact(depth int, retainSeq uint64, cc compactionConfigT) err
 		}
 	}
 
+	// Collect every range tombstone from the (final) input tables. The merge
+	// applies them to drop covered point entries; writeMerged persists the subset
+	// that must be kept (carried whole to keep shadowing deeper tables, and at the
+	// bottom tier only those a live snapshot still needs).
+	inputRangeDels, rterr := collectInputRangeDels(inputs)
+	if rterr != nil {
+		return rterr
+	}
+
 	// Build a merge over all input table iterators.
 	srcs := make([]entrySource, len(inputs))
 	for i, t := range inputs {
@@ -216,12 +225,59 @@ func (s *engineT) Compact(depth int, retainSeq uint64, cc compactionConfigT) err
 		noDeeperTier:   noDeeperTier,
 		retainSeq:      retainSeq,
 		cc:             cc,
+		rangeDels:      inputRangeDels,
 	})
 	if err != nil {
 		return err
 	}
 
 	return s.commitCompaction(inputs, metas)
+}
+
+// collectInputRangeDels gathers every range tombstone from the input tables. The
+// merge applies them to drop covered point entries, and the sink persists the
+// subset that must be kept (see rangeDelsToPersist).
+func collectInputRangeDels(inputs []*tableMeta) ([]rangeTombstone, error) {
+	var out []rangeTombstone
+	for _, t := range inputs {
+		trts, err := t.reader.rangeTombstones()
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, trts...)
+	}
+	return out, nil
+}
+
+// rangeDelsToPersist returns the range tombstones a compaction output must keep.
+// At the bottom tier (dropAtBottom) a tombstone whose sequence is at or below
+// retainSeq is dropped: no snapshot needs it and nothing deeper survives to
+// un-shadow, and the merge has already dropped the point entries it covered.
+// Tombstones above retainSeq, and all tombstones at a non-bottom tier, are kept.
+//
+// INVARIANT that makes the bottom drop safe: for any user key, a version in a
+// SHALLOWER tier is always NEWER (higher seq) than one in a deeper tier. A flush
+// lands at tier 0; a bottom compaction ingests the WHOLE tier (overlap-selection
+// and the byte cap are disabled when dropTombstones is set, engine_compaction.go
+// around "Overlap-scoped selection" and "Byte-cap"); and SstFileWriter/ingest
+// installs at the bottom with a FRESH high seq. So a covered older point can never
+// sit in a tier strictly deeper than the tombstone covering it, and dropping the
+// tombstone at the bottom never leaves a surviving older version to resurrect.
+// A future feature that places or relocates a table at an arbitrary depth with an
+// OLDER seq than an existing deeper tombstone would break this and must revisit
+// the drop condition (e.g. only drop a tombstone once it reaches the true deepest
+// tier and no shallower non-input table can hold a covered key).
+func rangeDelsToPersist(rts []rangeTombstone, dropAtBottom bool, retainSeq uint64) []rangeTombstone {
+	if !dropAtBottom {
+		return rts
+	}
+	var out []rangeTombstone
+	for i := range rts {
+		if rts[i].seq > retainSeq {
+			out = append(out, rts[i])
+		}
+	}
+	return out
 }
 
 // rangesMayContain reports whether any [min,max] bound could contain key. A nil
@@ -394,6 +450,12 @@ func (s *engineT) CompactAll(retainSeq uint64, cc compactionConfigT) error {
 	if len(inputs) == 0 {
 		return nil
 	}
+	// CompactAll collapses every tier into the bottom; the merge applies range
+	// tombstones to covered points and persists only those a snapshot still needs.
+	inputRangeDels, rterr := collectInputRangeDels(inputs)
+	if rterr != nil {
+		return rterr
+	}
 	srcs := make([]entrySource, len(inputs))
 	for i, t := range inputs {
 		srcs[i] = t.reader.newIterator()
@@ -405,6 +467,7 @@ func (s *engineT) CompactAll(retainSeq uint64, cc compactionConfigT) error {
 		dropTombstones: true,
 		retainSeq:      retainSeq,
 		cc:             cc,
+		rangeDels:      inputRangeDels,
 	})
 	if err != nil {
 		return err
@@ -420,6 +483,9 @@ type mergeWrite struct {
 	dropTombstones bool
 	retainSeq      uint64
 	cc             compactionConfigT
+	// rangeDels are the range tombstones carried from the input tables, to persist
+	// in an output table. Empty when dropped at the bottom tier.
+	rangeDels []rangeTombstone
 	// noDeeperTier reports that no table below this compaction's output tier can
 	// contain the user key (by recorded key bounds). When it holds, a tombstone
 	// or shadowed version can be reclaimed at an intermediate tier just as at the
@@ -438,13 +504,14 @@ func (s *engineT) writeMerged(mw mergeWrite) ([]*tableMeta, error) {
 		return nil, err
 	}
 	sink := compactionSink{
-		eng:         s,
-		depth:       mw.depth,
-		codec:       c,
-		bloomBits:   mw.cc.BloomBits,
-		blockSize:   mw.cc.BlockSize,
-		entropySkip: mw.cc.EntropySkip,
-		target:      mw.cc.targetFileSize(mw.depth),
+		eng:              s,
+		depth:            mw.depth,
+		codec:            c,
+		bloomBits:        mw.cc.BloomBits,
+		blockSize:        mw.cc.BlockSize,
+		entropySkip:      mw.cc.EntropySkip,
+		target:           mw.cc.targetFileSize(mw.depth),
+		pendingRangeDels: rangeDelsToPersist(mw.rangeDels, mw.dropTombstones, mw.retainSeq),
 	}
 	var lastUser []byte
 	haveLast := false
@@ -498,6 +565,16 @@ func (s *engineT) writeMerged(mw mergeWrite) ([]*tableMeta, error) {
 		// itself and silently miss a genuine value conflict. Copy like lastUser.
 		lastSeq, lastKind = seq, kind
 		lastValue = append(lastValue[:0], value...)
+		// A carried range tombstone newer than this version deletes it. When the key
+		// can be reclaimed here (bottom tier or no deeper tier holds it) and no
+		// snapshot needs the pre-delete value (rt.seq <= retainSeq), drop the entry
+		// and mark the key decided so its older versions drop too. Otherwise the
+		// point is written and the range tombstone (persisted alongside) shadows it
+		// on read, so no version is lost for a snapshot that still needs it.
+		if reclaimHere && maxCoveringRangeDelSeqLE(mw.rangeDels, user, mw.retainSeq) > seq {
+			droppedBelow = true
+			continue
+		}
 		writeKey, value, kind, err := resolveCompactionEntry(mw.cc, mergeEntry{
 			ik:    ik,
 			user:  user,
@@ -526,6 +603,13 @@ func (s *engineT) writeMerged(mw mergeWrite) ([]*tableMeta, error) {
 	}
 	if err := mw.merged.Error(); err != nil {
 		return sink.fail(err)
+	}
+	// Carried range tombstones must survive even when the merge produced no point
+	// entries (so no output table was started). Force one output to hold them.
+	if len(sink.pendingRangeDels) > 0 && sink.out == nil {
+		if err := sink.start(); err != nil {
+			return sink.fail(err)
+		}
 	}
 	if err := sink.finish(); err != nil {
 		return sink.fail(err)
@@ -593,6 +677,11 @@ type compactionSink struct {
 	target               int64
 	out                  *compactionOutput
 	metas                []*tableMeta
+	// pendingRangeDels are range tombstones carried from the input tables that have
+	// not yet been written to an output. They are attached to the first output
+	// table produced (one carrier is enough: the read path scans every table's
+	// range tombstones, so a tombstone in one output still shadows keys in another).
+	pendingRangeDels []rangeTombstone
 }
 
 func (s *compactionSink) start() error {
@@ -654,6 +743,11 @@ func (s *compactionSink) finish() error {
 	}
 	out := s.out
 	s.out = nil
+	// Attach any carried range tombstones to this (the first) output, then clear
+	// them so later output tables in the same compaction do not duplicate them.
+	rts := s.pendingRangeDels
+	s.pendingRangeDels = nil
+	out.w.setRangeTombstones(rts)
 	size, err := out.w.finish()
 	if err == nil {
 		err = out.f.Sync()
@@ -669,13 +763,14 @@ func (s *compactionSink) finish() error {
 		_ = removeFileDurable(out.path)
 		return err
 	}
+	minKey, maxKey := widenBoundsForRangeDels(out.w.minUserKey(), out.w.maxUserKey(), rts)
 	meta, err := s.eng.openTableMeta(tableSpec{
 		num:        out.num,
 		depth:      s.depth,
 		path:       out.path,
 		size:       size,
-		minKey:     out.w.minUserKey(),
-		maxKey:     out.w.maxUserKey(),
+		minKey:     minKey,
+		maxKey:     maxKey,
 		entries:    out.w.entryCount(),
 		tombstones: out.w.tombstoneCount(),
 	})

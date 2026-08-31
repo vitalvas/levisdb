@@ -31,6 +31,17 @@ var (
 	// expiration cannot be represented as a Unix nanosecond timestamp.
 	ErrInvalidTTL = errors.New("levisdb: invalid TTL")
 
+	// ErrInvalidRange is returned by DeleteRange when the end is empty or not
+	// strictly greater than the start, so the half-open range [start, end) is
+	// empty or malformed.
+	ErrInvalidRange = errors.New("levisdb: invalid key range")
+
+	// ErrIngestRangeDeletes is returned by IngestExternalFile when the source
+	// table contains range tombstones, which ingest cannot reproduce and would
+	// otherwise silently drop. Build ingest files with SstFileWriter, which does
+	// not produce range tombstones.
+	ErrIngestRangeDeletes = errors.New("levisdb: external file contains range tombstones")
+
 	// ErrRetentionExpired is returned by GetUpdatesSince when the requested
 	// sequence is below the oldest retained WAL record, so the committed stream
 	// from that point is no longer on disk. The consumer must re-bootstrap from a

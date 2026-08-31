@@ -23,6 +23,14 @@ func (b *Batch) Delete(key []byte) {
 	b.ops = append(b.ops, batchOp{kind: EntryDelete, key: key})
 }
 
+// DeleteRange appends a range delete of the half-open key span [start, end): every
+// key k with start <= k < end is removed as of this batch's sequence. start and
+// end are retained by reference and must not be mutated until Write returns. An
+// empty start or end, or end <= start, is rejected when the batch is written.
+func (b *Batch) DeleteRange(start, end []byte) {
+	b.ops = append(b.ops, batchOp{rangeDel: true, key: start, value: end})
+}
+
 // Reset clears the batch for reuse.
 func (b *Batch) Reset() {
 	clear(b.ops)

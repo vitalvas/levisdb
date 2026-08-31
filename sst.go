@@ -177,6 +177,19 @@ func (db *DB) IngestExternalFile(path string) error {
 	}
 	defer src.handle.close()
 
+	// Reject a source that carries range tombstones: ingest copies only point
+	// entries and assigns one bumped sequence at the bottom tier, which cannot
+	// correctly reproduce a source range tombstone's shadowing. Accepting it would
+	// silently drop the range deletes (covered keys would wrongly reappear), so
+	// fail loudly instead. SstFileWriter cannot produce range tombstones, so a
+	// file built for ingest never trips this; only a raw levisdb table (flush or
+	// compaction output) can, and such a file is not a supported ingest input.
+	if rts, rerr := src.reader.rangeTombstones(); rerr != nil {
+		return rerr
+	} else if len(rts) > 0 {
+		return ErrIngestRangeDeletes
+	}
+
 	minKey, maxKey, err := externalKeyRange(src.reader)
 	if err != nil {
 		return err

@@ -2,6 +2,7 @@ package levisdb
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -151,4 +152,34 @@ func TestSstIngestClosedDB(t *testing.T) {
 	path := buildSST(t, t.TempDir(), "c", [][2]string{{"a", "1"}})
 	require.NoError(t, db.Close())
 	assert.ErrorIs(t, db.IngestExternalFile(path), ErrClosed)
+}
+
+// TestIngestRejectsRangeTombstones guards that IngestExternalFile refuses a raw
+// table that carries range tombstones (which ingest cannot reproduce), rather
+// than silently dropping them and resurrecting covered keys. SstFileWriter cannot
+// produce range tombstones, so the source is built with the low-level tableWriter.
+func TestIngestRejectsRangeTombstones(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "withrange.sst")
+	f, err := os.Create(path)
+	require.NoError(t, err)
+	none, _ := codecFromID(codecNone)
+	w := newTableWriter(f, tableWriterConfig{codec: none, bloomBits: 10, blockSize: 4096})
+	w.setRangeTombstones([]rangeTombstone{{start: []byte("k03"), end: []byte("k07"), seq: 100}})
+	for i := 0; i < 10; i++ {
+		ik := ikeyEncode(nil, []byte(fmt.Sprintf("k%02d", i)), uint64(i+1), ikeyKindSet)
+		require.NoError(t, w.Add(ik, []byte("v")))
+	}
+	_, err = w.finish()
+	require.NoError(t, err)
+	require.NoError(t, f.Sync())
+	require.NoError(t, f.Close())
+
+	db := openTestDB(t, nil)
+	err = db.IngestExternalFile(path)
+	require.ErrorIs(t, err, ErrIngestRangeDeletes, "ingest must refuse a file with range tombstones, not drop them")
+
+	// The rejected ingest changed nothing: no key from the file is present.
+	_, err = db.Get([]byte("k00"))
+	assert.ErrorIs(t, err, ErrNotFound)
 }

@@ -20,6 +20,10 @@ type memtableT struct {
 	mu   sync.RWMutex
 	list *skiplist
 	size int64
+	// rts holds range tombstones buffered by DeleteRange, in insertion order. They
+	// are applied by the engine read path (a range tombstone can shadow a point key
+	// in any source), persisted on flush, and carried through compaction.
+	rts []rangeTombstone
 }
 
 // New returns an empty memtable. seed varies the skiplist RNG per memtable.
@@ -34,11 +38,11 @@ func (m *memtableT) Size() int64 {
 	return m.size
 }
 
-// Empty reports whether the memtable holds no entries.
+// Empty reports whether the memtable holds no entries and no range tombstones.
 func (m *memtableT) empty() bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.list.first() == nilNode
+	return m.list.first() == nilNode && len(m.rts) == 0
 }
 
 // overlapsUserRange reports whether any buffered key's user portion falls within
@@ -70,6 +74,31 @@ func (m *memtableT) putTTL(seq uint64, key, value []byte, expiresAt int64) {
 // Delete buffers a tombstone for key at seq.
 func (m *memtableT) del(seq uint64, key []byte) {
 	m.add(seq, ikeyKindDelete, key, nil)
+}
+
+// delRange buffers a range tombstone deleting [start, end) at seq. start and end
+// are copied so the caller may reuse its buffers.
+func (m *memtableT) delRange(seq uint64, start, end []byte) {
+	rt := rangeTombstone{
+		start: append([]byte(nil), start...),
+		end:   append([]byte(nil), end...),
+		seq:   seq,
+	}
+	m.mu.Lock()
+	m.rts = append(m.rts, rt)
+	m.size += int64(len(rt.start) + len(rt.end))
+	m.mu.Unlock()
+}
+
+// rangeTombstones returns a snapshot copy of the buffered range tombstones. The
+// slice is owned by the caller; the tombstones' key bytes are immutable.
+func (m *memtableT) rangeTombstones() []rangeTombstone {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if len(m.rts) == 0 {
+		return nil
+	}
+	return append([]rangeTombstone(nil), m.rts...)
 }
 
 func (m *memtableT) add(seq uint64, kind ikeyKind, key, value []byte) {

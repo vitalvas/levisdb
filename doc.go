@@ -82,6 +82,17 @@
 // behaves as a tombstone and never reveals an older one. Point reads evaluate
 // expiry when called; each iterator captures one time at creation.
 //
+// # Range deletes
+//
+// DeleteRange(start, end) removes every key in the half-open range [start, end)
+// as one record, so deleting a large or prefix span is O(1) rather than one
+// tombstone per key. It applies at the sequence it commits, so an earlier
+// snapshot still sees the keys and a later write in the range is unaffected. Range
+// deletes persist in a per-table meta-block, shadow covered keys on reads and
+// scans, and are reclaimed at the bottom compaction tier once no snapshot needs
+// them. WALObserver and GetUpdatesSince deliver a range delete as an
+// EntryDeleteRange WALEntry with Key = start and Value = end.
+//
 // # Snapshots and iterators
 //
 // Snapshot pins a consistent read view at the current sequence; writes made after

@@ -21,8 +21,12 @@ type engineIterator struct {
 	lastKey  []byte
 	primed   bool
 	refs     []*tableMeta
-	err      error
-	closed   bool
+	// rts are the range tombstones from every source, captured at creation so the
+	// scan is snapshot-consistent. A key's deciding version is skipped when a
+	// visible range tombstone newer than it covers the key.
+	rts    []rangeTombstone
+	err    error
+	closed bool
 }
 
 // NewIterator returns an iterator over the engine at snapshot seq.
@@ -40,13 +44,18 @@ func (s *engineT) newRangeIteratorAt(seq uint64, start, end []byte, readTime int
 	s.mu.RLock()
 	sources := make([]entrySource, 0, len(s.tables)+len(s.recoveryMems)+2)
 	refs := make([]*tableMeta, 0, len(s.tables))
+	var rts []rangeTombstone
 	sources = append(sources, s.mem.newSnapshotIterator())
+	rts = append(rts, s.mem.rangeTombstones()...)
 	if s.imm != nil {
 		sources = append(sources, s.imm.newIterator())
+		rts = append(rts, s.imm.rangeTombstones()...)
 	}
 	for _, recovered := range s.recoveryMems {
 		sources = append(sources, recovered.newIterator())
+		rts = append(rts, recovered.rangeTombstones()...)
 	}
+	var rtErr error
 	for _, t := range s.tables {
 		// Skip a table whose key range does not intersect [start, end); end is
 		// treated inclusively here, which is conservative (never wrongly skipped).
@@ -56,20 +65,30 @@ func (s *engineT) newRangeIteratorAt(seq uint64, start, end []byte, readTime int
 		if t.acquire() {
 			refs = append(refs, t)
 			sources = append(sources, t.reader.newIterator())
+			if trts, err := t.reader.rangeTombstones(); err != nil {
+				rtErr = err
+			} else {
+				rts = append(rts, trts...)
+			}
 		}
 	}
 	s.mu.RUnlock()
 	// bytes.Clone preserves the nil/non-nil distinction: a non-nil empty end
 	// bound stays non-nil (an exclusive upper bound of "" matching nothing),
 	// whereas append([]byte(nil), end...) would collapse it to nil (unbounded).
-	return &engineIterator{
+	it := &engineIterator{
 		merge:    newMergeIter(sources...),
 		seq:      seq,
 		readTime: readTime,
 		start:    bytes.Clone(start),
 		end:      bytes.Clone(end),
 		refs:     refs,
+		rts:      rts,
 	}
+	// Surface a range-del read error on the first Next rather than silently
+	// dropping tombstones (which could reveal a deleted key).
+	it.err = rtErr
+	return it
 }
 
 // Next advances to the next live user key and reports whether one exists.
@@ -112,6 +131,11 @@ func (it *engineIterator) Next() bool {
 
 		if kind == ikeyKindDelete {
 			continue // deleted at this snapshot; move on
+		}
+		// A range tombstone visible at the snapshot and newer than this version
+		// deletes the key, even though the point version is a live value.
+		if rangeDeleted(it.rts, user, kseq, it.seq) {
+			continue
 		}
 		value := it.merge.Value()
 		if kind == ikeyKindSetTTL {

@@ -188,6 +188,13 @@ func (s *engineT) del(seq uint64, key []byte) {
 	s.mu.Unlock()
 }
 
+// delRange buffers a range tombstone for [start, end) into the active memtable.
+func (s *engineT) delRange(seq uint64, start, end []byte) {
+	s.mu.Lock()
+	s.mem.delRange(seq, start, end)
+	s.mu.Unlock()
+}
+
 // MemEmpty reports whether the active memtable holds no entries.
 func (s *engineT) memEmpty() bool {
 	s.mu.RLock()
@@ -259,6 +266,34 @@ func (s *engineT) get(seq uint64, key []byte) (value []byte, found, deleted bool
 	return s.getAtTime(seq, key, time.Now().UnixNano())
 }
 
+// versionPick tracks the newest visible version of a key seen so far while a
+// lookup scans the memtable, immutable memtable, recovery memtables, and tables.
+type versionPick struct {
+	value   []byte
+	seq     uint64
+	found   bool
+	deleted bool
+}
+
+// set records the first version found (no prior best to compare against).
+func (p *versionPick) set(v []byte, seq uint64, deleted bool) {
+	p.value, p.seq, p.found, p.deleted = v, seq, true, deleted
+}
+
+// merge folds one candidate version into the best. A higher sequence wins; the
+// same sequence with a different kind or value is an impossible-under-unique-seqs
+// anomaly and returns a conflict error tagged with source. Ties with an identical
+// version are ignored (the same record read from more than one place).
+func (p *versionPick) merge(v []byte, seq uint64, deleted bool, source string) error {
+	switch {
+	case !p.found || seq > p.seq:
+		p.set(v, seq, deleted)
+	case seq == p.seq && (deleted != p.deleted || (!deleted && !bytes.Equal(v, p.value))):
+		return fmt.Errorf("%s: conflicting versions for key at sequence %d", source, seq)
+	}
+	return nil
+}
+
 func (s *engineT) getAtTime(seq uint64, key []byte, now int64) (value []byte, found, deleted bool, err error) {
 	// Hold the read lock for the whole lookup so a concurrent compaction cannot
 	// close and remove a table file mid-read; the compaction swap runs under
@@ -266,29 +301,21 @@ func (s *engineT) getAtTime(seq uint64, key []byte, now int64) (value []byte, fo
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	var bestValue []byte
-	var bestSeq uint64
-	var bestFound, bestDeleted bool
+	var best versionPick
 	if v, vseq, f, d := s.mem.getVersionAt(seq, key, now); f {
-		bestValue, bestSeq, bestFound, bestDeleted = v, vseq, true, d
+		best.set(v, vseq, d)
 	}
 	if s.imm != nil {
 		if v, vseq, f, d := s.imm.getVersionAt(seq, key, now); f {
-			switch {
-			case !bestFound || vseq > bestSeq:
-				bestValue, bestSeq, bestFound, bestDeleted = v, vseq, true, d
-			case vseq == bestSeq && (d != bestDeleted || (!d && !bytes.Equal(v, bestValue))):
-				return nil, false, false, fmt.Errorf("memtable: conflicting versions for key at sequence %d", vseq)
+			if err := best.merge(v, vseq, d, "memtable"); err != nil {
+				return nil, false, false, err
 			}
 		}
 	}
 	for _, recovered := range s.recoveryMems {
 		if v, vseq, f, d := recovered.getVersionAt(seq, key, now); f {
-			switch {
-			case !bestFound || vseq > bestSeq:
-				bestValue, bestSeq, bestFound, bestDeleted = v, vseq, true, d
-			case vseq == bestSeq && (d != bestDeleted || (!d && !bytes.Equal(v, bestValue))):
-				return nil, false, false, fmt.Errorf("recovery memtable: conflicting versions for key at sequence %d", vseq)
+			if err := best.merge(v, vseq, d, "recovery memtable"); err != nil {
+				return nil, false, false, err
 			}
 		}
 	}
@@ -309,18 +336,61 @@ func (s *engineT) getAtTime(seq uint64, key []byte, now int64) (value []byte, fo
 		if !f {
 			continue
 		}
-		if !bestFound || vseq > bestSeq {
-			bestValue, bestSeq, bestFound, bestDeleted = v, vseq, true, d
-			continue
+		if err := best.merge(v, vseq, d, "table"); err != nil {
+			return nil, false, false, err
 		}
-		if vseq == bestSeq && (d != bestDeleted || (!d && !bytes.Equal(v, bestValue))) {
-			return nil, false, false, fmt.Errorf("table: conflicting versions for key at sequence %d", vseq)
+	}
+	bestValue, bestSeq, bestFound, bestDeleted := best.value, best.seq, best.found, best.deleted
+	// A range tombstone visible at seq and newer than the best point version
+	// deletes the key, even when the point version itself is live. Apply it after
+	// the point lookup so it can shadow a value in any source.
+	if bestFound && !bestDeleted {
+		rdSeq, rderr := s.maxCoveringRangeDelSeq(key, seq)
+		if rderr != nil {
+			return nil, false, false, rderr
+		}
+		if rdSeq > bestSeq {
+			bestDeleted = true
+			bestValue = nil
 		}
 	}
 	if bestFound {
 		return append([]byte(nil), bestValue...), true, bestDeleted, nil
 	}
 	return nil, false, false, nil
+}
+
+// maxCoveringRangeDelSeq returns the highest sequence of any range tombstone that
+// covers key and is visible at readSeq (seq <= readSeq), across the memtable, the
+// flushing memtable, the recovery memtables, and every table. Zero means none.
+// Caller holds s.mu.
+func (s *engineT) maxCoveringRangeDelSeq(key []byte, readSeq uint64) (uint64, error) {
+	var best uint64
+	consider := func(rts []rangeTombstone) {
+		for i := range rts {
+			if rts[i].seq <= readSeq && rts[i].seq > best && rts[i].contains(key) {
+				best = rts[i].seq
+			}
+		}
+	}
+	consider(s.mem.rangeTombstones())
+	if s.imm != nil {
+		consider(s.imm.rangeTombstones())
+	}
+	for _, recovered := range s.recoveryMems {
+		consider(recovered.rangeTombstones())
+	}
+	for _, table := range s.tables {
+		if !table.mayContain(key) {
+			continue
+		}
+		rts, err := table.reader.rangeTombstones()
+		if err != nil {
+			return 0, err
+		}
+		consider(rts)
+	}
+	return best, nil
 }
 
 // has reports whether key exists at snapshot seq, and whether the newest
@@ -377,6 +447,16 @@ func (s *engineT) hasAtTime(seq uint64, key []byte, now int64) (found, deleted b
 			return false, false, fmt.Errorf("table: conflicting kinds for key at sequence %d", vseq)
 		}
 	}
+	// A range tombstone newer than the best point version deletes the key.
+	if bestFound && !bestDeleted {
+		rdSeq, rderr := s.maxCoveringRangeDelSeq(key, seq)
+		if rderr != nil {
+			return false, false, rderr
+		}
+		if rdSeq > bestSeq {
+			bestDeleted = true
+		}
+	}
 	return bestFound, bestDeleted, nil
 }
 
@@ -428,7 +508,7 @@ func (s *engineT) Flush() error {
 	if err != nil {
 		return err
 	}
-	meta, err := s.writeTable(num, 0, path, imm.newIterator())
+	meta, err := s.writeTable(num, 0, path, imm.newIterator(), imm.rangeTombstones())
 	if err != nil {
 		return err
 	}
@@ -455,8 +535,9 @@ func (s *engineT) Flush() error {
 }
 
 // writeTable writes all entries from a memtable iterator into a new table file
-// at the given tier depth and opens it for reading.
-func (s *engineT) writeTable(num uint32, depth int, path string, it *memtableIterator) (*tableMeta, error) {
+// at the given tier depth, persists any range tombstones, and opens it for
+// reading.
+func (s *engineT) writeTable(num uint32, depth int, path string, it *memtableIterator, rts []rangeTombstone) (*tableMeta, error) {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o644)
 	if err != nil {
 		return nil, err
@@ -481,6 +562,7 @@ func (s *engineT) writeTable(num uint32, depth int, path string, it *memtableIte
 		blockSize:   s.cfg.BlockSize,
 		entropySkip: s.cfg.EntropySkip,
 	})
+	w.setRangeTombstones(rts)
 	for it.Next() {
 		if err := w.Add(it.internalKey(), it.Value()); err != nil {
 			return nil, err
@@ -501,13 +583,18 @@ func (s *engineT) writeTable(num uint32, depth int, path string, it *memtableIte
 	if err := syncDir(filepath.Dir(path)); err != nil {
 		return nil, err
 	}
+	// The recorded key bounds must span both point entries and range tombstones,
+	// so a read for a key that only a range tombstone covers does not skip this
+	// table via mayContain. A range tombstone's end is exclusive, but using it as
+	// an inclusive upper bound is safe (over-inclusive never wrongly skips).
+	minKey, maxKey := widenBoundsForRangeDels(w.minUserKey(), w.maxUserKey(), rts)
 	meta, err := s.openTableMeta(tableSpec{
 		num:        num,
 		depth:      depth,
 		path:       path,
 		size:       size,
-		minKey:     w.minUserKey(),
-		maxKey:     w.maxUserKey(),
+		minKey:     minKey,
+		maxKey:     maxKey,
 		entries:    w.entryCount(),
 		tombstones: w.tombstoneCount(),
 	})
@@ -516,6 +603,30 @@ func (s *engineT) writeTable(num uint32, depth int, path string, it *memtableIte
 	}
 	keep = true
 	return meta, nil
+}
+
+// widenBoundsForRangeDels expands [minKey, maxKey] to also cover every range
+// tombstone's [start, end], so a table's recorded bounds include keys that only
+// a range tombstone touches. nil point bounds (a range-del-only table) take the
+// tombstone span directly.
+func widenBoundsForRangeDels(minKey, maxKey []byte, rts []rangeTombstone) ([]byte, []byte) {
+	for i := range rts {
+		if minKey == nil || bytes.Compare(rts[i].start, minKey) < 0 {
+			minKey = rts[i].start
+		}
+		if maxKey == nil || bytes.Compare(rts[i].end, maxKey) > 0 {
+			maxKey = rts[i].end
+		}
+	}
+	// Return owned copies so later reuse of the tombstone buffers cannot mutate the
+	// recorded bounds.
+	if minKey != nil {
+		minKey = append([]byte(nil), minKey...)
+	}
+	if maxKey != nil {
+		maxKey = append([]byte(nil), maxKey...)
+	}
+	return minKey, maxKey
 }
 
 // tableSpec identifies a table file to open and its recorded metadata.

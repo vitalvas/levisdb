@@ -19,9 +19,13 @@ const (
 	// walKindPutTTL stores an absolute expiration before the value so replay
 	// preserves the original deadline instead of restarting the TTL.
 	walKindPutTTL
+	// walKindRangeDelete removes every key in a half-open range. The record's Key
+	// holds the inclusive start and Value holds the exclusive end.
+	walKindRangeDelete
 )
 
-// Entry is one mutation in a batch. Seq is assigned by the writer.
+// Entry is one mutation in a batch. Seq is assigned by the writer. For a range
+// delete, Key is the range start and Value is the range end.
 type walEntry struct {
 	Seq       uint64
 	Kind      walKindType
@@ -53,7 +57,8 @@ func encodeBatch(dst []byte, baseSeq uint64, entries []walEntry) []byte {
 		if e.Kind == walKindPutTTL {
 			dst = binary.AppendVarint(dst, e.ExpiresAt)
 		}
-		if e.Kind == walKindPut || e.Kind == walKindPutTTL {
+		// Puts carry a value; a range delete carries its end key in the same field.
+		if e.Kind == walKindPut || e.Kind == walKindPutTTL || e.Kind == walKindRangeDelete {
 			dst = binary.AppendUvarint(dst, uint64(len(e.Value)))
 			dst = append(dst, e.Value...)
 		}
@@ -90,7 +95,8 @@ func decodeBatch(rec []byte) ([]walEntry, error) {
 		}
 		kind := walKindType(rest[0])
 		rest = rest[1:]
-		if kind != walKindPut && kind != walKindDelete && kind != walKindPutTTL {
+		if kind != walKindPut && kind != walKindDelete && kind != walKindPutTTL &&
+			kind != walKindRangeDelete {
 			return nil, fmt.Errorf("wal: unknown entry kind %d", kind)
 		}
 
@@ -109,7 +115,8 @@ func decodeBatch(rec []byte) ([]walEntry, error) {
 			e.ExpiresAt = expiresAt
 			rest = rest[used:]
 		}
-		if kind == walKindPut || kind == walKindPutTTL {
+		// Puts carry a value; a range delete carries its end key in the same field.
+		if kind == walKindPut || kind == walKindPutTTL || kind == walKindRangeDelete {
 			val, r2, err := readBytes(rest)
 			if err != nil {
 				return nil, fmt.Errorf("wal: value: %w", err)

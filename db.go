@@ -1,6 +1,7 @@
 package levisdb
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"log/slog"
@@ -120,6 +121,9 @@ type batchOp struct {
 	key   []byte
 	value []byte
 	ttl   time.Duration
+	// rangeDel marks a range delete: key is the inclusive start and value is the
+	// exclusive end. kind is ignored for a range delete.
+	rangeDel bool
 }
 
 // Iterator iterates over key/value pairs in key order.
@@ -784,6 +788,19 @@ func (db *DB) Delete(key []byte) error {
 	return db.Write(&b)
 }
 
+// DeleteRange removes every key in the half-open range [start, end): every key k
+// with start <= k < end becomes invisible as of this call. It is one record
+// regardless of how many keys the range spans, so deleting a large or prefix
+// range is O(1) rather than one tombstone per key. end must be strictly greater
+// than start and non-empty, else ErrInvalidRange. Keys written after this call
+// with a key in the range are unaffected (the delete applies only to the sequence
+// at which it commits).
+func (db *DB) DeleteRange(start, end []byte) error {
+	var b Batch
+	b.DeleteRange(start, end)
+	return db.Write(&b)
+}
+
 // Get returns the value for key at the latest committed sequence, or
 // ErrNotFound.
 func (db *DB) Get(key []byte) ([]byte, error) {
@@ -971,6 +988,22 @@ func (db *DB) writeBatch(b *Batch) error {
 	for i, op := range b.ops {
 		if len(op.key) == 0 {
 			return ErrEmptyKey
+		}
+		if op.rangeDel {
+			// A range delete needs a non-empty exclusive end strictly above start.
+			if len(op.value) == 0 || bytes.Compare(op.key, op.value) >= 0 {
+				return ErrInvalidRange
+			}
+			entrySize := len(op.key) + len(op.value)
+			if entrySize > maxEntrySize {
+				return ErrEntryTooLarge
+			}
+			total += int64(entrySize)
+			if total > int64(maxEntrySize) {
+				return ErrBatchTooLarge
+			}
+			entries[i] = walEntry{Kind: walKindRangeDelete, Key: op.key, Value: op.value}
+			continue
 		}
 		// Reject an entry that would approach the uint32 offset limits and
 		// silently corrupt the skiplist arena or a data block. A TTL value carries
@@ -1244,6 +1277,8 @@ func (db *DB) applyCommitted(entries []walEntry) {
 		switch e.Kind {
 		case walKindDelete:
 			db.eng.del(e.Seq, e.Key)
+		case walKindRangeDelete:
+			db.eng.delRange(e.Seq, e.Key, e.Value)
 		case walKindPutTTL:
 			db.eng.putTTL(e.Seq, e.Key, e.Value, e.ExpiresAt)
 		default:
