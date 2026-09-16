@@ -100,7 +100,7 @@ target a single slow spinning disk.
 | Option | Default | Purpose |
 | --- | --- | --- |
 | `Dir` | (required) | Data directory. |
-| `MemtableSize` | `2 MiB` | Memtable flush threshold in bytes. |
+| `MemtableSize` | `4 MiB` | Memtable flush threshold in bytes. |
 | `TierRatio` | `4` | Size-tiered compaction fan-out (tables per tier before merge). |
 | `TierByteTrigger` | `8 x FileSizeMax` | Tier bytes that trigger compaction below the count ratio; negative disables. |
 | `TombstoneCompactionRatio` | `0.5` | Delete fraction that triggers early compaction; negative disables. |
@@ -112,7 +112,7 @@ target a single slow spinning disk.
 | `BloomBits` | `10` | Bloom filter bits per key. |
 | `BlockSize` | `4 KiB` | SSTable data block size in bytes. |
 | `BlockCacheSize` / `DisableBlockCache` | `256 MiB` / `false` | Decoded-block cache capacity; or turn it off. |
-| `MaxOpenFiles` | `1024` | Open table descriptors kept at once; negative keeps all open. |
+| `MaxOpenFiles` | `1000` | Open table descriptors kept at once; negative keeps all open. |
 | `NoSync` / `WALSyncInterval` | `false` / `1s` | WAL durability. See [Write-ahead log](#write-ahead-log). |
 | `StrictWALRecovery` | `false` | Fail open on any WAL corruption instead of salvaging the prefix. |
 | `ReadOnly` | `false` | Reject writes; make no filesystem changes. |
@@ -286,10 +286,11 @@ With the defaults (`FileSizeBase` 2 MiB, `FileSizeMultiplier` 2, `FileSizeMax`
 | 3 | 16 MiB |
 | 4 and deeper | 16 MiB (capped) |
 
-`MemtableSize` defaults to `FileSizeBase` so a flushed L0 table lands at the
-depth-0 target. Raise `FileSizeMax` (or the multiplier) for larger bottom-tier
-files and fewer of them; the target is a per-file roll point, not a hard limit,
-so a single oversized key can still produce a larger file.
+`MemtableSize` defaults to 4 MiB (matching LevelDB's `write_buffer_size`), so a
+full memtable flushes into two depth-0 files at the 2 MiB target. Raise
+`FileSizeMax` (or the multiplier) for larger bottom-tier files and fewer of them;
+the target is a per-file roll point, not a hard limit, so a single oversized key
+can still produce a larger file.
 
 `TombstoneCompactionRatio` (default `0.5`) compacts a tier early once that
 fraction of its entries are deletes, reclaiming delete-heavy data toward the

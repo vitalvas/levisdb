@@ -62,7 +62,7 @@ type WALObserver interface {
 // Default option values. All are tunable so the engine can be calibrated
 // against a real spindle.
 const (
-	DefaultMemtableSize = 2 << 20 // 2 MiB, matched to the fresh-tier file size
+	DefaultMemtableSize = 4 << 20 // 4 MiB, matching LevelDB's write_buffer_size
 	DefaultTierRatio    = 4
 	// DefaultTombstoneCompactionRatio compacts a tier once half its entries are
 	// tombstones, reclaiming delete-heavy data without waiting for the table-count
@@ -79,7 +79,7 @@ const (
 	DefaultBloomBits          = 10
 	DefaultBlockSize          = 4 << 10   // 4 KiB
 	DefaultBlockCacheSize     = 256 << 20 // 256 MiB
-	DefaultMaxOpenFiles       = 1024      // bounded open table descriptors
+	DefaultMaxOpenFiles       = 1000      // bounded open table descriptors, matching LevelDB
 	DefaultFreshCodec         = CodecS2
 	// DefaultBottomCodec is S2 too: zstd's slow encode dominated compaction on
 	// large, compressible values (bottom-tier merges stalled). S2 keeps compaction
@@ -303,9 +303,7 @@ func (o *Options) fillDefaults() {
 		o.FileSizeBase = DefaultFileSizeBase
 	}
 	if o.MemtableSize == 0 {
-		// A memtable flushes to one fresh-tier (L0) table, so default its size
-		// to the fresh-tier target so L0 tables come out uniformly sized.
-		o.MemtableSize = o.FileSizeBase
+		o.MemtableSize = DefaultMemtableSize
 	}
 	if o.FileSizeMultiplier == 0 {
 		o.FileSizeMultiplier = DefaultFileSizeMultiplier
