@@ -47,7 +47,7 @@ func TestBlockRoundTrip(t *testing.T) {
 		b.add([]byte(e[0]), []byte(e[1]))
 	}
 
-	raw := finishBlock(nil, b.buf, c, true)
+	raw := finishBlock(nil, b.buf, c)
 	payload, err := decodeBlock(raw)
 	require.NoError(t, err)
 
@@ -195,7 +195,7 @@ func TestDecodeBlockErrors(t *testing.T) {
 	t.Run("crc_mismatch", func(t *testing.T) {
 		var b blockBuilder
 		b.add([]byte("k"), []byte("v"))
-		raw := finishBlock(nil, b.buf, c, true)
+		raw := finishBlock(nil, b.buf, c)
 		raw[0] ^= 0xff // corrupt payload
 		_, err := decodeBlock(raw)
 		assert.Error(t, err)
@@ -204,7 +204,7 @@ func TestDecodeBlockErrors(t *testing.T) {
 	t.Run("unknown_codec_id", func(t *testing.T) {
 		var b blockBuilder
 		b.add([]byte("k"), []byte("v"))
-		raw := finishBlock(nil, b.buf, c, true)
+		raw := finishBlock(nil, b.buf, c)
 		// Rewrite the codec-id byte (just before the 4-byte CRC) to an unknown
 		// value, then repair the CRC so decodeBlock reaches codecFromID.
 		raw[len(raw)-5] = 0xff
@@ -220,7 +220,7 @@ func FuzzDecodeBlock(f *testing.F) {
 	c, _ := codecFromName("none")
 	var b blockBuilder
 	b.add([]byte("k"), []byte("v"))
-	f.Add(finishBlock(nil, b.buf, c, true))
+	f.Add(finishBlock(nil, b.buf, c))
 	f.Add([]byte{})
 	f.Add([]byte{0, 1, 2, 3, 4})
 
@@ -278,107 +278,54 @@ func blockCodecID(raw []byte) codecID {
 	return codecID(raw[len(raw)-blockTrailerLen])
 }
 
-func TestShannonEntropy(t *testing.T) {
-	t.Parallel()
-	// All-same byte: zero entropy.
-	assert.InDelta(t, 0.0, shannonEntropy(bytes.Repeat([]byte{0x41}, 1000)), 1e-9)
-	// Two equally-likely bytes: 1 bit/byte.
-	half := make([]byte, 1000)
-	for i := range half {
-		half[i] = byte(i & 1)
-	}
-	assert.InDelta(t, 1.0, shannonEntropy(half), 1e-9)
-	// A full, uniform 0..255 cycle: 8 bits/byte (max).
-	all := make([]byte, 256)
-	for i := range all {
-		all[i] = byte(i)
-	}
-	assert.InDelta(t, 8.0, shannonEntropy(all), 1e-9)
-	assert.Equal(t, 0.0, shannonEntropy(nil))
-}
-
+// TestFinishBlockConditionalCompression covers the size-check that keeps the
+// codec result only when it actually shrank the payload: a compressible block is
+// compressed, an incompressible block falls back to raw, and no block is ever
+// stored larger than its raw payload.
 func TestFinishBlockConditionalCompression(t *testing.T) {
 	t.Parallel()
 	s2c, err := codecFromName(CodecS2)
 	require.NoError(t, err)
 
 	t.Run("compressible payload is compressed", func(t *testing.T) {
-		payload := bytes.Repeat([]byte("abcdefgh"), 4096) // very low entropy
-		raw := finishBlock(nil, payload, s2c, true)
-		assert.Equal(t, codecS2, blockCodecID(raw), "low-entropy block should compress")
+		payload := bytes.Repeat([]byte("abcdefgh"), 4096)
+		raw := finishBlock(nil, payload, s2c)
+		assert.Equal(t, codecS2, blockCodecID(raw), "compressible block should compress")
 		assert.Less(t, len(raw), len(payload), "compressed smaller than raw")
 		got, err := decodeBlock(raw)
 		require.NoError(t, err)
 		assert.Equal(t, payload, got, "round-trips")
 	})
 
-	t.Run("high-entropy payload stored raw", func(t *testing.T) {
-		// Deterministic near-random bytes via a multiplicative keystream (no rand).
+	t.Run("incompressible payload falls back to raw by size", func(t *testing.T) {
+		// Deterministic near-random bytes via a multiplicative keystream (no rand):
+		// the codec cannot shrink them, so the size-check stores the block raw.
 		payload := make([]byte, 8192)
 		x := uint64(0x9e3779b97f4a7c15)
 		for i := range payload {
 			x = x*6364136223846793005 + 1442695040888963407
 			payload[i] = byte(x >> 56)
 		}
-		require.GreaterOrEqual(t, sampledEntropy(payload), entropySkipBitsPerByte)
-		raw := finishBlock(nil, payload, s2c, true)
-		assert.Equal(t, codecNone, blockCodecID(raw), "high-entropy block stored raw, codec skipped")
-		got, err := decodeBlock(raw)
-		require.NoError(t, err)
-		assert.Equal(t, payload, got, "round-trips")
-	})
-
-	t.Run("never larger than raw (size-check fallback)", func(t *testing.T) {
-		// Small low-entropy payload where the codec still wouldn't shrink below the
-		// raw size: the stored block payload must not exceed raw + trailer.
-		for _, n := range []int{1, 16, 64, 200} {
-			payload := bytes.Repeat([]byte{0x7e}, n)
-			raw := finishBlock(nil, payload, s2c, true)
-			assert.LessOrEqual(t, len(raw), len(payload)+blockTrailerLen,
-				"n=%d: block must never exceed raw payload + trailer", n)
-			got, err := decodeBlock(raw)
-			require.NoError(t, err)
-			assert.Equal(t, payload, got)
-		}
-	})
-}
-
-// TestFinishBlockEntropyDisabled covers the default path where the entropy
-// pre-check is off: the codec is always attempted, and the size-check fallback
-// (not the entropy estimate) decides whether a block is stored raw.
-func TestFinishBlockEntropyDisabled(t *testing.T) {
-	t.Parallel()
-	s2c, err := codecFromName(CodecS2)
-	require.NoError(t, err)
-
-	t.Run("high-entropy payload attempts codec, falls back to raw by size", func(t *testing.T) {
-		// Near-random bytes: the entropy check (if enabled) would skip the codec.
-		// With it disabled the codec runs, and the size-check stores raw because the
-		// result did not shrink, so the block still round-trips and is not larger.
-		payload := make([]byte, 8192)
-		x := uint64(0x9e3779b97f4a7c15)
-		for i := range payload {
-			x = x*6364136223846793005 + 1442695040888963407
-			payload[i] = byte(x >> 56)
-		}
-		require.GreaterOrEqual(t, sampledEntropy(payload), entropySkipBitsPerByte,
-			"payload must be high-entropy for this to test the disabled path")
-		raw := finishBlock(nil, payload, s2c, false)
-		assert.Equal(t, codecNone, blockCodecID(raw), "incompressible block stored raw via size-check, not entropy skip")
+		raw := finishBlock(nil, payload, s2c)
+		assert.Equal(t, codecNone, blockCodecID(raw), "incompressible block stored raw via size-check")
 		assert.LessOrEqual(t, len(raw), len(payload)+blockTrailerLen, "never larger than raw")
 		got, err := decodeBlock(raw)
 		require.NoError(t, err)
 		assert.Equal(t, payload, got, "round-trips")
 	})
 
-	t.Run("compressible payload still compresses", func(t *testing.T) {
-		payload := bytes.Repeat([]byte("abcdefgh"), 4096)
-		raw := finishBlock(nil, payload, s2c, false)
-		assert.Equal(t, codecS2, blockCodecID(raw), "low-entropy block compresses regardless of entropy setting")
-		assert.Less(t, len(raw), len(payload))
-		got, err := decodeBlock(raw)
-		require.NoError(t, err)
-		assert.Equal(t, payload, got)
+	t.Run("never larger than raw (size-check fallback)", func(t *testing.T) {
+		// Small payloads where the codec still wouldn't shrink below the raw size:
+		// the stored block payload must not exceed raw + trailer.
+		for _, n := range []int{1, 16, 64, 200} {
+			payload := bytes.Repeat([]byte{0x7e}, n)
+			raw := finishBlock(nil, payload, s2c)
+			assert.LessOrEqual(t, len(raw), len(payload)+blockTrailerLen,
+				"n=%d: block must never exceed raw payload + trailer", n)
+			got, err := decodeBlock(raw)
+			require.NoError(t, err)
+			assert.Equal(t, payload, got)
+		}
 	})
 }
 
@@ -393,7 +340,7 @@ func FuzzFinishBlockRoundTrip(f *testing.F) {
 		for _, name := range []string{CodecNone, CodecS2, CodecZstd} {
 			c, err := codecFromName(name)
 			require.NoError(t, err)
-			raw := finishBlock(nil, payload, c, true)
+			raw := finishBlock(nil, payload, c)
 			if name != CodecNone {
 				assert.LessOrEqual(t, len(raw), len(payload)+blockTrailerLen, "%s: never larger than raw", name)
 			}

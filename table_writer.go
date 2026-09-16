@@ -30,11 +30,10 @@ const (
 // order. It writes data blocks with the given codec, an index block, an
 // embedded bloom filter, and a footer.
 type tableWriter struct {
-	w           *bufio.Writer
-	c           blockCodec
-	bloom       *bloomFilter
-	blockSize   int
-	entropySkip bool // gate the per-block entropy pre-check in finishBlock
+	w         *bufio.Writer
+	c         blockCodec
+	bloom     *bloomFilter
+	blockSize int
 
 	offset     uint64
 	data       dataBlockBuilder
@@ -94,21 +93,19 @@ func (tw *tableWriter) maxUserKey() []byte {
 // the writer can grow options without widening newTableWriter past the signature
 // limit.
 type tableWriterConfig struct {
-	codec       blockCodec
-	bloomBits   int
-	blockSize   int
-	entropySkip bool
+	codec     blockCodec
+	bloomBits int
+	blockSize int
 }
 
 // NewWriter returns a table Writer over w using the given codec, bloom bits per
-// key, target uncompressed block size, and entropy pre-check setting.
+// key, and target uncompressed block size.
 func newTableWriter(w io.Writer, cfg tableWriterConfig) *tableWriter {
 	return &tableWriter{
-		w:           bufio.NewWriterSize(w, tableWriteBufferSize),
-		c:           cfg.codec,
-		bloom:       newBloom(cfg.bloomBits),
-		blockSize:   cfg.blockSize,
-		entropySkip: cfg.entropySkip,
+		w:         bufio.NewWriterSize(w, tableWriteBufferSize),
+		c:         cfg.codec,
+		bloom:     newBloom(cfg.bloomBits),
+		blockSize: cfg.blockSize,
 	}
 }
 
@@ -171,7 +168,7 @@ func (tw *tableWriter) writeBlock(payload []byte, c blockCodec) blockHandle {
 	if tw.err != nil {
 		return blockHandle{}
 	}
-	block := finishBlock(tw.compScratch, payload, c, tw.entropySkip)
+	block := finishBlock(tw.compScratch, payload, c)
 	tw.compScratch = block // retain the (possibly grown) backing array for reuse
 	if err := writeAll(tw.w, block); err != nil {
 		tw.err = err
@@ -234,8 +231,7 @@ func (tw *tableWriter) writeRawBlock(payload []byte) blockHandle {
 		return blockHandle{}
 	}
 	none, _ := codecFromID(codecNone)
-	// The none codec never triggers the entropy pre-check, so its setting is moot.
-	block := finishBlock(tw.compScratch, payload, none, false)
+	block := finishBlock(tw.compScratch, payload, none)
 	tw.compScratch = block // retain the backing array for reuse
 	if err := writeAll(tw.w, block); err != nil {
 		tw.err = err

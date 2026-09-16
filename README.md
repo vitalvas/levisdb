@@ -22,7 +22,7 @@ not supported.
 - overlap-scoped compaction that merges only key-overlapping tables, bounding read amplification
 - tombstone-density compaction that drains delete-heavy tiers early
 - write backpressure that slows and then stops writers before the tier ladder runs away
-- S2 for fresh data and Zstandard for bottom-tier data, skipped for high-entropy blocks
+- S2 for fresh data and Zstandard for bottom-tier data, with incompressible blocks stored raw
 - Bloom filters, a bounded block cache, and a bounded table descriptor pool
 - non-mutating read-only opens, including in-memory replay of a crash WAL
 - optional ordered WAL observation for replication or change-data capture
@@ -109,7 +109,6 @@ target a single slow spinning disk.
 | `DisableOverlapSelection` | `false` | Merge the whole tier instead of only the largest key-overlapping group. |
 | `FileSizeBase` / `FileSizeMultiplier` / `FileSizeMax` | `2 MiB` / `2` / `16 MiB` | Per-depth output size curve. |
 | `FreshCodec` / `BottomCodec` / `LevelCodecs` | `CodecS2` / `CodecS2` / nil | Compression (`none`/`s2`/`flate`/`zstd`). See [Compression](#compression). |
-| `EntropyCompression` | `false` | Skip the codec on incompressible blocks via an entropy pre-check. |
 | `BloomBits` | `10` | Bloom filter bits per key. |
 | `BlockSize` | `4 KiB` | SSTable data block size in bytes. |
 | `BlockCacheSize` / `DisableBlockCache` | `256 MiB` / `false` | Decoded-block cache capacity; or turn it off. |
@@ -353,13 +352,6 @@ larger than raw. Because each block records its own codec id, changing these
 options only affects tables written afterward; existing tables keep decoding with
 the codec they were written with, and a later compaction re-encodes them under
 the new setting.
-
-`EntropyCompression` (default off) adds a per-block entropy pre-check: a block
-whose sampled Shannon entropy looks incompressible (already-compressed,
-encrypted, or random data) is stored raw *without* attempting the codec, saving
-that CPU. With it off, the codec is always attempted and the size fallback above
-decides. Enable it when much of your data is already compressed and the wasted
-compression attempts cost more than the entropy sampling.
 
 ## Monitoring
 

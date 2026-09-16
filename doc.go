@@ -57,10 +57,8 @@
 // LevelCodecs overrides the codec per depth, falling back to that split for empty
 // entries and depths past its length. Compression is per block: a block that
 // would not shrink is stored raw, so incompressible data is never stored larger
-// than raw.
-// EntropyCompression (default off) additionally skips the codec entirely on
-// blocks whose sampled entropy looks incompressible. Each block records its own
-// codec id, so changing these options affects only tables written afterward.
+// than raw. Each block records its own codec id, so changing these options
+// affects only tables written afterward.
 //
 // # Durability and recovery
 //

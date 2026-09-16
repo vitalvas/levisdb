@@ -321,10 +321,9 @@ func (db *DB) writeIngestTable(num uint32, path string, src *tableReader, seq ui
 		return nil, err
 	}
 	w := newTableWriter(f, tableWriterConfig{
-		codec:       c,
-		bloomBits:   db.eng.cfg.BloomBits,
-		blockSize:   db.eng.cfg.BlockSize,
-		entropySkip: db.eng.cfg.EntropySkip,
+		codec:     c,
+		bloomBits: db.eng.cfg.BloomBits,
+		blockSize: db.eng.cfg.BlockSize,
 	})
 
 	var keyBuf []byte

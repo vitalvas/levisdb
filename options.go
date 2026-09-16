@@ -213,15 +213,6 @@ type Options struct {
 	// id, so changing this only affects tables written afterward.
 	LevelCodecs []string
 
-	// EntropyCompression enables a per-block entropy pre-check: a block whose
-	// sampled Shannon entropy looks incompressible (already-compressed, encrypted,
-	// or random data) is stored raw without attempting the codec, saving that CPU.
-	// The default (false) disables the pre-check and always attempts the codec,
-	// relying on the size-check fallback that stores a block raw when compression
-	// did not shrink it. Enable it when much of the data is already compressed and
-	// the wasted compression attempts cost more than the entropy sampling.
-	EntropyCompression bool
-
 	// WALObserver, if non-nil, receives committed entries for replication/CDC.
 	WALObserver WALObserver
 

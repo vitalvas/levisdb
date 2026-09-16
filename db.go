@@ -419,7 +419,6 @@ func (db *DB) engineConfig() engineConfigT {
 		BlockSize:      db.opts.BlockSize,
 		FreshCodecName: db.opts.FreshCodec,
 		LevelCodecs:    db.opts.LevelCodecs,
-		EntropySkip:    db.opts.EntropyCompression,
 		Cache:          db.cache,
 		FDs:            db.fds,
 		Commit: func(inputs, outputs []*tableMeta, install func()) error {
@@ -452,7 +451,6 @@ func (db *DB) compactionConfig() compactionConfigT {
 		FreshCodecName:     db.opts.FreshCodec,
 		BottomCodecName:    db.opts.BottomCodec,
 		LevelCodecs:        db.opts.LevelCodecs,
-		EntropySkip:        db.opts.EntropyCompression,
 		FileSizeBase:       db.opts.FileSizeBase,
 		FileSizeMultiplier: db.opts.FileSizeMultiplier,
 		FileSizeMax:        db.opts.FileSizeMax,

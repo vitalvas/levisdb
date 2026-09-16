@@ -28,7 +28,6 @@ type compactionConfigT struct {
 	FreshCodecName     string
 	BottomCodecName    string
 	LevelCodecs        []string
-	EntropySkip        bool
 	FileSizeBase       int64
 	FileSizeMultiplier int
 	FileSizeMax        int64
@@ -509,7 +508,6 @@ func (s *engineT) writeMerged(mw mergeWrite) ([]*tableMeta, error) {
 		codec:            c,
 		bloomBits:        mw.cc.BloomBits,
 		blockSize:        mw.cc.BlockSize,
-		entropySkip:      mw.cc.EntropySkip,
 		target:           mw.cc.targetFileSize(mw.depth),
 		pendingRangeDels: rangeDelsToPersist(mw.rangeDels, mw.dropTombstones, mw.retainSeq),
 	}
@@ -673,7 +671,6 @@ type compactionSink struct {
 	depth                int
 	codec                blockCodec
 	bloomBits, blockSize int
-	entropySkip          bool
 	target               int64
 	out                  *compactionOutput
 	metas                []*tableMeta
@@ -702,10 +699,9 @@ func (s *compactionSink) start() error {
 		path: path,
 		f:    f,
 		w: newTableWriter(f, tableWriterConfig{
-			codec:       s.codec,
-			bloomBits:   s.bloomBits,
-			blockSize:   s.blockSize,
-			entropySkip: s.entropySkip,
+			codec:     s.codec,
+			bloomBits: s.bloomBits,
+			blockSize: s.blockSize,
 		}),
 	}
 	return nil

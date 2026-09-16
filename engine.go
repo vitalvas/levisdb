@@ -113,7 +113,6 @@ type engineConfigT struct {
 	BlockSize      int
 	FreshCodecName string
 	LevelCodecs    []string
-	EntropySkip    bool         // enable the per-block entropy pre-check when writing tables
 	Cache          *blockCacheT // shared block cache; nil disables caching
 	FDs            *fdPool      // shared open-descriptor pool; nil keeps files open
 	// Commit durably records a table-set replacement, invokes install while the
@@ -588,10 +587,9 @@ func (s *engineT) writeTable(num uint32, depth int, path string, it *memtableIte
 		return nil, err
 	}
 	w := newTableWriter(f, tableWriterConfig{
-		codec:       c,
-		bloomBits:   s.cfg.BloomBits,
-		blockSize:   s.cfg.BlockSize,
-		entropySkip: s.cfg.EntropySkip,
+		codec:     c,
+		bloomBits: s.cfg.BloomBits,
+		blockSize: s.cfg.BlockSize,
 	})
 	w.setRangeTombstones(rts)
 	for it.Next() {
