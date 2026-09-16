@@ -156,6 +156,25 @@ func (tr *tableReader) rangeTombstones() ([]rangeTombstone, error) {
 	return m.rangeDel, nil
 }
 
+// verify reads and validates every block in the table: it parses the metadata
+// (which reads and CRC-checks the filter, index, and range-del blocks) and then
+// reads every data block, whose CRC and codec are checked by decodeBlock. It
+// returns the first error found, or nil if the whole table is intact. It reads
+// blocks directly (bypassing the block cache) so a cached-but-stale copy cannot
+// mask on-disk corruption.
+func (tr *tableReader) verify() error {
+	m, err := tr.ensureMeta()
+	if err != nil {
+		return err
+	}
+	for i := range m.indexEnt {
+		if _, err := tr.readBlockRaw(m.blockHandleAt(i)); err != nil {
+			return fmt.Errorf("table: data block %d: %w", i, err)
+		}
+	}
+	return nil
+}
+
 // loadMeta reads and parses the filter, index, and (when present) range-del
 // blocks from disk.
 func (tr *tableReader) loadMeta() (*tableMetaBlocks, error) {

@@ -460,6 +460,37 @@ func (s *engineT) hasAtTime(seq uint64, key []byte, now int64) (found, deleted b
 	return bestFound, bestDeleted, nil
 }
 
+// tableFault reports a table that failed integrity verification.
+type tableFault struct {
+	num uint32
+	err error
+}
+
+// verify reads and validates every block of every live table, returning a fault
+// per table that failed its CRC/codec/metadata checks (empty when all intact).
+// Each table is ref-held during its scan so a concurrent compaction cannot free
+// the file mid-read; the engine lock is released for the I/O so verification does
+// not block reads or writes.
+func (s *engineT) verify() []tableFault {
+	s.mu.RLock()
+	held := make([]*tableMeta, 0, len(s.tables))
+	for _, t := range s.tables {
+		if t.acquire() {
+			held = append(held, t)
+		}
+	}
+	s.mu.RUnlock()
+
+	var faults []tableFault
+	for _, t := range held {
+		if err := t.reader.verify(); err != nil {
+			faults = append(faults, tableFault{num: t.num, err: err})
+		}
+		_ = t.releaseRef()
+	}
+	return faults
+}
+
 // rotate seals the active memtable as immutable and installs a fresh active
 // one, so writes continue while the sealed table is flushed. It reports whether
 // there is anything to flush.

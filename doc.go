@@ -129,7 +129,9 @@
 // hits/misses, cumulative compaction/flush/WAL bytes, write stalls).
 // GetProperty returns individual values by LevelDB-style name.
 // Opening a database also publishes a process-wide expvar named "levisdb" mapping
-// each data directory to its stats.
+// each data directory to its stats. Verify is a scrub: it reads every block of
+// every table and reports on-disk corruption (bad CRC, truncated/garbled file)
+// proactively, before a query hits the damaged block, changing nothing on disk.
 //
 // # Concurrency
 //

@@ -219,6 +219,7 @@ Package-level:
 | `IngestExternalFile(path string) error` | Bulk-load a table built by `SstFileWriter`. |
 | `Stats() (Stats, error)` | Point-in-time monitoring snapshot. |
 | `GetProperty(name string) (string, error)` | One named property as a string. |
+| `Verify() ([]CorruptTable, error)` | Scrub: read every table's blocks and report on-disk corruption. |
 | `Close() error` | Flush, retire the WAL, release resources. |
 
 `*Batch`: `Put(PutOptions)`, `Delete(key []byte)`, `DeleteRange(start, end []byte)`,
@@ -374,6 +375,16 @@ Opening a database also publishes a process-wide `expvar` named `levisdb`, a
 map of data directory to its stats, so a `net/http/pprof` or `expvar` HTTP
 handler exposes every open database with no extra wiring. Closing a database
 removes it from that view.
+
+`Verify` is a scrub for proactive integrity checking: it reads every block of
+every on-disk table and forces the per-block CRC32C check that reads already
+perform, so bit rot or a truncated file is caught before a query happens to hit
+the damaged block. It returns the corrupt tables (`[]CorruptTable`) and changes
+nothing on disk; a caller with a replica or backup can then restore or
+re-replicate them. It is I/O-heavy on a large database and does not block writes,
+so run it during quiet periods. Reads already fail safe on corruption (a bad CRC
+errors rather than returning wrong data); Verify only makes the detection
+proactive rather than lazy.
 
 ## Errors
 
