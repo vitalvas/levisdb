@@ -92,6 +92,22 @@ func (w *SstFileWriter) PutTTL(key, value []byte, ttl time.Duration) error {
 	return w.add(key, encodeExpiringValue(value, expiresAt), ikeyKindSetTTL)
 }
 
+// bytesWritten reports the compressed on-disk bytes flushed so far, so a caller
+// building a multi-file image can roll to a new file at a size target.
+func (w *SstFileWriter) bytesWritten() int64 { return w.tw.bytesWritten() }
+
+// PutWithExpiry adds a key/value pair with an absolute expiration (Unix nanos),
+// preserving an exact stored deadline rather than re-deriving one from the wall
+// clock the way PutTTL does. expiresAt must be positive. Keys must be added in
+// strictly ascending order. It is used to reproduce a source value's precise
+// expiry when building a bootstrap image (see Snapshot.WriteTo).
+func (w *SstFileWriter) PutWithExpiry(key, value []byte, expiresAt int64) error {
+	if expiresAt <= 0 {
+		return ErrInvalidTTL
+	}
+	return w.add(key, encodeExpiringValue(value, expiresAt), ikeyKindSetTTL)
+}
+
 // Delete adds a tombstone for key, so ingesting the file removes that key.
 func (w *SstFileWriter) Delete(key []byte) error {
 	return w.add(key, nil, ikeyKindDelete)
@@ -145,6 +161,18 @@ func (w *SstFileWriter) Finish() error {
 		return err
 	}
 	return w.f.Close()
+}
+
+// discard closes and removes the file without finishing it, for a caller that
+// built no entries (Finish rejects empty) or hit an error mid-build and must not
+// leave a partial table behind. It mirrors Finish's own empty-file cleanup.
+func (w *SstFileWriter) discard() {
+	if w.closed {
+		return
+	}
+	w.closed = true
+	_ = w.f.Close()
+	_ = removeFileDurable(w.path)
 }
 
 // IngestExternalFile loads a table built by SstFileWriter into the database in

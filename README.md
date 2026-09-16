@@ -227,10 +227,15 @@ Package-level:
 `*WALUpdates`: `Next() bool`, `Batch() []WALEntry`, `Error() error`, `Close() error`.
 
 `*SstFileWriter`: `NewSstFileWriter(path, SstWriterOptions)`, then `Put`,
-`PutTTL`, `Delete` (keys ascending), `Finish()`.
+`PutTTL`, `PutWithExpiry` (exact absolute deadline), `Delete` (keys ascending),
+`Finish()`.
 
 `*Snapshot`: `Get`, `Has`, `NewIterator`, `NewRangeIterator` (same signatures as
-the `*DB` reads, fixed to the snapshot's sequence), `Seq() uint64`, `Release()`.
+the `*DB` reads, fixed to the snapshot's sequence), `WriteTo(path,
+SstWriterOptions) (uint64, error)` (write a single-file base image for follower
+bootstrap; returns the resume seq), `WriteToDir(dir, SstWriterOptions,
+maxFileBytes int64) ([]string, uint64, error)` (same, rolled into bounded files
+for a large database), `Seq() uint64`, `Release()`.
 
 `Iterator` (interface): `Next() bool`, `Key() []byte`, `Value() []byte`,
 `Error() error`, `Close() error`. Key and value slices are valid only until the
@@ -405,9 +410,8 @@ mutations already flushed and retired, enable retention with `WALRetention` (a
 duration) and/or `WALRetentionBytes`; flushed segments are then kept until they
 are past *both* horizons. A request below the retained horizon returns
 `ErrRetentionExpired`, signalling the consumer to re-bootstrap from a `Snapshot`
-(iterate it, remember `Seq()`) and resume `GetUpdatesSince` from there. Delivery
-is at-least-once: a consumer may re-see entries after a crash, so it must be
-idempotent.
+and resume `GetUpdatesSince` from there. Delivery is at-least-once: a consumer
+may re-see entries after a crash, so it must be idempotent.
 
 ```go
 u, err := db.GetUpdatesSince(lastApplied)
@@ -423,11 +427,43 @@ for u.Next() {
 }
 ```
 
-For bulk load, build a table offline with `SstFileWriter` (keys ascending) and
-load it with `IngestExternalFile`. The whole file is assigned one fresh sequence
-above every committed write and installed at the bottom tier, so its keys become
-the newest version of whatever they carry. The file's key range must not overlap
-keys still in the memtable; overlapping already-flushed tables is fine.
+To bootstrap a follower with the existing data (the base the tail builds on),
+take a `Snapshot` and call `WriteTo`: it writes the pinned data as an ingestible
+table and returns the sequence to resume the tail from. TTL entries keep their
+exact stored deadline, so the follower's expiry matches what the tail delivers.
+The follower must be fresh or quiesced, since `IngestExternalFile` rejects a file
+overlapping keys still live in its memtable.
+
+```go
+snap, err := db.Snapshot()
+if err != nil {
+	return err
+}
+defer snap.Release()
+resume, err := snap.WriteTo(basePath, levisdb.SstWriterOptions{})
+if err != nil {
+	return err
+}
+// ship basePath to the follower, then on the follower:
+//   follower.IngestExternalFile(basePath)
+//   follower.GetUpdatesSince(resume) // resume the tail with no gap
+```
+
+`WriteTo` puts the whole snapshot in one file. For a large (multi-terabyte)
+database use `WriteToDir`, which rolls the image into bounded files (at
+`maxFileBytes`, or `FileSizeMax` when zero) that the follower ingests one at a
+time and compacts as normal-sized tables; it returns the ordered chunk paths and
+the same resume seq. One snapshot pins the read view for the whole scan, so all
+chunks are consistent — but on a large database that scan is long and holds
+versions on the source (growing its disk) until it finishes and the snapshot is
+released.
+
+For bulk load unrelated to replication, build a table offline with
+`SstFileWriter` (keys ascending) and load it with `IngestExternalFile`. The whole
+file is assigned one fresh sequence above every committed write and installed at
+the bottom tier, so its keys become the newest version of whatever they carry.
+The file's key range must not overlap keys still in the memtable; overlapping
+already-flushed tables is fine.
 
 ## Write-ahead log
 

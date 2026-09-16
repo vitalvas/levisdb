@@ -11,16 +11,17 @@ import (
 // flushing memtable, and all tables, keeps the newest version at or below seq
 // for each user key, and skips tombstones.
 type engineIterator struct {
-	merge    *mergeIter
-	seq      uint64
-	readTime int64
-	start    []byte // inclusive lower bound, nil for unbounded
-	end      []byte // exclusive upper bound, nil for unbounded
-	key      []byte
-	value    []byte
-	lastKey  []byte
-	primed   bool
-	refs     []*tableMeta
+	merge     *mergeIter
+	seq       uint64
+	readTime  int64
+	start     []byte // inclusive lower bound, nil for unbounded
+	end       []byte // exclusive upper bound, nil for unbounded
+	key       []byte
+	value     []byte
+	expiresAt int64 // absolute deadline (Unix nanos) of the current TTL entry, 0 otherwise
+	lastKey   []byte
+	primed    bool
+	refs      []*tableMeta
 	// rts are the range tombstones from every source, captured at creation so the
 	// scan is snapshot-consistent. A key's deciding version is skipped when a
 	// visible range tombstone newer than it covers the key.
@@ -138,6 +139,7 @@ func (it *engineIterator) Next() bool {
 			continue
 		}
 		value := it.merge.Value()
+		var entryExpiry int64
 		if kind == ikeyKindSetTTL {
 			var expiresAt int64
 			var err error
@@ -150,6 +152,7 @@ func (it *engineIterator) Next() bool {
 			if expiresAt <= it.readTime {
 				continue
 			}
+			entryExpiry = expiresAt
 		}
 		// Return the merge iterator's buffers directly rather than copying: they are
 		// stable until this iterator advances again (it.merge.Next in the loop
@@ -158,6 +161,7 @@ func (it *engineIterator) Next() bool {
 		// advances, so the public value the caller sees is still stable.
 		it.key = user
 		it.value = value
+		it.expiresAt = entryExpiry
 		return true
 	}
 	it.err = it.merge.Error()
@@ -172,6 +176,10 @@ func (it *engineIterator) Key() []byte { return it.key }
 // Value returns the current value. The slice is valid only until the next call
 // to Next; copy it to retain.
 func (it *engineIterator) Value() []byte { return it.value }
+
+// valueExpiresAt returns the absolute expiration (Unix nanos) of the current
+// entry, or 0 when it has no TTL. Valid only until the next call to Next.
+func (it *engineIterator) valueExpiresAt() int64 { return it.expiresAt }
 
 func (it *engineIterator) Error() error { return it.err }
 

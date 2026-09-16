@@ -109,9 +109,13 @@
 // behind; enable WALRetention / WALRetentionBytes to keep flushed WAL segments
 // long enough to serve them, or GetUpdatesSince covers only the live segment. A
 // request below the retained horizon returns ErrRetentionExpired, signalling the
-// consumer to re-bootstrap from a Snapshot. Delivery is at-least-once, so
-// consumers must be idempotent. For bulk load, SstFileWriter builds a table
-// offline and IngestExternalFile installs it at one fresh sequence.
+// consumer to re-bootstrap from a Snapshot. Snapshot.WriteTo writes the pinned
+// data as an ingestible base image and returns the sequence to resume the tail
+// from, preserving exact TTL deadlines, so a bootstrap closes the gap the
+// tail-only helpers leave; WriteToDir rolls that image into bounded files for a
+// large database. Delivery is at-least-once, so consumers must be idempotent. For
+// bulk load, SstFileWriter builds a table offline and IngestExternalFile installs
+// it at one fresh sequence.
 //
 // # Size limits
 //
