@@ -71,7 +71,7 @@ func (s *Snapshot) WriteTo(path string, opts SstWriterOptions) (uint64, error) {
 	finished := false
 	defer func() {
 		if !finished {
-			w.discard()
+			_ = w.Close()
 		}
 	}()
 
@@ -136,7 +136,7 @@ func (s *Snapshot) WriteToDir(dir string, opts SstWriterOptions, maxFileBytes in
 	// already closed and stay.
 	defer func() {
 		if w != nil {
-			w.discard()
+			_ = w.Close()
 		}
 	}()
 

@@ -17,6 +17,7 @@ func openIterDB(t *testing.T) *DB {
 	// then genuinely merge across several on-disk tables, and the test avoids the
 	// compaction churn that dominated its runtime.
 	o.TierRatio = 1000
+	o.L0StopTables = -1 // keep read fixtures without backpressure
 	o.FreshCodec = CodecNone
 	o.BottomCodec = CodecNone
 	o.NoSync = true // iterator tests exercise reads, not durability fsyncs

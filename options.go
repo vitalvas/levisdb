@@ -155,8 +155,9 @@ type Options struct {
 	// number of fresh-tier (depth 0) tables, so a write burst cannot outrun the
 	// serialized compactor and grow the tier ladder without bound. When the
 	// depth-0 table count reaches L0SlowdownTables, writes are briefly delayed; at
-	// L0StopTables they block until the scheduler drains below the slowdown mark.
-	// L0StopTables must be >= L0SlowdownTables. Zero uses the defaults; a negative
+	// L0StopTables they block until the scheduler drains below the stop threshold.
+	// L0StopTables must be >= L0SlowdownTables and TierRatio so compaction can
+	// drain a stopped writer's backlog. Zero uses the defaults; a negative
 	// value disables that threshold.
 	L0SlowdownTables int
 	L0StopTables     int
@@ -377,6 +378,9 @@ func (o *Options) validate() error {
 	}
 	if o.L0SlowdownTables > 0 && o.L0StopTables > 0 && o.L0StopTables < o.L0SlowdownTables {
 		return fmt.Errorf("levisdb: L0StopTables (%d) must be >= L0SlowdownTables (%d)", o.L0StopTables, o.L0SlowdownTables)
+	}
+	if o.L0StopTables > 0 && o.L0StopTables < o.TierRatio {
+		return fmt.Errorf("levisdb: L0StopTables (%d) must be >= TierRatio (%d)", o.L0StopTables, o.TierRatio)
 	}
 	if o.FileSizeBase < 1 {
 		return fmt.Errorf("levisdb: FileSizeBase must be positive, got %d", o.FileSizeBase)

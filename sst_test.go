@@ -1,6 +1,7 @@
 package levisdb
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -23,6 +24,41 @@ func buildSST(t *testing.T, dir, name string, puts [][2]string) string {
 	}
 	require.NoError(t, w.Finish())
 	return path
+}
+
+func TestIngestRequiresReplicationBootstrap(t *testing.T) {
+	t.Parallel()
+	db := openTestDB(t, func(o *Options) { o.WALRetention = time.Hour })
+	require.NoError(t, db.Put(PutOptions{Key: []byte("a"), Value: []byte("before")}))
+	path := buildSST(t, t.TempDir(), "image", [][2]string{{"b", "ingested"}})
+	require.NoError(t, db.IngestExternalFile(path))
+	ingested := db.LatestSeq()
+	updates, err := db.GetUpdatesSince(0)
+	require.ErrorIs(t, err, ErrRetentionExpired)
+	require.Nil(t, updates)
+	require.Empty(t, drainUpdates(t, db, ingested))
+	require.NoError(t, db.Put(PutOptions{Key: []byte("c"), Value: []byte("after")}))
+	tail := drainUpdates(t, db, ingested)
+	require.Len(t, tail, 1)
+	assert.Equal(t, ingested+1, tail[0].Seq)
+}
+
+func TestFailedIngestDoesNotLeaveWALGap(t *testing.T) {
+	t.Parallel()
+	src := newTestEngine(t, 1<<20)
+	src.Put(1, []byte("b"), []byte("old"))
+	src.Put(2, []byte("b"), []byte("new"))
+	require.NoError(t, src.Flush())
+	db := openTestDB(t, nil)
+	require.NoError(t, db.Put(PutOptions{Key: []byte("a"), Value: []byte("before")}))
+	// Restamping both source versions to the ingest sequence fails during the
+	// build, after the sequence has been reserved but before anything publishes.
+	require.ErrorContains(t, db.IngestExternalFile(src.tables[0].path), "out of order")
+	require.NoError(t, db.Put(PutOptions{Key: []byte("c"), Value: []byte("after")}))
+	updates := drainUpdates(t, db, 0)
+	require.Len(t, updates, 2)
+	assert.Equal(t, uint64(1), updates[0].Seq)
+	assert.Equal(t, uint64(2), updates[1].Seq)
 }
 
 func TestSstIngestRoundTrip(t *testing.T) {
@@ -108,6 +144,7 @@ func TestSstWriterRejectsUnorderedKeys(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "bad.sst")
 	w, err := NewSstFileWriter(path, SstWriterOptions{})
 	require.NoError(t, err)
+	defer w.Close()
 	require.NoError(t, w.Put([]byte("b"), []byte("1")))
 	err = w.Put([]byte("a"), []byte("2"))
 	require.Error(t, err)
@@ -182,4 +219,118 @@ func TestIngestRejectsRangeTombstones(t *testing.T) {
 	// The rejected ingest changed nothing: no key from the file is present.
 	_, err = db.Get([]byte("k00"))
 	assert.ErrorIs(t, err, ErrNotFound)
+}
+
+func TestRegressionIngestTombstoneGC(t *testing.T) {
+	t.Parallel()
+	db := openTestDB(t, func(o *Options) { o.MemtableSize = 1 << 30 })
+	require.NoError(t, db.Put(PutOptions{Key: []byte("k"), Value: []byte("old")}))
+	require.NoError(t, db.eng.Flush())
+	require.NoError(t, db.Put(PutOptions{Key: []byte("j"), Value: []byte("filler")}))
+	require.NoError(t, db.eng.Flush())
+	require.NoError(t, db.eng.Compact(0, db.LatestSeq(), db.compactionConfig()))
+	for _, key := range []string{"k", "z"} {
+		path := filepath.Join(t.TempDir(), "input.sst")
+		w, err := NewSstFileWriter(path, SstWriterOptions{})
+		require.NoError(t, err)
+		require.NoError(t, w.Delete([]byte(key)))
+		require.NoError(t, w.Finish())
+		require.NoError(t, db.IngestExternalFile(path))
+	}
+	_, err := db.Get([]byte("k"))
+	require.ErrorIs(t, err, ErrNotFound)
+	db.flushEngine() // the ordinary background picker selects the delete-heavy bottom tier
+	require.NoError(t, db.backgroundError())
+	v, err := db.Get([]byte("k"))
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("ingested deletion lost during bottom compaction: value=%q err=%v", v, err)
+	}
+}
+
+func TestRegressionIngestManifestSyncFailure(t *testing.T) {
+	t.Parallel()
+	opts := DefaultOptions(t.TempDir())
+	db, err := Open(opts)
+	require.NoError(t, err)
+	path := filepath.Join(t.TempDir(), "input.sst")
+	w, err := NewSstFileWriter(path, SstWriterOptions{})
+	require.NoError(t, err)
+	require.NoError(t, w.Put([]byte("k"), []byte("v")))
+	require.NoError(t, w.Finish())
+	db.man.syncFile = func() error { return errors.New("injected fsync failure") }
+	require.Error(t, db.IngestExternalFile(path))
+	db.crash()
+	reopened, err := Open(opts)
+	if reopened != nil {
+		defer reopened.Close()
+	}
+	if err != nil {
+		t.Fatalf("ingest error deleted table already referenced by manifest, preventing reopen: %v", err)
+	}
+}
+
+func TestRegressionSSTWriterErrorLeaksFile(t *testing.T) {
+	t.Parallel()
+	w, err := NewSstFileWriter(filepath.Join(t.TempDir(), "input.sst"), SstWriterOptions{})
+	require.NoError(t, err)
+	defer w.Close()
+	require.NoError(t, w.Put([]byte("z"), []byte("v")))
+	require.Error(t, w.Put([]byte("a"), []byte("v")))
+	require.Error(t, w.Finish())
+	if _, err := w.f.Stat(); !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("Finish after Put error leaves file open, no public Close/Abort exists: %v", err)
+	}
+}
+
+func TestSSTWriterClosePreservesOnlyFinishedFiles(t *testing.T) {
+	t.Parallel()
+	for _, finish := range []bool{false, true} {
+		t.Run(map[bool]string{false: "abort", true: "finished"}[finish], func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "output.sst")
+			w, err := NewSstFileWriter(path, SstWriterOptions{})
+			require.NoError(t, err)
+			require.NoError(t, w.Put([]byte("k"), []byte("v")))
+			if finish {
+				require.NoError(t, w.Finish())
+			}
+			require.NoError(t, w.Close())
+			require.NoError(t, w.Close())
+			_, err = w.f.Stat()
+			require.ErrorIs(t, err, os.ErrClosed)
+			_, err = os.Stat(path)
+			if finish {
+				require.NoError(t, err)
+			} else {
+				require.ErrorIs(t, err, os.ErrNotExist)
+			}
+		})
+	}
+}
+
+func TestIngestedDeletionCompactionPreservesSnapshot(t *testing.T) {
+	t.Parallel()
+	db := openTestDB(t, func(o *Options) { o.MemtableSize = 1 << 30 })
+	require.NoError(t, db.Put(PutOptions{Key: []byte("k"), Value: []byte("old")}))
+	require.NoError(t, db.eng.Flush())
+	snapshot, err := db.Snapshot()
+	require.NoError(t, err)
+	defer snapshot.Release()
+	for _, key := range []string{"k", "z"} {
+		path := filepath.Join(t.TempDir(), "input.sst")
+		w, err := NewSstFileWriter(path, SstWriterOptions{})
+		require.NoError(t, err)
+		require.NoError(t, w.Delete([]byte(key)))
+		require.NoError(t, w.Finish())
+		require.NoError(t, db.IngestExternalFile(path))
+	}
+	require.NoError(t, db.eng.Compact(maxTierDepth, snapshot.Seq(), db.compactionConfig()))
+	v, err := snapshot.Get([]byte("k"))
+	require.NoError(t, err)
+	require.Equal(t, "old", string(v))
+	_, err = db.Get([]byte("k"))
+	require.ErrorIs(t, err, ErrNotFound)
+	snapshot.Release()
+	require.NoError(t, db.CompactRange(nil, nil))
+	_, err = db.Get([]byte("k"))
+	require.ErrorIs(t, err, ErrNotFound)
 }

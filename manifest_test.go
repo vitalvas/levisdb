@@ -18,6 +18,7 @@ func TestManifestEditEncodeDecode(t *testing.T) {
 		{"empty", manifestEdit{}},
 		{"identity", manifestEdit{HasIdentity: true}},
 		{"last-seq", manifestEdit{HasLastSeq: true, LastSeq: 999}},
+		{"recovery-log", manifestEdit{ReplayLogNum: 42}},
 		{"add-delete", manifestEdit{
 			Added: []manifestTableInfo{
 				{Num: 7, Depth: 2, Size: 4096},
@@ -60,6 +61,7 @@ func TestManifestEditEncodeDecode(t *testing.T) {
 			assert.Equal(t, tc.edit.HasIdentity, got.HasIdentity)
 			assert.Equal(t, tc.edit.HasLastSeq, got.HasLastSeq)
 			assert.Equal(t, tc.edit.LastSeq, got.LastSeq)
+			assert.Equal(t, tc.edit.ReplayLogNum, got.ReplayLogNum)
 			assert.Equal(t, tc.edit.Added, got.Added)
 			assert.Equal(t, tc.edit.Deleted, got.Deleted)
 		})
@@ -119,6 +121,10 @@ func TestDecodeEditErrors(t *testing.T) {
 		{"missing-end-tag", []byte{tagLastSeq, 1}},
 		{"duplicate-identity", []byte{tagIdentity, tagIdentity, tagEnd}},
 		{"duplicate-last-seq", []byte{tagLastSeq, 1, tagLastSeq, 2, tagEnd}},
+		{"bad-recovery-log", []byte{tagReplayLog}},
+		{"zero-recovery-log", []byte{tagReplayLog, 0, tagEnd}},
+		{"duplicate-recovery-log", []byte{tagReplayLog, 1, tagReplayLog, 2, tagEnd}},
+		{"overflow-recovery-log", []byte{tagReplayLog, 0x80, 0x80, 0x80, 0x80, 0x10, tagEnd}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -14,11 +14,12 @@ import (
 
 // DB is an open levisdb database.
 type DB struct {
-	opts   Options
-	store  *storageT
-	alloc  *allocatorT
-	man    *manifestWriter
-	manNum uint32 // file number of the live manifest, for rotation cleanup
+	opts         Options
+	store        *storageT
+	alloc        *allocatorT
+	man          *manifestWriter
+	manNum       uint32 // file number of the live manifest, for rotation cleanup
+	replayLogNum uint32 // first WAL needed for recovery; guarded by manMu after Open
 	// wal is the single write-ahead log and the segment bookkeeping the
 	// checkpoint uses to rotate and retire it.
 	wal *dbWAL
@@ -33,9 +34,9 @@ type DB struct {
 	// batch applies, so snapshot reads never observe a half-applied batch.
 	walSeq  atomic.Uint64
 	readSeq atomic.Uint64 // highest committed sequence, for snapshot reads
-	// filterSafeSeq is the highest sequence whose WAL segment has been retired
-	// after a flush. A compaction filter may physically discard only versions at
-	// or below this point, or crash replay could resurrect them.
+	// filterSafeSeq is the highest sequence whose WAL segment is excluded from
+	// recovery by the durable manifest. A filter may physically discard only
+	// versions at or below this point, or crash replay could resurrect them.
 	filterSafeSeq atomic.Uint64
 
 	sched *scheduler   // serializes flush + compaction off the write path
@@ -85,12 +86,10 @@ type dbWAL struct {
 	file    *os.File
 	num     uint32   // live segment file number
 	retired []uint32 // rotated-out segments awaiting removal after their flush
-	// reapedThroughSeq is the highest sequence whose retained segment the reaper
-	// has deleted. GetUpdatesSince cannot serve a sequence at or below it, so a
-	// request there returns ErrRetentionExpired. Only used when WAL retention is
-	// enabled; retained segments themselves live on disk, not in memory. Atomic
-	// because the reaper writes it under db.checkpointMu while GetUpdatesSince
-	// reads it under db.mu - different locks, so a plain field would race.
+	// reapedThroughSeq is the oldest usable catch-up watermark. Restart, WAL
+	// reaping, and ingestion advance it when earlier mutations cannot be served.
+	// Atomic because ingestion advances it under db.mu while the reaper uses
+	// checkpointMu; concurrent advances must never move the horizon backward.
 	reapedThroughSeq atomic.Uint64
 }
 
@@ -281,6 +280,7 @@ func (db *DB) load() error {
 			return err
 		}
 		startSeq = state.LastSeq
+		db.replayLogNum = state.ReplayLogNum
 	}
 
 	// Existing WAL segments (from a crash) and the current manifest number come
@@ -330,6 +330,9 @@ func (db *DB) load() error {
 	if err := db.openWAL(startSeq); err != nil {
 		return err
 	}
+	// Recovery flushed every replayed entry; the new baseline can exclude all
+	// earlier segments even if a crash interrupts their subsequent deletion.
+	db.replayLogNum = db.wal.num
 	if err := db.openManifest(); err != nil {
 		return err
 	}
@@ -467,16 +470,18 @@ func (db *DB) compactionConfig() compactionConfigT {
 // reads until release is called.
 func (db *DB) compactionRunConfig(forceCheckpoint bool) (retain uint64, cc compactionConfigT, release func(), err error) {
 	cc = db.compactionConfig()
-	if cc.Filter != nil && db.snaps.beginCompactionFilter() {
-		safe := db.filterSafeSeq.Load()
-		if forceCheckpoint {
-			var prepareErr error
-			safe, prepareErr = db.prepareCompactionFilter()
-			if prepareErr != nil {
-				db.snaps.endCompactionFilter()
-				return 0, compactionConfigT{}, func() {}, prepareErr
-			}
+	// Checkpoint before reserving the filter interval. Readers wait for that
+	// interval while holding db.mu.RLock; checkpoint/Close must never wait on
+	// those readers while a filter reservation waits for checkpointMu.
+	if cc.Filter != nil && forceCheckpoint {
+		if _, prepareErr := db.prepareCompactionFilter(); prepareErr != nil {
+			return 0, compactionConfigT{}, func() {}, prepareErr
 		}
+	}
+	safe := db.filterSafeSeq.Load()
+	// Zero means unbounded for standalone engine users, so a DB must disable
+	// filtering entirely when no sequence has yet become recovery-safe.
+	if cc.Filter != nil && safe != 0 && db.snaps.beginCompactionFilter() {
 		cc.FilterThrough = safe
 		return db.readSeq.Load(), cc, db.snaps.endCompactionFilter, nil
 	}
@@ -509,6 +514,7 @@ func (db *DB) openWAL(startSeq uint64) error {
 	w := newWAL(f, db.walBridge(), walConfig{sync: !db.opts.NoSync})
 	w.apply = db.applyCommitted
 	db.wal = &dbWAL{wal: w, file: f, num: num}
+	db.wal.reapedThroughSeq.Store(startSeq)
 	return nil
 }
 
@@ -539,7 +545,7 @@ func (db *DB) openManifest() error {
 }
 
 // newManifestWithBaseline creates a new manifest file and writes a baseline
-// edit capturing every live table plus the committed-sequence watermark, so a
+// edit capturing every live table plus the allocated-sequence watermark, so a
 // reopen can reconstruct the full state from this one manifest without the
 // history that preceded it. It does not touch CURRENT.
 func (db *DB) newManifestWithBaseline() (*manifestWriter, uint32, error) {
@@ -552,7 +558,7 @@ func (db *DB) newManifestWithBaseline() (*manifestWriter, uint32, error) {
 		return nil, 0, err
 	}
 
-	edit := manifestEdit{HasLastSeq: true, LastSeq: db.readSeq.Load()}
+	edit := manifestEdit{HasLastSeq: true, LastSeq: db.walSeq.Load(), ReplayLogNum: db.replayLogNum}
 	for _, t := range db.eng.Tables() {
 		edit.Added = append(edit.Added, manifestTableInfo(t))
 	}
@@ -1199,7 +1205,7 @@ func (db *DB) checkpointWALMode(force bool) (uint64, error) {
 		return db.filterSafeSeq.Load(), err
 	}
 	oldNum := db.wal.num
-	oldFile, err := db.wal.wal.rotate(f)
+	oldFile, cutoff, err := db.wal.wal.rotate(f, &db.readSeq)
 	if err != nil {
 		_ = f.Close()
 		_ = removeFileDurable(path)
@@ -1212,16 +1218,6 @@ func (db *DB) checkpointWALMode(force bool) (uint64, error) {
 		return db.filterSafeSeq.Load(), err
 	}
 
-	// readSeq is a true contiguous watermark: a writer holds db.mu.RLock across
-	// its whole batch (apply then publish), and there is one commit stream, so
-	// once the current writers drain past apply every seq <= readSeq is applied.
-	// Take db.mu exclusively for the instant of the read to drain in-flight
-	// writers, so the cutoff never precedes an un-applied write; without it a
-	// crash could replay a value a compaction filter dropped from a table.
-	db.mu.Lock()
-	cutoff := db.readSeq.Load()
-	db.mu.Unlock()
-
 	// Two passes cover the case where an immutable memtable already existed when
 	// the checkpoint began: the first drains it, the second captures the active
 	// table that contains every write from the retired segment.
@@ -1229,6 +1225,23 @@ func (db *DB) checkpointWALMode(force bool) (uint64, error) {
 		return db.filterSafeSeq.Load(), err
 	}
 	if err := db.eng.Flush(); err != nil {
+		return db.filterSafeSeq.Load(), err
+	}
+	if err := db.backgroundError(); err != nil {
+		return db.filterSafeSeq.Load(), err
+	}
+	// Record the recovery boundary before allowing filters to discard versions.
+	// Retained logs remain available to CDC, but must never be replayed into the
+	// filtered table set. Serialize this edit and baseline rotation together.
+	db.manMu.Lock()
+	err = db.man.append(&manifestEdit{ReplayLogNum: num})
+	if err == nil {
+		db.replayLogNum = num
+		db.maybeRotateManifest()
+	}
+	db.manMu.Unlock()
+	if err != nil {
+		db.setBackgroundError(err)
 		return db.filterSafeSeq.Load(), err
 	}
 	if err := db.backgroundError(); err != nil {

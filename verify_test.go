@@ -45,10 +45,15 @@ func flipByteInDataRegion(t *testing.T, path string) {
 func TestVerifyCleanDatabase(t *testing.T) {
 	t.Parallel()
 	db := openTestDB(t, func(o *Options) { o.MemtableSize = 4 << 10 })
-	for i := 0; i < 300; i++ {
-		require.NoError(t, db.Put(PutOptions{Key: []byte(fmt.Sprintf("k%05d", i)), Value: []byte("value-payload")}))
+	for start := 0; start < 300; start += 150 {
+		var batch Batch
+		for i := start; i < start+150; i++ {
+			batch.Put(PutOptions{Key: []byte(fmt.Sprintf("k%05d", i)), Value: []byte("value-payload")})
+		}
+		require.NoError(t, db.Write(&batch))
+		db.sched.drain()
 	}
-	db.sched.drain()
+	require.NotEmpty(t, db.eng.Tables())
 
 	faults, err := db.Verify()
 	require.NoError(t, err)
@@ -64,9 +69,11 @@ func TestVerifyDetectsCorruptBlock(t *testing.T) {
 	db, err := Open(o)
 	require.NoError(t, err)
 
+	var batch Batch
 	for i := 0; i < 300; i++ {
-		require.NoError(t, db.Put(PutOptions{Key: []byte(fmt.Sprintf("k%05d", i)), Value: []byte("value-payload")}))
+		batch.Put(PutOptions{Key: []byte(fmt.Sprintf("k%05d", i)), Value: []byte("value-payload")})
 	}
+	require.NoError(t, db.Write(&batch))
 	// Force everything to disk in a settled table set.
 	require.NoError(t, db.CompactRange(nil, nil))
 
@@ -110,4 +117,27 @@ func TestVerifyClosedDB(t *testing.T) {
 	require.NoError(t, db.Close())
 	_, err := db.Verify()
 	assert.ErrorIs(t, err, ErrClosed)
+}
+
+func TestRegressionVerifyCachedMetadata(t *testing.T) {
+	t.Parallel()
+	db := openTestDB(t, nil)
+	require.NoError(t, db.Put(PutOptions{Key: []byte("k"), Value: []byte("v")}))
+	require.NoError(t, db.eng.Flush())
+	table := db.eng.tables[0]
+	f, err := os.OpenFile(table.path, os.O_RDWR, 0)
+	require.NoError(t, err)
+	off := int64(table.reader.filterBH.offset)
+	b := make([]byte, 1)
+	_, err = f.ReadAt(b, off)
+	require.NoError(t, err)
+	b[0] ^= 0xff
+	_, err = f.WriteAt(b, off)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+	faults, err := db.Verify()
+	require.NoError(t, err)
+	if len(faults) == 0 {
+		t.Fatal("Verify reported intact table after filter block was corrupted on disk")
+	}
 }

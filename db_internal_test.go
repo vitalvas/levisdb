@@ -74,11 +74,20 @@ func TestRecoverMixedFlushedAndWAL(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 
-	db := openAt(t, dir, 512) // small: some data flushes, some stays in WAL
-	for i := 0; i < 150; i++ {
-		require.NoError(t, db.Put(PutOptions{Key: []byte(fmt.Sprintf("key%03d", i)), Value: []byte(fmt.Sprintf("v%d", i))}))
+	db := openAt(t, dir, 1<<30)
+	for start := 0; start < 150; start += 75 {
+		var batch Batch
+		for i := start; i < start+75; i++ {
+			batch.Put(PutOptions{Key: []byte(fmt.Sprintf("key%03d", i)), Value: []byte(fmt.Sprintf("v%d", i))})
+		}
+		require.NoError(t, db.Write(&batch))
+		if start == 0 {
+			require.NoError(t, db.eng.Flush())
+		}
 	}
-	db.sched.drain() // let background flushes settle
+	// Guarantee both recovery sources exist instead of relying on flush timing.
+	require.NotEmpty(t, db.eng.Tables())
+	require.False(t, db.eng.memEmpty())
 	db.crash()
 
 	db2 := openAt(t, dir, 512)
@@ -144,10 +153,7 @@ func TestRestoreTablesMissingFileErrors(t *testing.T) {
 
 	// Write and flush data so at least one .sst table exists, then close cleanly.
 	db := openAt(t, dir, 512)
-	for i := 0; i < 200; i++ {
-		require.NoError(t, db.Put(PutOptions{Key: []byte(fmt.Sprintf("key%03d", i)), Value: []byte("v")}))
-	}
-	db.sched.drain()
+	require.NoError(t, db.Put(PutOptions{Key: []byte("key"), Value: []byte("v")}))
 	require.NoError(t, db.Close())
 
 	// Delete one .sst table the manifest references; reopen must fail because
@@ -475,28 +481,31 @@ func TestManifestNoAccumulationAcrossRestarts(t *testing.T) {
 }
 
 func TestManifestRotationBoundsGrowth(t *testing.T) {
-	// Lower the rotation threshold so a modest workload triggers several
-	// rotations; restore it afterward.
-	old := manifestRotateEdits
-	manifestRotateEdits = 8
-	defer func() { manifestRotateEdits = old }()
+	t.Parallel()
 
 	dir := t.TempDir()
 	o := DefaultOptions(dir)
-	o.MemtableSize = 256 // small: each burst of writes flushes -> a manifest edit
+	o.MemtableSize = 1 << 30 // flush each batch explicitly to produce manifest edits
 	db, err := Open(o)
 	require.NoError(t, err)
 
-	startNum := db.manNum
-	for i := 0; i < 120; i++ {
-		require.NoError(t, db.Put(PutOptions{Key: []byte(fmt.Sprintf("key%05d", i)), Value: []byte("v")}))
+	for start := 0; start < 120; start += 40 {
+		var batch Batch
+		for i := start; i < start+40; i++ {
+			batch.Put(PutOptions{Key: []byte(fmt.Sprintf("key%05d", i)), Value: []byte("v")})
+		}
+		require.NoError(t, db.Write(&batch))
+		// Put this manifest one edit below rotation without changing a global
+		// threshold or generating thousands of unrelated flushes.
+		db.manMu.Lock()
+		db.man.edits = manifestRotateEdits - 1
+		startNum := db.manNum
+		db.manMu.Unlock()
+		require.NoError(t, db.eng.Flush())
+		require.Greater(t, db.manNum, startNum, "manifest should have rotated")
+		assert.LessOrEqual(t, countManifests(t, dir), 2, "old manifests must be removed on rotation")
 	}
 	db.sched.drain()
-
-	// Rotation advanced the manifest number and never left more than a couple
-	// of manifest files around (the live one, transiently the old).
-	require.Greater(t, db.manNum, startNum, "manifest should have rotated")
-	assert.LessOrEqual(t, countManifests(t, dir), 2, "old manifests must be removed on rotation")
 	require.NoError(t, db.Close())
 
 	// Data survives across all the rotations on reopen.
@@ -541,9 +550,7 @@ func TestOpenManifestKeepsPostRenameStateOnSyncFailure(t *testing.T) {
 }
 
 func TestManifestRotationAdoptsPostRenameStateOnSyncFailure(t *testing.T) {
-	oldThreshold := manifestRotateEdits
-	manifestRotateEdits = 1
-	defer func() { manifestRotateEdits = oldThreshold }()
+	t.Parallel()
 
 	dir := t.TempDir()
 	store, err := openStorage(dir)
@@ -559,6 +566,7 @@ func TestManifestRotationAdoptsPostRenameStateOnSyncFailure(t *testing.T) {
 
 	sentinel := errors.New("directory sync failed")
 	store.currentSyncDir = func(string) error { return sentinel }
+	db.man.edits = manifestRotateEdits
 	db.maybeRotateManifest()
 	require.NotEqual(t, oldNum, db.manNum)
 	assert.ErrorIs(t, db.backgroundError(), sentinel)
@@ -574,9 +582,7 @@ func TestManifestRotationAdoptsPostRenameStateOnSyncFailure(t *testing.T) {
 }
 
 func TestCloseRetainsWALWhenManifestRotationSyncFails(t *testing.T) {
-	oldThreshold := manifestRotateEdits
-	manifestRotateEdits = 1
-	defer func() { manifestRotateEdits = oldThreshold }()
+	t.Parallel()
 
 	dir := t.TempDir()
 	opts := DefaultOptions(dir)
@@ -587,6 +593,7 @@ func TestCloseRetainsWALWhenManifestRotationSyncFails(t *testing.T) {
 
 	sentinel := errors.New("directory sync failed")
 	db.store.currentSyncDir = func(string) error { return sentinel }
+	db.man.edits = manifestRotateEdits - 1
 	err = db.Close()
 	assert.ErrorIs(t, err, sentinel)
 	logs := allLogs(t, db.store)
@@ -790,4 +797,130 @@ func TestRecoveryFlushesMidReplay(t *testing.T) {
 	st, err := db2.Stats()
 	require.NoError(t, err)
 	assert.Greater(t, st.Tables, 1, "recovery should flush mid-replay into several tables")
+}
+
+func TestCheckpointRecoveryBoundarySurvivesManifestRotation(t *testing.T) {
+	t.Parallel()
+	for _, readOnly := range []bool{false, true} {
+		t.Run(map[bool]string{false: "writable", true: "read-only"}[readOnly], func(t *testing.T) {
+			opts := DefaultOptions(t.TempDir())
+			opts.WALRetention = time.Hour
+			opts.CompactionFilter = func(CompactionFilterEntry) bool { return false }
+			db, err := Open(opts)
+			require.NoError(t, err)
+			require.NoError(t, db.Put(PutOptions{Key: []byte("drop"), Value: []byte("v")}))
+			require.NoError(t, db.CompactRange(nil, nil))
+			// Rotate without changing the package-wide threshold used by parallel tests.
+			db.manMu.Lock()
+			db.man.edits = manifestRotateEdits
+			db.maybeRotateManifest()
+			db.manMu.Unlock()
+			require.NoError(t, db.backgroundError())
+			// This write is not covered by the checkpoint and still needs replay.
+			require.NoError(t, db.Put(PutOptions{Key: []byte("live"), Value: []byte("new")}))
+			db.crash()
+			opts.ReadOnly = readOnly
+			db, err = Open(opts)
+			require.NoError(t, err)
+			defer db.Close()
+			_, err = db.Get([]byte("drop"))
+			require.ErrorIs(t, err, ErrNotFound)
+			v, err := db.Get([]byte("live"))
+			require.NoError(t, err)
+			require.Equal(t, "new", string(v))
+		})
+	}
+}
+
+func TestCheckpointManifestFailurePreservesRecovery(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	opts := DefaultOptions(dir)
+	opts.CompactionFilter = func(CompactionFilterEntry) bool { return false }
+	db, err := Open(opts)
+	require.NoError(t, err)
+	require.NoError(t, db.Put(PutOptions{Key: []byte("k"), Value: []byte("v")}))
+	// Flush first so the next manifest append is the recovery boundary itself.
+	require.NoError(t, db.eng.Flush())
+	db.man.syncFile = func() error { return errors.New("boundary sync failure") }
+	_, err = db.checkpointWALMode(true)
+	require.ErrorContains(t, err, "boundary sync failure")
+	require.Zero(t, db.filterSafeSeq.Load())
+	require.Error(t, db.CompactRange(nil, nil))
+	db.crash()
+	db, err = Open(opts)
+	require.NoError(t, err)
+	defer db.Close()
+	v, err := db.Get([]byte("k"))
+	require.NoError(t, err)
+	require.Equal(t, "v", string(v))
+}
+
+func TestLegacyManifestStillReplaysUnflushedWAL(t *testing.T) {
+	t.Parallel()
+	opts := DefaultOptions(t.TempDir())
+	db, err := Open(opts)
+	require.NoError(t, err)
+	require.NoError(t, db.Put(PutOptions{Key: []byte("k"), Value: []byte("v")}))
+	// Older baselines contained LastSeq but no recovery boundary. LastSeq alone
+	// must not cause replay to skip a write whose only durable copy is the WAL.
+	old := db.man
+	db.replayLogNum = 0
+	require.NoError(t, db.openManifest())
+	require.NoError(t, old.Close())
+	db.crash()
+	db, err = Open(opts)
+	require.NoError(t, err)
+	defer db.Close()
+	v, err := db.Get([]byte("k"))
+	require.NoError(t, err)
+	require.Equal(t, "v", string(v))
+}
+
+func TestRecoveryPreservesAllocatedSequence(t *testing.T) {
+	t.Parallel()
+	for _, rotate := range []bool{false, true} {
+		t.Run(fmt.Sprint("rotate=", rotate), func(t *testing.T) {
+			t.Parallel()
+			opts := DefaultOptions(t.TempDir())
+			opts.MemtableSize = 1 << 30
+			db, err := Open(opts)
+			require.NoError(t, err)
+			apply := db.wal.wal.apply
+			db.wal.wal.apply = func(es []walEntry) {
+				// Model a background flush after the first entry of a durable batch has
+				// applied, but before applyCommitted publishes the batch's final sequence.
+				db.eng.Put(es[0].Seq, es[0].Key, es[0].Value)
+				require.NoError(t, db.eng.Flush())
+				if rotate {
+					db.manMu.Lock()
+					db.man.edits = manifestRotateEdits
+					db.maybeRotateManifest()
+					db.manMu.Unlock()
+				}
+				apply(es[1:])
+			}
+			var b Batch
+			b.Put(PutOptions{Key: []byte("a"), Value: []byte("old")})
+			b.Put(PutOptions{Key: []byte("b"), Value: []byte("other")})
+			require.NoError(t, db.Write(&b))
+			st, err := db.replayManifest(db.manNum)
+			require.NoError(t, err)
+			require.Equal(t, uint64(2), st.LastSeq)
+			pth := db.walPath(db.wal.num)
+			db.crash()
+			raw, err := os.ReadFile(pth)
+			require.NoError(t, err)
+			raw[len(raw)-1] ^= 1
+			require.NoError(t, os.WriteFile(pth, raw, 0o600))
+			db, err = Open(opts)
+			require.NoError(t, err)
+			defer db.Close()
+			require.NoError(t, db.Put(PutOptions{Key: []byte("a"), Value: []byte("new")}))
+			v, err := db.Get([]byte("a"))
+			require.NoError(t, err, "a successful new write must not reuse an existing SST sequence")
+			require.Equal(t, "new", string(v))
+			require.Equal(t, uint64(3), db.LatestSeq())
+		})
+	}
 }

@@ -123,8 +123,13 @@ func TestIncompressibleValuesRoundTrip(t *testing.T) {
 		return v
 	}
 	const n = 400
-	for i := 0; i < n; i++ {
-		require.NoError(t, db.Put(PutOptions{Key: []byte(fmt.Sprintf("k%05d", i)), Value: mkVal(i)}))
+	for start := 0; start < n; start += 100 {
+		var batch Batch
+		for i := start; i < start+100; i++ {
+			batch.Put(PutOptions{Key: []byte(fmt.Sprintf("k%05d", i)), Value: mkVal(i)})
+		}
+		require.NoError(t, db.Write(&batch))
+		db.sched.drain()
 	}
 	db.sched.drain()
 	require.NoError(t, db.CompactRange(nil, nil)) // force flush + compaction
@@ -153,9 +158,11 @@ func TestLevelCodecsAppliedToFlushedTable(t *testing.T) {
 	// Highly compressible values so the size-fallback in finishBlock does not
 	// downgrade the block to none.
 	val := bytes.Repeat([]byte("levisdb"), 128)
+	var batch Batch
 	for i := 0; i < 200; i++ {
-		require.NoError(t, db.Put(PutOptions{Key: []byte(fmt.Sprintf("k%05d", i)), Value: val}))
+		batch.Put(PutOptions{Key: []byte(fmt.Sprintf("k%05d", i)), Value: val})
 	}
+	require.NoError(t, db.Write(&batch))
 	db.sched.drain()
 
 	ids := depth0BlockCodecIDs(t, db.eng)
@@ -179,8 +186,13 @@ func TestFlateCodecEndToEnd(t *testing.T) {
 
 	val := bytes.Repeat([]byte("levisdb-flate"), 128) // compressible so flate is kept
 	const n = 300
-	for i := 0; i < n; i++ {
-		require.NoError(t, db.Put(PutOptions{Key: []byte(fmt.Sprintf("k%05d", i)), Value: val}))
+	for start := 0; start < n; start += 100 {
+		var batch Batch
+		for i := start; i < start+100; i++ {
+			batch.Put(PutOptions{Key: []byte(fmt.Sprintf("k%05d", i)), Value: val})
+		}
+		require.NoError(t, db.Write(&batch))
+		db.sched.drain()
 	}
 	// CompactRange forces flush + compaction and blocks until done, so the live
 	// table set is stable when we inspect it (no background flush/compaction race).

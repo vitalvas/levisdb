@@ -59,12 +59,14 @@ func TestLoggingEmitsStorageEvents(t *testing.T) {
 
 	db := openTestDB(t, func(o *Options) {
 		o.Logger = logger
-		o.MemtableSize = 1024 // tiny so a modest write count flushes and compacts
+		o.MemtableSize = 1024
 	})
-	for i := 0; i < 800; i++ {
-		require.NoError(t, db.Put(PutOptions{Key: []byte(fmt.Sprintf("k%06d", i)), Value: []byte("value-payload")}))
+	// Each write fills a memtable; enough flushed tables trigger compaction.
+	value := bytes.Repeat([]byte("v"), 1024)
+	for i := 0; i < db.opts.TierRatio; i++ {
+		require.NoError(t, db.Put(PutOptions{Key: []byte(fmt.Sprintf("k%06d", i)), Value: value}))
+		db.sched.drain()
 	}
-	db.sched.drain()
 	require.NoError(t, db.Close())
 
 	mu.Lock()

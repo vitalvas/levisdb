@@ -716,7 +716,7 @@ func TestWriteBackpressureHardStopReleasesAfterDrain(t *testing.T) {
 	// stop path both engages and releases (no deadlock).
 	db := openTestDB(t, func(o *Options) {
 		o.MemtableSize = 256
-		o.TierRatio = 1000 // do not auto-compact; we drain manually
+		o.TierRatio = 4
 		o.L0SlowdownTables = 3
 		o.L0StopTables = 4
 	})
@@ -728,19 +728,17 @@ func TestWriteBackpressureHardStopReleasesAfterDrain(t *testing.T) {
 	}
 	require.GreaterOrEqual(t, db.eng.depth0Count(), db.opts.L0StopTables)
 
-	// Release the writer shortly after it blocks by compacting the fresh tier
-	// down to one deeper table (depth-0 count -> 0).
-	go func() {
-		time.Sleep(20 * time.Millisecond)
-		retain, cc, release, err := db.compactionRunConfig(false)
-		if err == nil {
-			_ = db.eng.CompactAll(retain, cc)
-			release()
-		}
-	}()
-
+	// Hold the worker at the flush/compaction lock to model a slow compaction.
+	db.eng.flushMu.Lock()
 	done := make(chan error, 1)
 	go func() { done <- db.Put(PutOptions{Key: []byte("late"), Value: []byte("v")}) }()
+	select {
+	case <-done:
+		db.eng.flushMu.Unlock()
+		t.Fatal("writer bypassed the hard stop before compaction drained the tier")
+	case <-time.After(20 * time.Millisecond):
+	}
+	db.eng.flushMu.Unlock()
 
 	select {
 	case err := <-done:
@@ -762,7 +760,7 @@ func TestWriteBackpressureFailsFastOnBackgroundError(t *testing.T) {
 	t.Parallel()
 	db := openTestDB(t, func(o *Options) {
 		o.MemtableSize = 256
-		o.TierRatio = 1000 // no auto-compaction to drain the tier
+		o.TierRatio = 4
 		o.L0SlowdownTables = 3
 		o.L0StopTables = 4
 	})
@@ -795,6 +793,7 @@ func TestTombstoneTriggerNoLivelockWithHeldSnapshot(t *testing.T) {
 	db := openTestDB(t, func(o *Options) {
 		o.MemtableSize = 256
 		o.TierRatio = 1000               // count trigger off
+		o.L0StopTables = -1              // this test intentionally disables count compaction
 		o.TombstoneCompactionRatio = 0.5 // tombstone trigger on
 		o.FileSizeBase = 512             // small files so delete-heavy data
 		o.FileSizeMax = 512              // rolls into >= 2 output tables

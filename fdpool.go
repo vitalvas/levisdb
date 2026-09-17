@@ -45,7 +45,7 @@ type openFile struct {
 	// onEvict, if set, runs when the clock closes this descriptor (not on the
 	// permanent close path). The table reader uses it to drop its lazily-parsed
 	// index/filter so that metadata memory is bounded by the open-file count, not
-	// by the number of live tables. Called without rw held.
+	// by the number of live tables. Guarded by rw; called without rw held.
 	onEvict func()
 
 	used     atomic.Bool  // recently-used flag for the clock; set lock-free by reads
@@ -161,11 +161,12 @@ func (p *fdPool) admit(h *openFile) {
 			v.file = nil
 			evicted = true
 		}
+		onEvict := v.onEvict
 		v.rw.Unlock()
 		// Drop the reader's cached metadata after releasing rw so the callback can
 		// take its own locks without ordering against the handle lock.
-		if evicted && v.onEvict != nil {
-			v.onEvict()
+		if evicted && onEvict != nil {
+			onEvict()
 		}
 	}
 }

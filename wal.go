@@ -290,37 +290,35 @@ func (w *walT) Close() error {
 	return w.file.Close()
 }
 
-// rotate atomically switches future appends to file after making the old
-// segment durable, returning the old file for the caller to close. It waits for
-// the active group committer so no record is split across segments. It settles
-// in-flight commits, but the checkpoint's cutoff still needs a db.mu barrier: a
-// writer can hold a reserved seq below readSeq without having appended yet, which
-// rotate cannot see.
-func (w *walT) rotate(file *os.File) (*os.File, error) {
+// rotate makes the drained segment durable and captures its committed cutoff
+// before switching files. Loading the watermark afterward could include writes
+// that still need the new WAL for recovery. The caller closes the old file.
+func (w *walT) rotate(file *os.File, committed *atomic.Uint64) (*os.File, uint64, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	for w.writing {
 		w.cond.Wait()
 	}
 	if w.closed {
-		return nil, os.ErrClosed
+		return nil, 0, os.ErrClosed
 	}
 	if w.err != nil {
-		return nil, w.err
+		return nil, 0, w.err
 	}
 	if err := w.jw.Flush(); err != nil {
 		w.err = err
-		return nil, err
+		return nil, 0, err
 	}
 	if err := w.file.Sync(); err != nil {
 		w.err = err
-		return nil, err
+		return nil, 0, err
 	}
+	cutoff := committed.Load()
 	old := w.file
 	w.file = file
 	w.jw = newJournalWriter(file)
 	w.segBytes.Store(0) // new segment starts empty
-	return old, nil
+	return old, cutoff, nil
 }
 
 // currentSize returns the record bytes appended to the current segment, without
@@ -356,7 +354,7 @@ func (w *walT) syncNow() (skipped bool, err error) {
 // in order. A torn tail from a crash is ignored. seq is the highest sequence
 // number seen, or startSeq if the log was empty.
 func replayWALFile(file *os.File, startSeq uint64) (entries []walEntry, seq uint64, err error) {
-	seq, err = replayWALFileVisit(file, startSeq, false, func(batch []walEntry) error {
+	seq, err = replayWALFileVisit(file, startSeq, false, false, func(batch []walEntry) error {
 		entries = append(entries, batch...)
 		return nil
 	})
@@ -372,8 +370,11 @@ func replayWALFile(file *os.File, startSeq uint64) (entries []walEntry, seq uint
 // prefix instead of failing the whole open. Semantic errors raised by visit
 // (e.g. an empty key or a regressing sequence) still propagate regardless, since
 // they signal a logic/format problem rather than bit rot.
-func replayWALFileVisit(file *os.File, startSeq uint64, lenient bool, visit func([]walEntry) error) (seq uint64, err error) {
+// strictTail rejects incomplete records in sealed replication segments. Crash
+// recovery leaves it false because a torn final record is expected after a crash.
+func replayWALFileVisit(file *os.File, startSeq uint64, lenient, strictTail bool, visit func([]walEntry) error) (seq uint64, err error) {
 	r := newJournalReader(file)
+	r.strictTail = strictTail
 	seq = startSeq
 	var lastRecordSeq uint64
 	for {

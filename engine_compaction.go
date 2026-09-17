@@ -104,6 +104,7 @@ func (s *engineT) Compact(depth int, retainSeq uint64, cc compactionConfigT) err
 	s.flushMu.Lock()
 	defer s.flushMu.Unlock()
 	s.mu.RLock()
+	tables := append([]*tableMeta(nil), s.tables...)
 	maxDepth := 0
 	for _, t := range s.tables {
 		if t.depth > maxDepth {
@@ -123,22 +124,15 @@ func (s *engineT) Compact(depth int, retainSeq uint64, cc compactionConfigT) err
 	}
 	inPlace := outDepth == depth
 	var inputs []*tableMeta
-	// deeper holds the key bounds of every table at or below the output tier that
-	// is NOT an input, so writeMerged can reclaim a tombstone at an intermediate
-	// tier when no such table can hold the key. flushMu serializes compaction,
-	// so this snapshot stays valid for the whole merge.
+	// Non-input tables at ANY depth can contain older versions: ingest puts
+	// fresh sequences at the bottom. Include all their bounds in the GC check.
 	var deeper [][2][]byte
 	for _, t := range s.tables {
 		if t.depth == depth {
 			inputs = append(inputs, t)
 			continue
 		}
-		// For an in-place merge (outDepth == depth) the inputs are the whole tier
-		// and there is nothing deeper, so no table is "deeper" - the tier == depth
-		// tables are all inputs above.
-		if t.depth >= outDepth && t.depth != depth {
-			deeper = append(deeper, [2][]byte{t.minKey, t.maxKey})
-		}
+		deeper = append(deeper, [2][]byte{t.minKey, t.maxKey})
 	}
 	s.mu.RUnlock()
 
@@ -149,7 +143,21 @@ func (s *engineT) Compact(depth int, retainSeq uint64, cc compactionConfigT) err
 	// merge at the cap is the bottom (its tables are all inputs, nothing is below);
 	// otherwise it is the bottom only when the output tier is at/below the deepest.
 	bottomCodec := outDepth >= maxDepth
-	dropTombstones := outDepth > maxDepth || (inPlace && len(deeper) == 0)
+	dropTombstones := outDepth > maxDepth || (inPlace && depth == maxDepth)
+	if dropTombstones {
+		// Reclaiming a bottom tombstone also requires merging overlapping
+		// shallower versions. Include each entire connected overlap group that
+		// touches the selected tier, keeping disjoint tables untouched.
+		inputs = nil
+		for _, group := range overlapSets(tables) {
+			for _, table := range group {
+				if table.depth == depth {
+					inputs = append(inputs, group...)
+					break
+				}
+			}
+		}
+	}
 
 	// Overlap-scoped selection: merge only the largest group of key-overlapping
 	// tables rather than the whole tier, so unrelated key ranges are not rewritten
@@ -254,18 +262,8 @@ func collectInputRangeDels(inputs []*tableMeta) ([]rangeTombstone, error) {
 // un-shadow, and the merge has already dropped the point entries it covered.
 // Tombstones above retainSeq, and all tombstones at a non-bottom tier, are kept.
 //
-// INVARIANT that makes the bottom drop safe: for any user key, a version in a
-// SHALLOWER tier is always NEWER (higher seq) than one in a deeper tier. A flush
-// lands at tier 0; a bottom compaction ingests the WHOLE tier (overlap-selection
-// and the byte cap are disabled when dropTombstones is set, engine_compaction.go
-// around "Overlap-scoped selection" and "Byte-cap"); and SstFileWriter/ingest
-// installs at the bottom with a FRESH high seq. So a covered older point can never
-// sit in a tier strictly deeper than the tombstone covering it, and dropping the
-// tombstone at the bottom never leaves a surviving older version to resurrect.
-// A future feature that places or relocates a table at an arbitrary depth with an
-// OLDER seq than an existing deeper tombstone would break this and must revisit
-// the drop condition (e.g. only drop a tombstone once it reaches the true deepest
-// tier and no shallower non-input table can hold a covered key).
+// Bottom merges include every overlapping table at every depth. Table bounds
+// include range tombstones, so no covered older point survives outside the merge.
 func rangeDelsToPersist(rts []rangeTombstone, dropAtBottom bool, retainSeq uint64) []rangeTombstone {
 	if !dropAtBottom {
 		return rts
@@ -485,10 +483,9 @@ type mergeWrite struct {
 	// rangeDels are the range tombstones carried from the input tables, to persist
 	// in an output table. Empty when dropped at the bottom tier.
 	rangeDels []rangeTombstone
-	// noDeeperTier reports that no table below this compaction's output tier can
-	// contain the user key (by recorded key bounds). When it holds, a tombstone
-	// or shadowed version can be reclaimed at an intermediate tier just as at the
-	// bottom, because nothing below it could hold an older version to un-shadow.
+	// noDeeperTier reports that no non-input table, including shallower tables,
+	// can contain the user key. A tombstone can then be reclaimed without
+	// revealing an older value left outside this merge.
 	// nil means "unknown for every key" (never reclaim at an intermediate tier).
 	noDeeperTier func(userKey []byte) bool
 }
@@ -530,7 +527,6 @@ func (s *engineT) writeMerged(mw mergeWrite) ([]*tableMeta, error) {
 		user := ikeyUserKey(ik)
 		seq, kind := ikeySeqKind(ik)
 		value := mw.merged.Value()
-
 		sameKey := haveLast && bytes.Equal(user, lastUser)
 		switch {
 		case !sameKey:
@@ -544,6 +540,19 @@ func (s *engineT) writeMerged(mw mergeWrite) ([]*tableMeta, error) {
 				(mw.noDeeperTier != nil && mw.noDeeperTier(user))
 		case seq == lastSeq:
 			if kind != lastKind {
+				// TTL sorts before delete at the same sequence. Recovery may
+				// replay the original TTL beside its compacted tombstone; accept
+				// only that expired pair. Same-kind payload conflicts still fail.
+				_, expiredValue, expiredKind, expiryErr := resolveCompactionEntry(compactionConfigT{}, mergeEntry{
+					ik:    ik,
+					user:  user,
+					value: lastValue,
+					seq:   seq,
+					kind:  lastKind,
+				}, now)
+				if expiryErr == nil && kind == expiredKind && bytes.Equal(value, expiredValue) {
+					continue
+				}
 				return sink.fail(fmt.Errorf("compaction: conflicting kinds at sequence %d", seq))
 			}
 			if !bytes.Equal(value, lastValue) {

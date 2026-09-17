@@ -36,6 +36,9 @@ func (db *DB) recoverWALMode(logs []uint32, startSeq uint64, flush bool) (uint64
 	s := db.eng
 	var lastWALSeq uint64
 	for _, num := range logs {
+		if num < db.replayLogNum {
+			continue // retained CDC history already covered by durable tables
+		}
 		path, perr := db.store.logPath(num)
 		if perr != nil {
 			return maxSeq, perr
@@ -44,7 +47,7 @@ func (db *DB) recoverWALMode(logs []uint32, startSeq uint64, flush bool) (uint64
 		if err != nil {
 			return maxSeq, err
 		}
-		seq, err := replayWALFileVisit(f, startSeq, lenient, func(entries []walEntry) error {
+		seq, err := replayWALFileVisit(f, startSeq, lenient, false, func(entries []walEntry) error {
 			for i := range entries {
 				e := &entries[i]
 				if e.Seq <= lastWALSeq {
@@ -286,7 +289,10 @@ func (db *DB) commitTableChange(inputs, outputs []*tableMeta, install func()) er
 	}
 	edit := manifestEdit{
 		HasLastSeq: true,
-		LastSeq:    db.readSeq.Load(),
+		// A flush can include a partially applied batch before readSeq advances.
+		// Preserve the allocated watermark so even lenient WAL recovery cannot
+		// reuse a sequence already present in an SST.
+		LastSeq: db.walSeq.Load(),
 	}
 	for _, t := range outputs {
 		edit.Added = append(edit.Added, manifestTableInfo{

@@ -104,7 +104,7 @@ target a single slow spinning disk.
 | `TierRatio` | `4` | Size-tiered compaction fan-out (tables per tier before merge). |
 | `TierByteTrigger` | `8 x FileSizeMax` | Tier bytes that trigger compaction below the count ratio; negative disables. |
 | `TombstoneCompactionRatio` | `0.5` | Delete fraction that triggers early compaction; negative disables. |
-| `L0SlowdownTables` / `L0StopTables` | `16` / `24` | Fresh-tier table counts that slow, then stop, writers. |
+| `L0SlowdownTables` / `L0StopTables` | `16` / `24` | Fresh-tier table counts that slow, then stop, writers. A positive stop threshold must be at least `TierRatio` and the slowdown threshold. |
 | `MaxCompactionBytes` | `10 x FileSizeMax` | Input byte cap per non-bottom compaction; negative disables. |
 | `DisableOverlapSelection` | `false` | Merge the whole tier instead of only the largest key-overlapping group. |
 | `FileSizeBase` / `FileSizeMultiplier` / `FileSizeMax` | `2 MiB` / `2` / `16 MiB` | Per-depth output size curve. |
@@ -228,7 +228,8 @@ Package-level:
 
 `*SstFileWriter`: `NewSstFileWriter(path, SstWriterOptions)`, then `Put`,
 `PutTTL`, `PutWithExpiry` (exact absolute deadline), `Delete` (keys ascending),
-`Finish()`.
+`Finish()`. Defer `Close()` to release an abandoned build; it removes unfinished
+output and preserves a successfully finished file.
 
 `*Snapshot`: `Get`, `Has`, `NewIterator`, `NewRangeIterator` (same signatures as
 the `*DB` reads, fixed to the snapshot's sequence), `WriteTo(path,
@@ -267,8 +268,9 @@ lone table is never merged alone. A negative `TierByteTrigger` disables it.
 A non-bottom compaction merges only the largest group of key-overlapping tables in
 the tier (overlap-scoped selection), not the whole tier, so unrelated key ranges
 are not rewritten and a lookup touches at most one output table per non-overlapping
-group. The bottom tier still merges wholly because tombstone GC needs the complete
-tier. Set `DisableOverlapSelection` to always merge the whole tier instead.
+group. Bottom-tier merges include the complete tier and any overlapping shallower
+tables, so removing ingested tombstones cannot reveal older values elsewhere.
+Set `DisableOverlapSelection` to always merge the whole tier instead.
 `MaxCompactionBytes` then caps the input merged in one non-bottom pass so a large
 group drains in bounded steps rather than one merge that pins the disk.
 
@@ -413,6 +415,14 @@ are past *both* horizons. A request below the retained horizon returns
 and resume `GetUpdatesSince` from there. Delivery is at-least-once: a consumer
 may re-see entries after a crash, so it must be idempotent.
 
+Catch-up is bounded by the committed sequence captured when the call starts.
+Corrupted or truncated retained segments return an error instead of silently
+skipping mutations. WAL history is cleared across a reopen; consumers behind the
+startup sequence receive `ErrRetentionExpired` even when retention is enabled.
+Ingesting an external file also advances the retention horizon to its assigned
+sequence: the ingested mutations bypass the WAL, so older consumers must take
+a new snapshot before resuming catch-up.
+
 ```go
 u, err := db.GetUpdatesSince(lastApplied)
 if err != nil {
@@ -490,8 +500,9 @@ second; negative disables it) to bound that window.
 
 **Rotation and checkpoint.** When the live segment grows past its size bound the
 WAL rotates to a fresh segment and checkpoints: the memtable the old segment
-covered is flushed, then that segment is retired. So the on-disk WAL only ever
-holds records not yet captured in a table, and recovery work stays bounded. The
+covered is flushed, then the manifest records the first segment still needed for
+recovery. Earlier segments are removed or retained for replication; recovery skips
+them even when they remain on disk, so filtered values cannot reappear. The
 checkpoint runs on a background goroutine, so a write never blocks on the flush
 barrier (backpressure already bounds how far writes get ahead); `Close` waits for
 an in-flight checkpoint before it returns. Enabling a `CompactionFilter` can force
@@ -522,6 +533,10 @@ flush and compaction, with a `CURRENT` file naming the live manifest; a `LOCK`
 file for the single-process lock; and `<num>.sst` tables. Tables use
 LevelDB-style prefix-compressed data blocks with restart points, a flat index,
 an embedded bloom filter, and per-block CRC32C.
+
+The manifest now records a WAL recovery boundary. This version reads older
+manifests, but opening a database for writing upgrades its manifest: older
+binaries that do not recognize the recovery-boundary field cannot reopen it.
 
 ## TTL
 
@@ -590,4 +605,3 @@ the filter can add checkpoint I/O to compaction.
 
 `CompactRange` forces full compaction and therefore provides a way to run the
 configured filter without waiting for automatic tier selection.
-

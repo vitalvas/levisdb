@@ -25,12 +25,16 @@ type manifestTableInfo struct {
 }
 
 // Edit is one atomic change: an optional identity marker (on the first edit)
-// plus tables added and removed, and an optional committed-sequence watermark.
+// plus tables added and removed, and an optional sequence allocation watermark.
 type manifestEdit struct {
 	HasIdentity bool
 
 	HasLastSeq bool
-	LastSeq    uint64 // highest committed sequence at the time of this edit
+	LastSeq    uint64 // allocated watermark; bounds every sequence in persisted tables
+	// ReplayLogNum is the first WAL segment still needed for recovery. Earlier
+	// segments may remain on disk for replication, but their tables are durable.
+	// Zero leaves the previous boundary unchanged (legacy manifests omit it).
+	ReplayLogNum uint32
 
 	Added   []manifestTableInfo
 	Deleted []manifestTableRef // num identifies a table to remove
@@ -43,11 +47,12 @@ type manifestTableRef struct {
 
 // record tags for the edit encoding.
 const (
-	tagIdentity = 1
-	tagAdd      = 2
-	tagDelete   = 3
-	tagLastSeq  = 4
-	tagEnd      = 0
+	tagIdentity  = 1
+	tagAdd       = 2
+	tagDelete    = 3
+	tagLastSeq   = 4
+	tagReplayLog = 5
+	tagEnd       = 0
 )
 
 // encode serializes an edit into a self-describing record.
@@ -59,6 +64,10 @@ func (e *manifestEdit) encode() []byte {
 	if e.HasLastSeq {
 		b = append(b, tagLastSeq)
 		b = binary.AppendUvarint(b, e.LastSeq)
+	}
+	if e.ReplayLogNum != 0 {
+		b = append(b, tagReplayLog)
+		b = binary.AppendUvarint(b, uint64(e.ReplayLogNum))
 	}
 	for _, t := range e.Added {
 		b = append(b, tagAdd)
@@ -107,6 +116,13 @@ func decodeEdit(rec []byte) (manifestEdit, error) {
 			}
 			e.HasLastSeq = true
 			e.LastSeq = seq
+			rec = rec[n:]
+		case tagReplayLog:
+			num, n := binary.Uvarint(rec)
+			if n <= 0 || num == 0 || num > math.MaxUint32 || e.ReplayLogNum != 0 {
+				return e, fmt.Errorf("manifest: bad recovery log boundary")
+			}
+			e.ReplayLogNum = uint32(num)
 			rec = rec[n:]
 		case tagAdd:
 			t, r, err := readTable(rec)
@@ -281,8 +297,9 @@ func (w *manifestWriter) Close() error {
 
 // State is the reconstructed live view after replaying a manifest.
 type manifestState struct {
-	LastSeq uint64              // highest committed sequence recorded
-	Tables  []manifestTableInfo // the live table set
+	ReplayLogNum uint32              // first WAL segment required by this table set
+	LastSeq      uint64              // highest sequence allocation watermark recorded
+	Tables       []manifestTableInfo // the live table set
 }
 
 // Replay reads a manifest file and reconstructs the live table set. It applies
@@ -320,6 +337,12 @@ func replayManifestFile(r io.Reader) (*manifestState, error) {
 		}
 		if edit.HasLastSeq && edit.LastSeq > st.LastSeq {
 			st.LastSeq = edit.LastSeq
+		}
+		if edit.ReplayLogNum != 0 {
+			if edit.ReplayLogNum < st.ReplayLogNum {
+				return nil, fmt.Errorf("manifest: regressing recovery log boundary")
+			}
+			st.ReplayLogNum = edit.ReplayLogNum
 		}
 		for _, t := range edit.Added {
 			if t.Num == 0 {

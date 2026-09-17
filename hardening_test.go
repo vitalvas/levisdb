@@ -23,6 +23,7 @@ import (
 // while a compaction is in flight; the crash/consistency assertions are
 // unchanged.
 func TestPointReadPinsCapturedSequenceAgainstCompaction(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name string
 		read func(*DB) error
@@ -176,6 +177,7 @@ func TestConcurrentWritersSurviveCrash(t *testing.T) {
 }
 
 func TestWALAppliesConcurrentBatchesInCommitOrder(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t, func(o *Options) { o.MemtableSize = 1 << 30 })
 	originalApply := db.wal.wal.apply
 	entered := make(chan struct{})
@@ -214,6 +216,7 @@ func TestWALAppliesConcurrentBatchesInCommitOrder(t *testing.T) {
 }
 
 func TestConcurrentIteratorAndWrites(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t, func(o *Options) {
 		o.MemtableSize = 1 << 30
 	})
@@ -739,6 +742,10 @@ func TestDeepCompactionOutputCannotShadowNewerShallowTable(t *testing.T) {
 	t.Parallel()
 	s := newTestEngine(t, 1<<20)
 	cc := testCompactionConfig()
+	// Keep the merge intermediate: bottom GC now also consumes overlapping
+	// shallower tables, so use a disjoint deeper table to exercise file ordering.
+	flushSingle(t, s, 1, "zz-deeper", "value")
+	s.tables[0].depth = 3
 
 	// Build two old depth-1 tables.
 	flushSingle(t, s, 1, "value-key", "old")
@@ -807,9 +814,11 @@ func TestCompactAllRewritesSingleTable(t *testing.T) {
 }
 
 func TestCloseWaitsForManualCompaction(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t, func(o *Options) {
 		o.MemtableSize = 1 << 30
 		o.TierRatio = 100
+		o.L0StopTables = -1
 	})
 	require.NoError(t, db.Put(PutOptions{Key: []byte("a"), Value: []byte("1")}))
 	require.NoError(t, db.eng.Flush())
@@ -853,9 +862,13 @@ func TestFailedRecoveryRemovesUnmanifestedTables(t *testing.T) {
 	writeOpts.MemtableSize = 1 << 30
 	db, err := Open(writeOpts)
 	require.NoError(t, err)
+	var batch Batch
 	for i := 0; i < 50; i++ {
-		require.NoError(t, db.Put(PutOptions{Key: []byte{0x01, byte(i)}, Value: []byte("left")}))
+		batch.Put(PutOptions{Key: []byte{0x01, byte(i)}, Value: []byte("left")})
 	}
+	require.NoError(t, db.Write(&batch))
+	// Keep the corruptible record separate so recovery flushes the first batch
+	// before encountering the corruption.
 	require.NoError(t, db.Put(PutOptions{Key: []byte{0xff}, Value: []byte("right")}))
 	db.crash()
 
@@ -1000,9 +1013,11 @@ func TestReadOnlyOpenPreservesOrphanTables(t *testing.T) {
 }
 
 func TestFlushWorkerDrainsMemtableFilledDuringActiveFlush(t *testing.T) {
+	t.Parallel()
 	db := openTestDB(t, func(o *Options) {
 		o.MemtableSize = 1
 		o.TierRatio = 100
+		o.L0StopTables = -1
 	})
 
 	originalCommit := db.eng.cfg.Commit

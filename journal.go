@@ -148,6 +148,7 @@ type journalReader struct {
 	blockLen    int
 	blockOffset int
 	eof         bool
+	strictTail  bool // sealed replication history must not have incomplete records
 }
 
 // NewReader returns a Reader over r.
@@ -169,6 +170,9 @@ func (r *journalReader) Next() ([]byte, error) {
 		typ, data, err := r.readChunk()
 		if err != nil {
 			if err == io.EOF && inProgress {
+				if r.strictTail {
+					return nil, errJournalCorrupt
+				}
 				// Record began but stream ended mid-way: torn tail.
 				return nil, io.EOF
 			}
@@ -205,11 +209,17 @@ func (r *journalReader) Next() ([]byte, error) {
 // readChunk reads one framed chunk, refilling the block buffer as needed.
 func (r *journalReader) readChunk() (byte, []byte, error) {
 	if r.blockLen-r.blockOffset < headerSize {
+		if r.strictTail && r.blockLen < blockSize && r.blockLen > r.blockOffset {
+			return 0, nil, errJournalCorrupt
+		}
 		if err := r.fill(); err != nil {
 			return 0, nil, err
 		}
 		// A short final fragment cannot hold a header and is a torn tail.
 		if r.blockLen-r.blockOffset < headerSize {
+			if r.strictTail {
+				return 0, nil, errJournalCorrupt
+			}
 			return 0, nil, io.EOF
 		}
 	}
@@ -224,7 +234,7 @@ func (r *journalReader) readChunk() (byte, []byte, error) {
 		return 0, nil, errJournalCorrupt
 	}
 	if off+headerSize+length > r.blockLen {
-		if r.blockLen < blockSize {
+		if r.blockLen < blockSize && !r.strictTail {
 			return 0, nil, io.EOF // incomplete final block: torn tail
 		}
 		return 0, nil, errJournalCorrupt

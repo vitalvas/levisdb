@@ -139,40 +139,46 @@ func (w *SstFileWriter) add(key, value []byte, kind ikeyKind) error {
 
 // Finish writes the table footer and closes the file. The written file is ready
 // for IngestExternalFile. It is an error to Finish an empty writer.
-func (w *SstFileWriter) Finish() error {
+func (w *SstFileWriter) Finish() (err error) {
 	if w.err != nil {
+		_ = w.Close()
 		return w.err
 	}
 	if w.closed {
 		return fmt.Errorf("sst: writer already finished")
 	}
 	w.closed = true
+	defer func() {
+		if closeErr := w.f.Close(); err == nil {
+			err = closeErr
+		}
+		if err != nil {
+			w.err = err
+			_ = removeFileDurable(w.path)
+		}
+	}()
 	if w.entries == 0 {
-		_ = w.f.Close()
-		_ = removeFileDurable(w.path)
 		return fmt.Errorf("sst: cannot finish an empty file")
 	}
 	if _, err := w.tw.finish(); err != nil {
-		_ = w.f.Close()
 		return err
 	}
-	if err := w.f.Sync(); err != nil {
-		_ = w.f.Close()
-		return err
-	}
-	return w.f.Close()
+	return w.f.Sync()
 }
 
-// discard closes and removes the file without finishing it, for a caller that
-// built no entries (Finish rejects empty) or hit an error mid-build and must not
-// leave a partial table behind. It mirrors Finish's own empty-file cleanup.
-func (w *SstFileWriter) discard() {
+// Close aborts an unfinished build, closing and removing its partial file.
+// It is safe to call after Finish; a successfully finished file is preserved.
+func (w *SstFileWriter) Close() error {
 	if w.closed {
-		return
+		return nil
 	}
 	w.closed = true
-	_ = w.f.Close()
-	_ = removeFileDurable(w.path)
+	closeErr := w.f.Close()
+	removeErr := removeFileDurable(w.path)
+	if closeErr != nil {
+		return closeErr
+	}
+	return removeErr
 }
 
 // IngestExternalFile loads a table built by SstFileWriter into the database in
@@ -186,6 +192,8 @@ func (w *SstFileWriter) discard() {
 // IngestExternalFile returns an error and changes nothing. The file is copied
 // (its keys are rewritten to the assigned sequence), so the source file is left
 // untouched and may be ingested into several databases.
+// Since ingestion bypasses the WAL, consumers behind its sequence must
+// re-bootstrap from a snapshot before resuming GetUpdatesSince.
 func (db *DB) IngestExternalFile(path string) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
@@ -233,6 +241,14 @@ func (db *DB) IngestExternalFile(path string) error {
 	if err != nil {
 		return err
 	}
+	defer func() {
+		// db.mu excludes every other sequence allocator during ingestion. A
+		// failed build has published nothing, so return its unused reservation
+		// rather than leaving an artificial gap in subsequent WAL history.
+		if db.readSeq.Load() < seq {
+			db.walSeq.Store(seq - 1)
+		}
+	}()
 
 	num := db.alloc.Next()
 	if num == 0 {
@@ -247,9 +263,8 @@ func (db *DB) IngestExternalFile(path string) error {
 		return err
 	}
 
-	// Publish the assigned sequence before recording the manifest edit: the edit
-	// stamps LastSeq from readSeq, and it must be at least the ingest sequence so a
-	// reopen restores a watermark that makes the ingested keys visible.
+	// Publish under db.mu so readers see this watermark only after installation.
+	// The manifest independently records walSeq for safe sequence allocation.
 	db.publishSeq(seq)
 
 	install := func() {
@@ -258,9 +273,12 @@ func (db *DB) IngestExternalFile(path string) error {
 		db.eng.mu.Unlock()
 	}
 	if err := db.commitTableChange(nil, []*tableMeta{meta}, install); err != nil {
-		_ = meta.releaseOwner(true)
+		// A failed manifest Sync may still leave a readable addition. Preserve
+		// the SST until recovery decides whether it is referenced or orphaned.
+		_ = meta.releaseOwner(false)
 		return err
 	}
+	db.advanceReapHorizon(seq)
 	db.log.Info("ingested external file",
 		"op", "ingest", "path", path, "table", num, "seq", seq, "bytes", size)
 	return nil

@@ -99,8 +99,10 @@ func (db *DB) reapRetainedWAL(liveNum uint32) {
 
 // advanceReapHorizon moves reapedThroughSeq forward to h (never backward).
 func (db *DB) advanceReapHorizon(h uint64) {
-	if h > db.wal.reapedThroughSeq.Load() {
-		db.wal.reapedThroughSeq.Store(h)
+	for old := db.wal.reapedThroughSeq.Load(); h > old; old = db.wal.reapedThroughSeq.Load() {
+		if db.wal.reapedThroughSeq.CompareAndSwap(old, h) {
+			return
+		}
 	}
 }
 
@@ -115,7 +117,7 @@ func (db *DB) firstSeqBefore(num uint32) uint64 {
 	}
 	defer f.Close()
 	var first uint64
-	_, _ = replayWALFileVisit(f, 0, true, func(entries []walEntry) error {
+	_, _ = replayWALFileVisit(f, 0, true, false, func(entries []walEntry) error {
 		if len(entries) > 0 {
 			first = entries[0].Seq
 			return errWALStop // only the first record is needed
@@ -147,7 +149,9 @@ type WALUpdates struct {
 // in the live segment are available. If since is below the oldest sequence still
 // on disk, GetUpdatesSince returns ErrRetentionExpired and the consumer must
 // re-bootstrap from a Snapshot and resume from its Seq. Passing the current
-// LatestSeq yields an empty stream (the consumer is already caught up).
+// LatestSeq yields an empty stream (the consumer is already caught up). An
+// external-file ingestion advances the horizon to its sequence because its
+// mutations are not in the WAL; older consumers must take a new snapshot.
 //
 // The returned stream must be closed. Delivery is at-least-once: the consumer may
 // re-see entries it already applied (those with Seq <= its watermark are filtered,
@@ -168,12 +172,12 @@ func (db *DB) GetUpdatesSince(since uint64) (*WALUpdates, error) {
 		db.mu.RUnlock()
 		return nil, ErrReadOnly // read-only opens have no live WAL to tail
 	}
-	// Coverage check. The lowest sequence still on disk is one past whatever the
-	// reaper has deleted (reapedThroughSeq); anything at or below that is gone. With
+	// Coverage check. Requests before reapedThroughSeq need a fresh snapshot
+	// because of restart, reaping, or ingestion outside the WAL. With
 	// retention off, nothing is retained past flush, so the horizon is the
 	// flushed-and-retired watermark (filterSafeSeq): a consumer behind it cannot be
-	// served from the live segment alone. reapedThroughSeq cannot advance while we
-	// hold checkpointMu, so this check stays valid through the read below.
+	// served from the live segment alone. These locks stabilize both the horizon
+	// and cutoff. A later ingestion is beyond this call's captured cutoff.
 	horizon := db.wal.reapedThroughSeq.Load()
 	if db.opts.WALRetention == 0 && db.opts.WALRetentionBytes == 0 {
 		if fs := db.filterSafeSeq.Load(); fs > horizon {
@@ -183,6 +187,11 @@ func (db *DB) GetUpdatesSince(since uint64) (*WALUpdates, error) {
 	if since < horizon {
 		db.mu.RUnlock()
 		return nil, ErrRetentionExpired
+	}
+	cutoff := db.readSeq.Load()
+	if since >= cutoff {
+		db.mu.RUnlock()
+		return &WALUpdates{}, nil
 	}
 	// Snapshot the on-disk segment list (retained oldest-first plus the live
 	// segment). listLogs returns numbers ascending, which is commit/seq order
@@ -197,23 +206,42 @@ func (db *DB) GetUpdatesSince(since uint64) (*WALUpdates, error) {
 	// segment, so a failed open is a genuine error rather than a benign race that
 	// would silently drop mutations.
 	u := &WALUpdates{}
-	var maxSeen uint64
+	maxSeen := since
 	for _, num := range segs {
 		f, oerr := os.Open(db.walPath(num))
 		if oerr != nil {
 			return nil, fmt.Errorf("wal: open segment for updates: %w", oerr)
 		}
-		_, verr := replayWALFileVisit(f, 0, true, func(entries []walEntry) error {
+		_, verr := replayWALFileVisit(f, 0, false, num != db.wal.num, func(entries []walEntry) error {
+			// Publication happens only after an entire batch applies. Never emit
+			// a live record beyond the committed watermark captured above.
+			if entries[len(entries)-1].Seq > cutoff {
+				return errWALStop
+			}
+			if entries[0].Seq > maxSeen+1 {
+				return fmt.Errorf("wal: missing updates after sequence %d", maxSeen)
+			}
 			if batch := convertWALBatch(entries, since, &maxSeen); len(batch) > 0 {
 				u.batches = append(u.batches, batch)
 			}
+			if entries[len(entries)-1].Seq == cutoff {
+				return errWALStop
+			}
 			return nil
 		})
-		_ = f.Close()
-		// A lenient stop (errWALStop) or clean EOF ends this segment; keep going.
+		closeErr := f.Close()
 		if verr != nil && verr != errWALStop {
 			return nil, fmt.Errorf("wal: read updates: %w", verr)
 		}
+		if closeErr != nil {
+			return nil, closeErr
+		}
+		if verr == errWALStop {
+			break
+		}
+	}
+	if maxSeen != cutoff {
+		return nil, fmt.Errorf("wal: missing updates after sequence %d through %d", maxSeen, cutoff)
 	}
 	return u, nil
 }

@@ -1,7 +1,9 @@
 package levisdb
 
 import (
+	"errors"
 	"fmt"
+	"os"
 	"testing"
 	"time"
 
@@ -34,6 +36,64 @@ func TestLatestSeqTracksWrites(t *testing.T) {
 	b.Put(PutOptions{Key: []byte("c"), Value: []byte("3")})
 	require.NoError(t, db.Write(&b))
 	assert.Equal(t, uint64(3), db.LatestSeq())
+}
+
+func TestGetUpdatesSinceRejectsMissingRecords(t *testing.T) {
+	t.Parallel()
+	for _, mode := range []string{"first", "middle", "live", "missing-file", "record-boundary"} {
+		t.Run(mode, func(t *testing.T) {
+			t.Parallel()
+			db := openTestDB(t, func(o *Options) {
+				o.MemtableSize = 1 << 30
+				o.WALRetention = time.Hour
+			})
+			var firstRecordSize int64
+			for i := 1; i <= 6; i++ {
+				require.NoError(t, db.Put(PutOptions{Key: []byte(fmt.Sprint(i)), Value: []byte("v")}))
+				if i == 1 {
+					info, err := os.Stat(db.walPath(db.wal.num))
+					require.NoError(t, err)
+					firstRecordSize = info.Size()
+				}
+				if i%2 == 0 && i < 6 {
+					_, err := db.checkpointWALMode(true)
+					require.NoError(t, err)
+				}
+			}
+			logs, err := db.store.listLogs()
+			require.NoError(t, err)
+			require.Len(t, logs, 3)
+			switch mode {
+			case "first":
+				require.NoError(t, os.Truncate(db.walPath(logs[0]), 0))
+			case "middle":
+				require.NoError(t, os.Truncate(db.walPath(logs[1]), 0))
+			case "live":
+				require.NoError(t, os.Truncate(db.walPath(logs[2]), 0))
+			case "missing-file":
+				require.NoError(t, os.Remove(db.walPath(logs[1])))
+			case "record-boundary":
+				require.NoError(t, os.Truncate(db.walPath(logs[0]), firstRecordSize))
+			}
+			updates, err := db.GetUpdatesSince(0)
+			require.ErrorContains(t, err, "missing updates")
+			require.Nil(t, updates, "never expose a partial history")
+		})
+	}
+}
+
+func TestGetUpdatesSinceInsideBatch(t *testing.T) {
+	t.Parallel()
+	db := openTestDB(t, nil)
+	var batch Batch
+	for _, key := range []string{"a", "b", "c"} {
+		batch.Put(PutOptions{Key: []byte(key), Value: []byte("v")})
+	}
+	require.NoError(t, db.Write(&batch))
+	updates := drainUpdates(t, db, 1)
+	require.Len(t, updates, 2)
+	assert.Equal(t, uint64(2), updates[0].Seq)
+	assert.Equal(t, uint64(3), updates[1].Seq)
 }
 
 func TestGetUpdatesSinceLiveSegment(t *testing.T) {
@@ -75,10 +135,7 @@ func TestGetUpdatesSinceDeliversAbsoluteExpiry(t *testing.T) {
 }
 
 func TestGetUpdatesSinceRetainsAcrossFlush(t *testing.T) {
-	// Not parallel: mutates the global walSegmentBytes.
-	oldSeg := walSegmentBytes
-	walSegmentBytes = 4 << 10
-	t.Cleanup(func() { walSegmentBytes = oldSeg })
+	t.Parallel()
 
 	db := openTestDB(t, func(o *Options) {
 		o.MemtableSize = 4 << 10
@@ -86,8 +143,14 @@ func TestGetUpdatesSinceRetainsAcrossFlush(t *testing.T) {
 		o.WALRetentionBytes = 1 << 30 // wide byte horizon
 	})
 	const n = 500
-	for i := 0; i < n; i++ {
-		require.NoError(t, db.Put(PutOptions{Key: []byte(fmt.Sprintf("k%05d", i)), Value: []byte("value-payload")}))
+	for start := 0; start < n; start += 100 {
+		var batch Batch
+		for i := start; i < start+100; i++ {
+			batch.Put(PutOptions{Key: []byte(fmt.Sprintf("k%05d", i)), Value: []byte("value-payload")})
+		}
+		require.NoError(t, db.Write(&batch))
+		_, err := db.checkpointWALMode(true)
+		require.NoError(t, err)
 	}
 	db.sched.drain()
 
@@ -102,19 +165,15 @@ func TestGetUpdatesSinceRetainsAcrossFlush(t *testing.T) {
 }
 
 func TestGetUpdatesSinceRetentionExpired(t *testing.T) {
-	// Not parallel: mutates the global walSegmentBytes.
-	oldSeg := walSegmentBytes
-	walSegmentBytes = 4 << 10
-	t.Cleanup(func() { walSegmentBytes = oldSeg })
+	t.Parallel()
 
 	db := openTestDB(t, func(o *Options) { o.MemtableSize = 4 << 10 })
-	for i := 0; i < 500; i++ {
-		require.NoError(t, db.Put(PutOptions{Key: []byte(fmt.Sprintf("k%05d", i)), Value: []byte("value-payload")}))
-	}
-	db.sched.drain()
+	require.NoError(t, db.Put(PutOptions{Key: []byte("flushed"), Value: []byte("value-payload")}))
+	_, err := db.checkpointWALMode(true)
+	require.NoError(t, err)
 
 	// filterSafeSeq has advanced past the earliest writes; asking from 0 must fail.
-	_, err := db.GetUpdatesSince(0)
+	_, err = db.GetUpdatesSince(0)
 	require.ErrorIs(t, err, ErrRetentionExpired)
 
 	// Asking from the current watermark still works (nothing to send).
@@ -122,10 +181,7 @@ func TestGetUpdatesSinceRetentionExpired(t *testing.T) {
 }
 
 func TestGetUpdatesSinceReaperExpiresOldSegments(t *testing.T) {
-	// Not parallel: mutates the global walSegmentBytes.
-	oldSeg := walSegmentBytes
-	walSegmentBytes = 4 << 10
-	t.Cleanup(func() { walSegmentBytes = oldSeg })
+	t.Parallel()
 
 	// Retention on by BYTES only, with a tiny byte horizon so the reaper deletes
 	// all but the most recent retained segment. WALRetention=0 means the time
@@ -134,17 +190,19 @@ func TestGetUpdatesSinceReaperExpiresOldSegments(t *testing.T) {
 		o.MemtableSize = 4 << 10
 		o.WALRetentionBytes = 8 << 10 // keep only a few KB of flushed WAL
 	})
-	for i := 0; i < 500; i++ {
-		require.NoError(t, db.Put(PutOptions{Key: []byte(fmt.Sprintf("k%05d", i)), Value: []byte("value-payload")}))
+	for start := 0; start < 500; start += 100 {
+		var batch Batch
+		for i := start; i < start+100; i++ {
+			batch.Put(PutOptions{Key: []byte(fmt.Sprintf("k%05d", i)), Value: []byte("value-payload")})
+		}
+		require.NoError(t, db.Write(&batch))
+		_, err := db.checkpointWALMode(true)
+		require.NoError(t, err)
 	}
 	db.sched.drain()
-	// The reaper runs inside a WAL checkpoint on a background goroutine; force a
-	// synchronous checkpoint so the reap has definitely happened before asserting.
-	_, err := db.checkpointWALMode(true)
-	require.NoError(t, err)
 
 	// The reaper deleted the oldest segments, so seq 0 is below the horizon.
-	_, err = db.GetUpdatesSince(0)
+	_, err := db.GetUpdatesSince(0)
 	require.ErrorIs(t, err, ErrRetentionExpired)
 
 	// The tail is still replayable: catching up from near the end returns the most
@@ -204,4 +262,87 @@ func TestGetUpdatesSinceClosedDB(t *testing.T) {
 	require.NoError(t, db.Close())
 	_, err := db.GetUpdatesSince(0)
 	assert.ErrorIs(t, err, ErrClosed)
+}
+
+func TestRegressionRetentionHorizonRestart(t *testing.T) {
+	t.Parallel()
+	opts := DefaultOptions(t.TempDir())
+	opts.WALRetention = time.Hour
+	db, err := Open(opts)
+	require.NoError(t, err)
+	require.NoError(t, db.Put(PutOptions{Key: []byte("k"), Value: []byte("v")}))
+	require.NoError(t, db.Close())
+	db, err = Open(opts)
+	require.NoError(t, err)
+	defer db.Close()
+	updates, err := db.GetUpdatesSince(0)
+	if updates != nil {
+		defer updates.Close()
+	}
+	if !errors.Is(err, ErrRetentionExpired) {
+		t.Fatalf("missing pre-restart WAL history accepted: err=%v", err)
+	}
+}
+
+func TestRegressionUpdatesBeforeCommit(t *testing.T) {
+	t.Parallel()
+	db := openTestDB(t, func(o *Options) { o.MemtableSize = 1 << 30 })
+	entered, release := make(chan struct{}), make(chan struct{})
+	apply := db.wal.wal.apply
+	db.wal.wal.apply = func(es []walEntry) { close(entered); <-release; apply(es) }
+	done := make(chan error, 1)
+	go func() { done <- db.Put(PutOptions{Key: []byte("k"), Value: []byte("v")}) }()
+	<-entered
+	seq := db.LatestSeq()
+	updates, err := db.GetUpdatesSince(seq)
+	close(release)
+	require.NoError(t, <-done)
+	require.NoError(t, err)
+	defer updates.Close()
+	if updates.Next() {
+		t.Fatalf("updates returned uncommitted batch beyond LatestSeq=%d: %+v", seq, updates.Batch())
+	}
+}
+
+func TestRegressionUpdatesSkipCorruptSegment(t *testing.T) {
+	t.Parallel()
+	db := openTestDB(t, func(o *Options) { o.WALRetention = time.Hour })
+	require.NoError(t, db.Put(PutOptions{Key: []byte("a"), Value: []byte("one")}))
+	oldPath := db.walPath(db.wal.num)
+	_, err := db.checkpointWALMode(true)
+	require.NoError(t, err)
+	require.NoError(t, db.Put(PutOptions{Key: []byte("b"), Value: []byte("two")}))
+	f, err := os.OpenFile(oldPath, os.O_RDWR, 0)
+	require.NoError(t, err)
+	b := make([]byte, 1)
+	_, err = f.ReadAt(b, 0)
+	require.NoError(t, err)
+	b[0] ^= 0xff
+	_, err = f.WriteAt(b, 0)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+	updates, err := db.GetUpdatesSince(0)
+	if err != nil {
+		return
+	}
+	defer updates.Close()
+	if updates.Next() {
+		t.Fatalf("replication silently skipped corrupt seq 1 and returned %+v", updates.Batch())
+	}
+	t.Fatal("replication silently accepted corrupt WAL")
+}
+
+func TestReplicationRejectsTruncatedRetainedSegment(t *testing.T) {
+	t.Parallel()
+	db := openTestDB(t, func(o *Options) { o.WALRetention = time.Hour })
+	require.NoError(t, db.Put(PutOptions{Key: []byte("a"), Value: []byte("one")}))
+	path := db.walPath(db.wal.num)
+	_, err := db.checkpointWALMode(true)
+	require.NoError(t, err)
+	require.NoError(t, db.Put(PutOptions{Key: []byte("b"), Value: []byte("two")}))
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	require.NoError(t, os.Truncate(path, info.Size()-1))
+	_, err = db.GetUpdatesSince(0)
+	require.ErrorIs(t, err, errJournalCorrupt)
 }

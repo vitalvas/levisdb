@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -410,6 +411,7 @@ func TestOverlapScopedCompaction(t *testing.T) {
 // crash-safe end to end: after a DB-level compaction that used overlap selection,
 // a crash and reopen returns every key.
 func TestOverlapScopedCompactionSurvivesCrash(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	opts := func() Options {
 		o := DefaultOptions(dir)
@@ -422,9 +424,14 @@ func TestOverlapScopedCompactionSurvivesCrash(t *testing.T) {
 
 	// Two interleaved key ranges so the tier has both overlap groups.
 	const n = 400
-	for i := 0; i < n; i++ {
-		require.NoError(t, db.Put(PutOptions{Key: []byte(fmt.Sprintf("lo-%05d", i)), Value: []byte("v")}))
-		require.NoError(t, db.Put(PutOptions{Key: []byte(fmt.Sprintf("hi-%05d", i)), Value: []byte("v")}))
+	for start := 0; start < n; start += 100 {
+		var batch Batch
+		for i := start; i < start+100; i++ {
+			batch.Put(PutOptions{Key: []byte(fmt.Sprintf("lo-%05d", i)), Value: []byte("v")})
+			batch.Put(PutOptions{Key: []byte(fmt.Sprintf("hi-%05d", i)), Value: []byte("v")})
+		}
+		require.NoError(t, db.Write(&batch))
+		db.sched.drain()
 	}
 	require.NoError(t, db.CompactRange(nil, nil)) // exercises the overlap-scoped path
 	db.crash()
@@ -1047,4 +1054,39 @@ func TestTombstoneCompactionReclaimsDeletedSpace(t *testing.T) {
 		assert.False(t, found, "deleted key k%d must be absent after tombstone compaction", i)
 	}
 	assert.Zero(t, s.depth0Count(), "delete-heavy tier compacted away")
+}
+
+func TestRegressionTTLReplayCompactionConflict(t *testing.T) {
+	t.Parallel()
+	opts := DefaultOptions(t.TempDir())
+	opts.MemtableSize = 1 << 30
+	db, err := Open(opts)
+	require.NoError(t, err)
+	require.NoError(t, db.Put(PutOptions{Key: []byte("k"), Value: []byte("old")}))
+	require.NoError(t, db.eng.Flush())
+	require.NoError(t, db.Put(PutOptions{Key: []byte("z"), Value: []byte("v")}))
+	require.NoError(t, db.eng.Flush())
+	require.NoError(t, db.eng.Compact(0, db.LatestSeq(), db.compactionConfig()))
+	require.NoError(t, db.Put(PutOptions{Key: []byte("k"), Value: []byte("new"), TTL: time.Nanosecond}))
+	require.NoError(t, db.eng.Flush())
+	require.NoError(t, db.Put(PutOptions{Key: []byte("y"), Value: []byte("v")}))
+	require.NoError(t, db.eng.Flush())
+	require.NoError(t, db.eng.Compact(0, db.LatestSeq(), db.compactionConfig()))
+	db.crash()
+	db, err = Open(opts)
+	require.NoError(t, err)
+	defer db.Close()
+	if err := db.CompactRange(nil, nil); err != nil {
+		t.Fatalf("TTL conversion conflicts with WAL replay: %v", err)
+	}
+}
+
+func TestTTLReplayDoesNotHidePayloadConflicts(t *testing.T) {
+	t.Parallel()
+	s := newTestEngine(t, 1<<20)
+	for _, value := range []string{"first", "second"} {
+		s.putTTL(1, []byte("k"), []byte(value), 1)
+		require.NoError(t, s.Flush())
+	}
+	require.ErrorContains(t, s.CompactAll(maxIKeySeq, testCompactionConfig()), "conflicting values")
 }

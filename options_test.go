@@ -27,6 +27,19 @@ func TestDefaultOptions(t *testing.T) {
 	require.NoError(t, o.validate())
 }
 
+func TestOpenRejectsUnreachableCompactionThreshold(t *testing.T) {
+	t.Parallel()
+	for _, ratio := range []int{4, 32} {
+		opts := DefaultOptions(t.TempDir())
+		opts.TierRatio = ratio
+		opts.L0SlowdownTables = 1
+		opts.L0StopTables = ratio - 1
+		db, err := Open(opts)
+		require.ErrorContains(t, err, "must be >= TierRatio")
+		require.Nil(t, db)
+	}
+}
+
 func TestFillDefaultsPreservesSetValues(t *testing.T) {
 	t.Parallel()
 	o := Options{
@@ -87,6 +100,8 @@ func TestValidate(t *testing.T) {
 		{"NaN tombstone ratio", func(o *Options) { o.TombstoneCompactionRatio = math.NaN() }, "TombstoneCompactionRatio"},
 		{"tombstone ratio above one", func(o *Options) { o.TombstoneCompactionRatio = 1.1 }, "TombstoneCompactionRatio"},
 		{"stop below slowdown", func(o *Options) { o.L0SlowdownTables = 10; o.L0StopTables = 5 }, "L0StopTables"},
+		{"stop below compaction ratio", func(o *Options) { o.TierRatio = 32 }, "must be >= TierRatio"},
+		{"disabled stop with high compaction ratio", func(o *Options) { o.TierRatio = 32; o.L0StopTables = -1 }, ""},
 		{"non-positive file size base", func(o *Options) { o.FileSizeBase = -1 }, "FileSizeBase must be positive"},
 		{"file size multiplier too small", func(o *Options) { o.FileSizeMultiplier = 0 }, "FileSizeMultiplier must be >= 1"},
 		{"max below base", func(o *Options) { o.FileSizeMax = o.FileSizeBase - 1 }, "FileSizeMax"},

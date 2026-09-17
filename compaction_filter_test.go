@@ -340,3 +340,98 @@ func TestSnapshotCreationWaitsForFilteringCompaction(t *testing.T) {
 		t.Fatal("snapshot creation did not resume after compaction committed")
 	}
 }
+
+func TestRegressionRetainedWALFilterCrash(t *testing.T) {
+	t.Parallel()
+	opts := DefaultOptions(t.TempDir())
+	opts.WALRetention = time.Hour
+	opts.CompactionFilter = func(CompactionFilterEntry) bool { return false }
+	db, err := Open(opts)
+	require.NoError(t, err)
+	require.NoError(t, db.Put(PutOptions{Key: []byte("k"), Value: []byte("v")}))
+	require.NoError(t, db.CompactRange(nil, nil))
+	_, err = db.Get([]byte("k"))
+	require.ErrorIs(t, err, ErrNotFound)
+	db.crash()
+	db, err = Open(opts)
+	require.NoError(t, err)
+	defer db.Close()
+	v, err := db.Get([]byte("k"))
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("filtered key resurrected after crash: value=%q err=%v", v, err)
+	}
+}
+
+func TestRegressionFilterCutoffIncludesLiveWAL(t *testing.T) {
+	t.Parallel()
+	opts := DefaultOptions(t.TempDir())
+	opts.MemtableSize = 1 << 30
+	opts.CompactionFilter = func(CompactionFilterEntry) bool { return false }
+	db, err := Open(opts)
+	require.NoError(t, err)
+	require.NoError(t, db.Put(PutOptions{Key: []byte("seed"), Value: []byte("v")}))
+	db.seqMu.Lock()
+	written := make(chan error, 1)
+	go func() { written <- db.Put(PutOptions{Key: []byte("k"), Value: []byte("v")}) }()
+	time.Sleep(20 * time.Millisecond) // writer holds db.mu.RLock while waiting for seqMu
+	checkpointed := make(chan error, 1)
+	go func() { _, err := db.checkpointWALMode(true); checkpointed <- err }()
+	deadline := time.Now().Add(time.Second)
+	for db.maxWALSegmentSize() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("WAL did not rotate")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	db.seqMu.Unlock() // queued write lands in the NEW WAL before cutoff is captured
+	require.NoError(t, <-written)
+	require.NoError(t, <-checkpointed)
+	require.Equal(t, uint64(1), db.filterSafeSeq.Load(), "the write in the new WAL is not covered by the retired cutoff")
+	require.NoError(t, db.CompactRange(nil, nil))
+	_, err = db.Get([]byte("k"))
+	require.ErrorIs(t, err, ErrNotFound)
+	db.crash()
+	db, err = Open(opts)
+	require.NoError(t, err)
+	defer db.Close()
+	v, err := db.Get([]byte("k"))
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("filtered key replayed from live WAL with retention disabled: value=%q err=%v", v, err)
+	}
+}
+
+func TestRegressionFilterReaderLockCycle(t *testing.T) {
+	t.Parallel()
+	db := openTestDB(t, func(o *Options) {
+		o.MemtableSize = 1 << 30
+		o.CompactionFilter = func(CompactionFilterEntry) bool { return true }
+	})
+	require.NoError(t, db.Put(PutOptions{Key: []byte("k"), Value: []byte("v")}))
+	db.checkpointMu.Lock()
+	configured := make(chan error, 1)
+	started := make(chan struct{})
+	go func() {
+		close(started)
+		_, _, release, err := db.compactionRunConfig(true)
+		release()
+		configured <- err
+	}()
+	<-started
+	time.Sleep(20 * time.Millisecond)
+	readDone := make(chan error, 1)
+	go func() { _, err := db.Get([]byte("k")); readDone <- err }()
+	// A pending checkpoint must not reserve the filter interval and block reads.
+	select {
+	case err := <-readDone:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Error("reader blocked by a filter reservation while checkpoint was pending")
+	}
+	db.checkpointMu.Unlock()
+	select {
+	case err := <-configured:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("filter checkpoint did not complete")
+	}
+}

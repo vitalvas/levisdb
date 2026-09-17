@@ -681,7 +681,12 @@ func (s *engineT) openTableMeta(spec tableSpec) (*tableMeta, error) {
 	// Drop the reader's parsed index/filter when its descriptor is evicted, so
 	// resident metadata is bounded by the open-file count, not the live-table
 	// count. A later read rebuilds it on demand.
+	handle.rw.Lock()
 	handle.onEvict = r.dropMeta
+	if handle.file == nil {
+		r.dropMeta() // eviction may have finished before the callback was installed
+	}
+	handle.rw.Unlock()
 	return &tableMeta{
 		num:        spec.num,
 		depth:      spec.depth,

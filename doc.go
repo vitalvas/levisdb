@@ -41,7 +41,8 @@
 //
 // so hot shallow tiers hold small, cheap files and cold deep tiers hold fewer,
 // larger ones. MaxCompactionBytes caps the input merged in one non-bottom pass;
-// the bottom tier always merges whole so tombstone GC stays correct.
+// bottom merges include the whole tier and overlapping shallower tables so
+// tombstone GC stays correct after ingestion.
 // TombstoneCompactionRatio compacts a delete-heavy tier early to reclaim space.
 //
 // Writes are throttled by fresh-tier table count so a burst cannot outrun the

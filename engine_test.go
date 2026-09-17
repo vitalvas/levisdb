@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -266,4 +267,36 @@ func TestEngineTableBoundsPopulatedAndReadSkip(t *testing.T) {
 	assert.False(t, found)
 	// In-range key still found.
 	assert.Equal(t, []byte("v-k20"), mustGet(t, s, 100, "k20"))
+}
+
+func TestOpenTableMetaConcurrentEviction(t *testing.T) {
+	t.Parallel()
+	s := newTestEngine(t, 1<<20)
+	flushSingle(t, s, 1, "key", "value")
+	src := s.tables[0]
+	s.cfg.FDs = newFDPool(1)
+	var wg sync.WaitGroup
+	errs := make(chan error, 8)
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 30 {
+				m, err := s.openTableMeta(tableSpec{num: 100, path: src.path, size: src.size})
+				if err != nil {
+					errs <- err
+					return
+				}
+				if err := m.releaseOwner(false); err != nil {
+					errs <- err
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		require.NoError(t, err)
+	}
 }

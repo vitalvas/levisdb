@@ -163,10 +163,13 @@ func (tr *tableReader) rangeTombstones() ([]rangeTombstone, error) {
 // blocks directly (bypassing the block cache) so a cached-but-stale copy cannot
 // mask on-disk corruption.
 func (tr *tableReader) verify() error {
-	m, err := tr.ensureMeta()
+	// Reopen the format over the existing reader to check the footer and all
+	// metadata from disk, independently of previously cached parsed metadata.
+	fresh, err := newCachedTableReader(tr.r, tr.size, nil, tr.tableNum)
 	if err != nil {
 		return err
 	}
+	m := fresh.meta.Load()
 	for i := range m.indexEnt {
 		if _, err := tr.readBlockRaw(m.blockHandleAt(i)); err != nil {
 			return fmt.Errorf("table: data block %d: %w", i, err)
