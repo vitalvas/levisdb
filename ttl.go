@@ -9,12 +9,16 @@ import (
 const expiryPrefixLen = 8
 
 // PutOptions describes one put operation. Key and Value are copied before the
-// call returns. A zero TTL stores the value without expiration; a positive TTL
-// is measured from Write submission.
+// call returns. A zero ExpiresAt stores the value without expiration; a positive
+// ExpiresAt is an absolute expiry instant in Unix seconds (as from
+// time.Time.Unix). Sub-second TTLs are not supported, so the unit is seconds. A
+// negative or already-past value is rejected with ErrInvalidTTL. The deadline is
+// absolute, not relative, so re-writing the same key/value/ExpiresAt is a
+// byte-identical record (see Options.Deduplication).
 type PutOptions struct {
-	Key   []byte
-	Value []byte
-	TTL   time.Duration
+	Key       []byte
+	Value     []byte
+	ExpiresAt int64
 }
 
 func encodeExpiringValue(value []byte, expiresAt int64) []byte {
@@ -34,16 +38,15 @@ func decodeExpiringValue(stored []byte) (value []byte, expiresAt int64, err erro
 	return stored[expiryPrefixLen:], expiresAt, nil
 }
 
-func ttlExpiresAt(now time.Time, ttl time.Duration) (int64, error) {
-	if ttl < 0 {
-		return 0, ErrInvalidTTL
+// validateExpiresAt checks an absolute expiry (Unix seconds) supplied on a put.
+// Zero means no expiration. A negative value, or one already at or before now, is
+// rejected: an already-expired write stores a value no read would ever return.
+func validateExpiresAt(now time.Time, expiresAt int64) error {
+	if expiresAt == 0 {
+		return nil
 	}
-	if ttl == 0 {
-		return 0, nil
+	if expiresAt <= now.Unix() {
+		return ErrInvalidTTL
 	}
-	nowNanos := now.UnixNano()
-	if int64(ttl) > int64(^uint64(0)>>1)-nowNanos {
-		return 0, ErrInvalidTTL
-	}
-	return nowNanos + int64(ttl), nil
+	return nil
 }

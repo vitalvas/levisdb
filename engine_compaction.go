@@ -718,7 +718,7 @@ func (s *engineT) writeMerged(mw mergeWrite) ([]*tableMeta, mergeStats, error) {
 	reclaimHere := mw.dropTombstones
 	now := mw.cc.ExpireBefore
 	if now == 0 {
-		now = time.Now().UnixNano()
+		now = time.Now().Unix()
 	}
 	for mw.merged.Next() {
 		ik := mw.merged.internalKey()
@@ -858,7 +858,9 @@ func resolveCompactionEntry(cc compactionConfigT, e mergeEntry, now int64) (writ
 			return ikeyEncode(nil, e.user, e.seq, ikeyKindDelete), nil, ikeyKindDelete, nil
 		}
 		filterValue = decoded
-		ttl = time.Duration(expiresAt - now)
+		// expiresAt and now are Unix seconds; the filter reports remaining lifetime
+		// as a duration.
+		ttl = time.Duration(expiresAt-now) * time.Second
 	}
 	filterSafe := cc.FilterThrough == 0 || e.seq <= cc.FilterThrough
 	if e.kind != ikeyKindDelete && cc.Filter != nil && filterSafe {

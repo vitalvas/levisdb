@@ -18,7 +18,7 @@ type engineIterator struct {
 	end       []byte // exclusive upper bound, nil for unbounded
 	key       []byte
 	value     []byte
-	expiresAt int64 // absolute deadline (Unix nanos) of the current TTL entry, 0 otherwise
+	expiresAt int64 // absolute deadline (Unix seconds) of the current TTL entry, 0 otherwise
 	lastKey   []byte
 	primed    bool
 	refs      []*tableMeta
@@ -38,7 +38,7 @@ func (s *engineT) NewIterator(seq uint64) *engineIterator {
 // NewRangeIterator returns an iterator over [start, end) at snapshot seq. A nil
 // bound is unbounded on that side.
 func (s *engineT) NewRangeIterator(seq uint64, start, end []byte) *engineIterator {
-	return s.newRangeIteratorAt(seq, start, end, time.Now().UnixNano())
+	return s.newRangeIteratorAt(seq, start, end, time.Now().Unix())
 }
 
 func (s *engineT) newRangeIteratorAt(seq uint64, start, end []byte, readTime int64) *engineIterator {
@@ -177,7 +177,7 @@ func (it *engineIterator) Key() []byte { return it.key }
 // to Next; copy it to retain.
 func (it *engineIterator) Value() []byte { return it.value }
 
-// valueExpiresAt returns the absolute expiration (Unix nanos) of the current
+// valueExpiresAt returns the absolute expiration (Unix seconds) of the current
 // entry, or 0 when it has no TTL. Valid only until the next call to Next.
 func (it *engineIterator) valueExpiresAt() int64 { return it.expiresAt }
 

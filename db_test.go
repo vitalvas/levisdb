@@ -52,6 +52,67 @@ func TestGetMissing(t *testing.T) {
 	assert.ErrorIs(t, err, ErrNotFound)
 }
 
+func TestDeduplicationSkipsUnchangedPuts(t *testing.T) {
+	t.Parallel()
+	// LatestSeq advances only when a write lands in the WAL, so an unchanged seq
+	// after a put proves the put was deduplicated.
+	expiresAt := time.Now().Add(time.Hour).Unix()
+
+	// A large memtable keeps these logical dedup checks in memory with no flush
+	// churn; the feature is unaffected by on-disk layout.
+	dedupOn := func(o *Options) { o.Deduplication = true; o.MemtableSize = 1 << 30 }
+
+	t.Run("off by default writes every put", func(t *testing.T) {
+		db := openTestDB(t, func(o *Options) { o.MemtableSize = 1 << 30 })
+		require.NoError(t, db.Put(PutOptions{Key: []byte("k"), Value: []byte("v")}))
+		first := db.LatestSeq()
+		require.NoError(t, db.Put(PutOptions{Key: []byte("k"), Value: []byte("v")}))
+		assert.Greater(t, db.LatestSeq(), first, "default (off) must write the duplicate")
+	})
+
+	t.Run("identical put is skipped", func(t *testing.T) {
+		db := openTestDB(t, dedupOn)
+		require.NoError(t, db.Put(PutOptions{Key: []byte("k"), Value: []byte("v")}))
+		seq := db.LatestSeq()
+		for i := 0; i < 100; i++ {
+			require.NoError(t, db.Put(PutOptions{Key: []byte("k"), Value: []byte("v")}))
+		}
+		assert.Equal(t, seq, db.LatestSeq(), "repeated identical puts add no WAL record")
+		v, err := db.Get([]byte("k"))
+		require.NoError(t, err)
+		assert.Equal(t, []byte("v"), v)
+	})
+
+	t.Run("a changed field writes", func(t *testing.T) {
+		db := openTestDB(t, dedupOn)
+		require.NoError(t, db.Put(PutOptions{Key: []byte("k"), Value: []byte("v"), ExpiresAt: expiresAt}))
+		seq := db.LatestSeq()
+		// Same key+value+ExpiresAt: skipped.
+		require.NoError(t, db.Put(PutOptions{Key: []byte("k"), Value: []byte("v"), ExpiresAt: expiresAt}))
+		assert.Equal(t, seq, db.LatestSeq())
+		// Different value: written.
+		require.NoError(t, db.Put(PutOptions{Key: []byte("k"), Value: []byte("w"), ExpiresAt: expiresAt}))
+		assert.Greater(t, db.LatestSeq(), seq)
+		seq = db.LatestSeq()
+		// Different ExpiresAt: written.
+		require.NoError(t, db.Put(PutOptions{Key: []byte("k"), Value: []byte("w"), ExpiresAt: expiresAt + 1}))
+		assert.Greater(t, db.LatestSeq(), seq)
+	})
+
+	t.Run("re-put after delete writes", func(t *testing.T) {
+		db := openTestDB(t, dedupOn)
+		require.NoError(t, db.Put(PutOptions{Key: []byte("k"), Value: []byte("v")}))
+		require.NoError(t, db.Delete([]byte("k")))
+		seq := db.LatestSeq()
+		// The value is gone, so the same put is not a duplicate and must apply.
+		require.NoError(t, db.Put(PutOptions{Key: []byte("k"), Value: []byte("v")}))
+		assert.Greater(t, db.LatestSeq(), seq)
+		v, err := db.Get([]byte("k"))
+		require.NoError(t, err)
+		assert.Equal(t, []byte("v"), v)
+	})
+}
+
 func TestOverwrite(t *testing.T) {
 	t.Parallel()
 	db := openTestDB(t, nil)
@@ -844,10 +905,11 @@ func TestEntryTooLargeRejected(t *testing.T) {
 	assert.ErrorIs(t, db.Put(PutOptions{Key: []byte("big"), Value: big}), ErrEntryTooLarge)
 
 	// TTL path counts the expiry prefix toward the limit.
+	expiresAt := time.Now().Add(time.Hour).Unix()
 	justUnder := make([]byte, maxEntrySize-len("k")-expiryPrefixLen)
-	assert.NoError(t, db.Put(PutOptions{Key: []byte("k"), Value: justUnder, TTL: time.Hour}))
+	assert.NoError(t, db.Put(PutOptions{Key: []byte("k"), Value: justUnder, ExpiresAt: expiresAt}))
 	overWithTTL := make([]byte, maxEntrySize-len("k")-expiryPrefixLen+1)
-	assert.ErrorIs(t, db.Put(PutOptions{Key: []byte("k"), Value: overWithTTL, TTL: time.Hour}), ErrEntryTooLarge)
+	assert.ErrorIs(t, db.Put(PutOptions{Key: []byte("k"), Value: overWithTTL, ExpiresAt: expiresAt}), ErrEntryTooLarge)
 
 	// A batch is rejected atomically if any op is too large (no partial apply).
 	var b Batch

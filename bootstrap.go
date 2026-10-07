@@ -19,7 +19,7 @@ import (
 // public iterator to read ValueExpiresAt, it must acquire and release those pins
 // itself. Returns ErrClosed if the database is closed.
 func (s *Snapshot) openImageScan() (*engineIterator, func(), error) {
-	readTime := time.Now().UnixNano()
+	readTime := time.Now().Unix()
 	s.db.mu.RLock()
 	if s.db.closed {
 		s.db.mu.RUnlock()

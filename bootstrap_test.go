@@ -54,7 +54,7 @@ func TestSnapshotWriteTo(t *testing.T) {
 		t.Parallel()
 		src := openTestDB(t, func(o *Options) { o.MemtableSize = 1 << 30 })
 		require.NoError(t, src.Put(PutOptions{Key: []byte("plain"), Value: []byte("v")}))
-		require.NoError(t, src.Put(PutOptions{Key: []byte("ttl"), Value: []byte("v"), TTL: time.Hour}))
+		require.NoError(t, src.Put(PutOptions{Key: []byte("ttl"), Value: []byte("v"), ExpiresAt: time.Now().Add(time.Hour).Unix()}))
 
 		// The exact stored deadline the source recorded for the TTL key.
 		srcEntries := drainUpdates(t, src, 0)

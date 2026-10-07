@@ -10,10 +10,10 @@ package levisdb
 // synchronously.)
 func (b *Batch) Put(opts PutOptions) {
 	b.ops = append(b.ops, batchOp{
-		kind:  EntryPut,
-		key:   opts.Key,
-		value: opts.Value,
-		ttl:   opts.TTL,
+		kind:      EntryPut,
+		key:       opts.Key,
+		value:     opts.Value,
+		expiresAt: opts.ExpiresAt,
 	})
 }
 

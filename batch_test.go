@@ -61,8 +61,9 @@ func TestBatchWriteThenCallerMayMutate(t *testing.T) {
 }
 
 func TestBatchRetainsPutTTL(t *testing.T) {
+	expiresAt := time.Now().Add(time.Minute).Unix()
 	var b Batch
-	b.Put(PutOptions{Key: []byte("key"), Value: []byte("value"), TTL: time.Minute})
+	b.Put(PutOptions{Key: []byte("key"), Value: []byte("value"), ExpiresAt: expiresAt})
 	require.Len(t, b.ops, 1)
-	assert.Equal(t, time.Minute, b.ops[0].ttl)
+	assert.Equal(t, expiresAt, b.ops[0].expiresAt)
 }

@@ -267,10 +267,7 @@ func convertWALBatch(entries []walEntry, since uint64, maxSeen *uint64) []WALEnt
 			Key:   append([]byte(nil), e.Key...),
 			Value: append([]byte(nil), e.Value...),
 		}
-		if e.ExpiresAt != 0 {
-			we.ExpiresAt = e.ExpiresAt
-			we.TTL = time.Until(time.Unix(0, e.ExpiresAt))
-		}
+		we.ExpiresAt = e.ExpiresAt
 		out = append(out, we)
 	}
 	return out

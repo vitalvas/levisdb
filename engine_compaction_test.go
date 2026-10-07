@@ -1190,7 +1190,16 @@ func TestRegressionTTLReplayCompactionConflict(t *testing.T) {
 	require.NoError(t, db.Put(PutOptions{Key: []byte("z"), Value: []byte("v")}))
 	require.NoError(t, db.eng.Flush())
 	require.NoError(t, db.eng.Compact(0, db.LatestSeq(), db.compactionConfig()))
-	require.NoError(t, db.Put(PutOptions{Key: []byte("k"), Value: []byte("new"), TTL: time.Nanosecond}))
+	// An already-expired TTL (deadline one second in the past) reproduces the
+	// replay-vs-compaction conflict without a wall-clock wait: the compaction below
+	// physically expires it while the WAL still carries the original TTL put. The
+	// public Put rejects a past deadline, so inject the WAL entry directly.
+	require.NoError(t, db.appendWAL([]walEntry{{
+		Kind:      walKindPutTTL,
+		Key:       []byte("k"),
+		Value:     []byte("new"),
+		ExpiresAt: time.Now().Unix() - 1,
+	}}))
 	require.NoError(t, db.eng.Flush())
 	require.NoError(t, db.Put(PutOptions{Key: []byte("y"), Value: []byte("v")}))
 	require.NoError(t, db.eng.Flush())

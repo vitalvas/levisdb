@@ -18,7 +18,7 @@ type dbIterator struct {
 }
 
 func (db *DB) newRangeIterator(seq uint64, start, end []byte) (Iterator, error) {
-	readTime := time.Now().UnixNano()
+	readTime := time.Now().Unix()
 	db.snaps.acquireIteratorTime(readTime)
 	src := db.eng.newRangeIteratorAt(seq, start, end, readTime)
 	return &dbIterator{src: src, snaps: db.snaps, seq: seq, readTime: readTime}, nil

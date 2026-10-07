@@ -77,11 +77,21 @@
 //
 // # TTL
 //
-// PutOptions.TTL sets a per-value lifetime. Zero means no expiration; a negative
-// or unrepresentable duration returns ErrInvalidTTL. Expiration is stored as an
-// absolute deadline, so recovery does not restart it. An expired newest value
-// behaves as a tombstone and never reveals an older one. Point reads evaluate
-// expiry when called; each iterator captures one time at creation.
+// PutOptions.ExpiresAt sets a per-value absolute expiry, a Unix-second instant
+// (sub-second TTLs are not supported). Zero means no expiration; a negative or
+// already-past value returns ErrInvalidTTL. The deadline is stored as given, so
+// recovery does not restart it and a replica can reproduce it exactly
+// (WALEntry.ExpiresAt). An expired newest value behaves as a tombstone and never
+// reveals an older one. Point reads evaluate expiry when called; each iterator
+// captures one time at creation.
+//
+// # Deduplication
+//
+// Options.Deduplication, off by default, skips a put whose key already holds an
+// identical value and the same ExpiresAt, so an unchanged row re-written any number
+// of times produces no new WAL record, memtable version, or compaction work.
+// Because ExpiresAt is absolute, re-writing the same key/value/ExpiresAt is a
+// byte-identical record. It costs one point lookup per put while enabled.
 //
 // # Range deletes
 //

@@ -121,10 +121,10 @@ type Batch struct {
 }
 
 type batchOp struct {
-	kind  EntryKind
-	key   []byte
-	value []byte
-	ttl   time.Duration
+	kind      EntryKind
+	key       []byte
+	value     []byte
+	expiresAt int64
 	// rangeDel marks a range delete: key is the inclusive start and value is the
 	// exclusive end. kind is ignored for a range delete.
 	rangeDel bool
@@ -464,7 +464,7 @@ func (db *DB) compactionConfig() compactionConfigT {
 		FileSizeMultiplier: db.opts.FileSizeMultiplier,
 		FileSizeMax:        db.opts.FileSizeMax,
 		MaxLevels:          db.opts.MaxLevels,
-		ExpireBefore:       db.snaps.oldestIteratorTime(time.Now().UnixNano()),
+		ExpireBefore:       db.snaps.oldestIteratorTime(time.Now().Unix()),
 		Filter:             db.opts.CompactionFilter,
 		MaxCompactionBytes: maxCompactionBytes(db.opts.MaxCompactionBytes),
 		OverlapSelection:   !db.opts.DisableOverlapSelection,
@@ -1008,13 +1008,13 @@ func (db *DB) writeBatch(b *Batch) error {
 		return nil
 	}
 
-	entries := make([]walEntry, len(b.ops))
+	entries := make([]walEntry, 0, len(b.ops))
 	now := time.Now()
 	// The whole batch is applied to the memtable before any flush check, so bound
 	// the cumulative bytes as well as each entry. Both limits keep the skiplist
 	// arena (uint32 offsets) well below 2^32.
 	var total int64
-	for i, op := range b.ops {
+	for _, op := range b.ops {
 		if len(op.key) == 0 {
 			return ErrEmptyKey
 		}
@@ -1031,14 +1031,14 @@ func (db *DB) writeBatch(b *Batch) error {
 			if total > int64(maxEntrySize) {
 				return ErrBatchTooLarge
 			}
-			entries[i] = walEntry{Kind: walKindRangeDelete, Key: op.key, Value: op.value}
+			entries = append(entries, walEntry{Kind: walKindRangeDelete, Key: op.key, Value: op.value})
 			continue
 		}
 		// Reject an entry that would approach the uint32 offset limits and
 		// silently corrupt the skiplist arena or a data block. A TTL value carries
 		// an extra 8-byte expiry prefix, so count it toward the limit.
 		entrySize := len(op.key) + len(op.value)
-		if op.ttl > 0 {
+		if op.expiresAt != 0 {
 			entrySize += expiryPrefixLen
 		}
 		if entrySize > maxEntrySize {
@@ -1048,27 +1048,52 @@ func (db *DB) writeBatch(b *Batch) error {
 		if total > int64(maxEntrySize) {
 			return ErrBatchTooLarge
 		}
-		expiresAt, err := ttlExpiresAt(now, op.ttl)
-		if err != nil {
+		if err := validateExpiresAt(now, op.expiresAt); err != nil {
 			return err
 		}
+		// Deduplication: skip a put whose committed value, and absolute expiry,
+		// already match. Because ExpiresAt is absolute, re-writing the same
+		// key/value/ExpiresAt is byte-identical, so a caller rewriting an unchanged
+		// row (even thousands of times) adds no WAL record, memtable version, or
+		// compaction work. Only puts dedup; deletes and range deletes always apply.
+		if op.kind == EntryPut && db.opts.Deduplication && db.isDuplicatePut(op) {
+			continue
+		}
 		kind := walKind(op.kind)
-		if kind == walKindPut && expiresAt != 0 {
+		if kind == walKindPut && op.expiresAt != 0 {
 			kind = walKindPutTTL
 		}
-		entries[i] = walEntry{
+		entries = append(entries, walEntry{
 			Kind:      kind,
 			Key:       op.key,
 			Value:     op.value,
-			ExpiresAt: expiresAt,
-		}
+			ExpiresAt: op.expiresAt,
+		})
 	}
 
+	if len(entries) == 0 {
+		return nil
+	}
 	if err := db.appendWAL(entries); err != nil {
 		db.setBackgroundError(err)
 		return err
 	}
 	return nil
+}
+
+// isDuplicatePut reports whether op would store a value identical to the one
+// already committed for its key: same value bytes and the same absolute expiry.
+// It is called only when Options.Deduplication is set, under db.mu held by the
+// caller (writeBatch runs inside Write's read lock). A tombstoned or absent key is
+// never a duplicate, so the put proceeds. A lookup error (for example a corrupt
+// table) is treated as "not a duplicate" so the write still happens; the error
+// surfaces on the caller's own read, not here.
+func (db *DB) isDuplicatePut(op batchOp) bool {
+	cur, expiresAt, found, err := db.eng.getWithExpiry(db.readSeq.Load(), op.key)
+	if err != nil || !found {
+		return false
+	}
+	return expiresAt == op.expiresAt && bytes.Equal(cur, op.value)
 }
 
 // reserveSeq atomically reserves n consecutive global sequence numbers and

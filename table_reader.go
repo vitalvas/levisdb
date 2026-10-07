@@ -337,28 +337,40 @@ func (tr *tableReader) readBlock(h blockHandle) ([]byte, error) {
 	return tr.readBlockRaw(h)
 }
 
+// lookupResult is the outcome of a table point lookup. value is the stored user
+// value (expiry prefix stripped), versionSeq the winning version's sequence
+// (needed because compaction output file creation order is not data recency
+// order), and expiresAt the absolute TTL deadline in Unix seconds (0 for a non-TTL or missing
+// value). found/deleted report presence and whether the newest version is a
+// tombstone (or an expired TTL, surfaced as a tombstone).
+type lookupResult struct {
+	value      []byte
+	versionSeq uint64
+	expiresAt  int64
+	found      bool
+	deleted    bool
+}
+
 // Get returns the value for userKey at the newest version with seq <= the query
 // seq. found reports whether any version was seen; deleted reports a tombstone.
 func (tr *tableReader) get(userKey []byte, seq uint64) (value []byte, found, deleted bool, err error) {
-	value, _, found, deleted, err = tr.lookupAtTime(userKey, seq, time.Now().UnixNano(), true)
-	return value, found, deleted, err
+	r, err := tr.lookupAtTime(userKey, seq, time.Now().Unix(), true)
+	return r.value, r.found, r.deleted, err
 }
 
-// lookupAtTime returns the newest visible version in this table together with
-// its sequence. The read path needs the sequence because compaction output file
-// creation order is not data recency order. When copyValue is
-// false, the returned value aliases the decoded block and is valid only for
-// the immediate consumer.
-func (tr *tableReader) lookupAtTime(userKey []byte, seq uint64, now int64, copyValue bool) (value []byte, versionSeq uint64, found, deleted bool, err error) {
+// lookupAtTime returns the newest visible version in this table. When copyValue is
+// false, the returned value aliases the decoded block and is valid only for the
+// immediate consumer.
+func (tr *tableReader) lookupAtTime(userKey []byte, seq uint64, now int64, copyValue bool) (lookupResult, error) {
 	// Load the parsed metadata once; a concurrent eviction cannot invalidate this
 	// local reference.
 	m, err := tr.ensureMeta()
 	if err != nil {
-		return nil, 0, false, false, err
+		return lookupResult{}, err
 	}
 	// Bloom gate: a definite miss avoids all block reads.
 	if !bloomMayContain(m.filter, bloomHash(userKey)) {
-		return nil, 0, false, false, nil
+		return lookupResult{}, nil
 	}
 
 	// Build the lookup key in a stack buffer to avoid a heap allocation on the
@@ -370,18 +382,18 @@ func (tr *tableReader) lookupAtTime(userKey []byte, seq uint64, now int64, copyV
 	// Find the first index entry whose separator is >= lookup key.
 	i := m.findBlock(lookup)
 	if i >= len(m.indexEnt) {
-		return nil, 0, false, false, nil
+		return lookupResult{}, nil
 	}
 	payload, err := tr.readBlock(m.blockHandleAt(i))
 	if err != nil {
-		return nil, 0, false, false, err
+		return lookupResult{}, err
 	}
 
 	// A value dataBlockIter stays on the stack, avoiding an allocation. It
 	// reconstructs prefix-compressed keys into its own buffer as it advances.
 	entries, restarts, nRestart, splitErr := splitDataBlock(payload)
 	if splitErr != nil {
-		return nil, 0, false, false, splitErr
+		return lookupResult{}, splitErr
 	}
 	it := dataBlockIter{entries: entries, restarts: restarts, nRestart: nRestart}
 	// Binary-search restart points to the interval that may hold userKey rather
@@ -393,10 +405,10 @@ func (tr *tableReader) lookupAtTime(userKey []byte, seq uint64, now int64, copyV
 	havePrevious := false
 	for it.next() {
 		if len(it.key) < trailerLen {
-			return nil, 0, false, false, fmt.Errorf("table: short internal key")
+			return lookupResult{}, fmt.Errorf("table: short internal key")
 		}
 		if havePrevious && ikeyCompare(previous, it.key) >= 0 {
-			return nil, 0, false, false, fmt.Errorf("table: block keys out of order")
+			return lookupResult{}, fmt.Errorf("table: block keys out of order")
 		}
 		previous = append(previous[:0], it.key...)
 		havePrevious = true
@@ -410,48 +422,48 @@ func (tr *tableReader) lookupAtTime(userKey []byte, seq uint64, now int64, copyV
 		}
 		kseq, kind := ikeySeqKind(it.key)
 		if !validIKeyKind(kind) {
-			return nil, 0, false, false, fmt.Errorf("table: unknown internal-key kind %d", kind)
+			return lookupResult{}, fmt.Errorf("table: unknown internal-key kind %d", kind)
 		}
 		if kseq > seq {
 			continue // version newer than the snapshot
 		}
 		if kind == ikeyKindDelete {
-			return nil, kseq, true, true, nil
+			return lookupResult{versionSeq: kseq, found: true, deleted: true}, nil
 		}
 		value := it.value
+		var exp int64
 		if kind == ikeyKindSetTTL {
-			var expiresAt int64
-			value, expiresAt, err = decodeExpiringValue(value)
+			value, exp, err = decodeExpiringValue(value)
 			if err != nil {
-				return nil, 0, false, false, fmt.Errorf("table: %w", err)
+				return lookupResult{}, fmt.Errorf("table: %w", err)
 			}
-			if expiresAt <= now {
-				return nil, kseq, true, true, nil
+			if exp <= now {
+				return lookupResult{versionSeq: kseq, found: true, deleted: true}, nil
 			}
 		}
 		if copyValue {
 			// Copy the value out: it.value aliases the (possibly cached) block
 			// payload, which may be evicted after this call returns.
-			return append([]byte(nil), value...), kseq, true, false, nil
+			value = append([]byte(nil), value...)
 		}
-		return value, kseq, true, false, nil
+		return lookupResult{value: value, versionSeq: kseq, expiresAt: exp, found: true}, nil
 	}
 	if err := it.Error(); err != nil {
-		return nil, 0, false, false, err
+		return lookupResult{}, err
 	}
-	return nil, 0, false, false, nil
+	return lookupResult{}, nil
 }
 
 // has reports whether userKey exists at seq without copying its value, making
 // it cheaper than get for a pure membership check.
 func (tr *tableReader) has(userKey []byte, seq uint64) (found, deleted bool, err error) {
-	_, _, found, deleted, err = tr.lookupAtTime(userKey, seq, time.Now().UnixNano(), false)
+	_, found, deleted, err = tr.hasVersionAtTime(userKey, seq, time.Now().Unix())
 	return found, deleted, err
 }
 
 func (tr *tableReader) hasVersionAtTime(userKey []byte, seq uint64, now int64) (versionSeq uint64, found, deleted bool, err error) {
-	_, versionSeq, found, deleted, err = tr.lookupAtTime(userKey, seq, now, false)
-	return versionSeq, found, deleted, err
+	r, err := tr.lookupAtTime(userKey, seq, now, false)
+	return r.versionSeq, r.found, r.deleted, err
 }
 
 // findBlock returns the index of the first block that may contain lookup.

@@ -125,12 +125,12 @@ func TestGetUpdatesSinceLiveSegment(t *testing.T) {
 func TestGetUpdatesSinceDeliversAbsoluteExpiry(t *testing.T) {
 	t.Parallel()
 	db := openTestDB(t, func(o *Options) { o.MemtableSize = 1 << 30 })
-	require.NoError(t, db.Put(PutOptions{Key: []byte("k"), Value: []byte("v"), TTL: time.Hour}))
+	expiresAt := time.Now().Add(time.Hour).Unix()
+	require.NoError(t, db.Put(PutOptions{Key: []byte("k"), Value: []byte("v"), ExpiresAt: expiresAt}))
 
 	all := drainUpdates(t, db, 0)
 	require.Len(t, all, 1)
-	assert.NotZero(t, all[0].ExpiresAt, "TTL put carries an absolute deadline")
-	assert.Greater(t, all[0].TTL, 50*time.Minute, "remaining TTL is derived from the deadline")
+	assert.Equal(t, expiresAt, all[0].ExpiresAt, "TTL put carries its exact absolute deadline")
 	assert.Equal(t, EntryPut, all[0].Kind)
 }
 

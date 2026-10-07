@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"fmt"
 	"os"
-	"time"
 )
 
 // logRecovered reports the outcome of WAL replay. Extracted so recoverWALMode
@@ -242,10 +241,7 @@ func (b *observerBridge) observe(batch []walEntry) {
 			Key:   e.Key,
 			Value: e.Value,
 		}
-		if e.ExpiresAt != 0 {
-			out[i].ExpiresAt = e.ExpiresAt
-			out[i].TTL = time.Until(time.Unix(0, e.ExpiresAt))
-		}
+		out[i].ExpiresAt = e.ExpiresAt
 	}
 	b.obs.Observe(out)
 }

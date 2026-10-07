@@ -30,14 +30,9 @@ type WALEntry struct {
 	// Value is the value for EntryPut, nil for EntryDelete, and the exclusive
 	// range end for EntryDeleteRange.
 	Value []byte
-	// TTL is the remaining lifetime at delivery time (zero means none, negative
-	// means already expired). It is derived from ExpiresAt, so it drifts with the
-	// clock; a replica that must preserve the exact original deadline should apply
-	// ExpiresAt instead.
-	TTL time.Duration
-	// ExpiresAt is the absolute expiration as a Unix-nanosecond timestamp, or zero
-	// when the entry has no TTL. Unlike TTL this is the exact stored deadline, so a
-	// replica can reproduce the original expiry without clock drift.
+	// ExpiresAt is the absolute expiration as a Unix-second timestamp, or zero when
+	// the entry has no TTL. A replica reproduces the original expiry exactly by
+	// applying it as PutOptions.ExpiresAt, with no clock drift.
 	ExpiresAt int64
 }
 
@@ -250,6 +245,15 @@ type Options struct {
 
 	// ReadOnly opens the database without allowing writes.
 	ReadOnly bool
+
+	// Deduplication skips a put whose key already holds an identical value and the
+	// same absolute ExpiresAt: no WAL record, memtable version, or later compaction
+	// work is produced for an unchanged row. Because ExpiresAt is absolute, a caller
+	// rewriting the same key/value/ExpiresAt (even repeatedly) stores one version.
+	// It costs one point lookup per put while enabled, so it is off by default;
+	// enable it for idempotent or replayed write streams. Deletes and range deletes
+	// are never deduplicated.
+	Deduplication bool
 	// NoSync disables the per-group WAL fsync, leaving durability to the OS page
 	// cache. The default (false) is durable: group commit fsyncs once per batch.
 	// Enabling it is faster but widens the crash-loss window; use only for

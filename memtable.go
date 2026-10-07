@@ -124,11 +124,11 @@ func (m *memtableT) add(seq uint64, kind ikeyKind, key, value []byte) {
 // found bool reports whether any version was seen; deleted reports whether the
 // newest such version is a tombstone (in which case value is nil).
 func (m *memtableT) get(seq uint64, key []byte) (value []byte, found, deleted bool) {
-	value, _, found, deleted = m.getVersionAt(seq, key, time.Now().UnixNano())
+	value, _, found, deleted, _ = m.getVersionAt(seq, key, time.Now().Unix())
 	return value, found, deleted
 }
 
-func (m *memtableT) getVersionAt(seq uint64, key []byte, now int64) (value []byte, versionSeq uint64, found, deleted bool) {
+func (m *memtableT) getVersionAt(seq uint64, key []byte, now int64) (value []byte, versionSeq uint64, found, deleted bool, expiresAt int64) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	// Stack buffer for the lookup key: it is only used to seek and never
@@ -137,30 +137,30 @@ func (m *memtableT) getVersionAt(seq uint64, key []byte, now int64) (value []byt
 	lookup := ikeyLookupKey(buf[:0], key, seq)
 	n := m.list.seek(lookup)
 	if n == nilNode {
-		return nil, 0, false, false
+		return nil, 0, false, false, 0
 	}
 	nkey := m.list.key(n)
 	if !bytes.Equal(ikeyUserKey(nkey), key) {
-		return nil, 0, false, false
+		return nil, 0, false, false, 0
 	}
 	// n is the newest version with seq <= the lookup seq, since the skiplist is
 	// ordered newest-first within a user key and LookupKey uses the query seq.
 	nseq, kind := ikeySeqKind(nkey)
 	if nseq > seq {
 		// All versions of this key are newer than the snapshot seq.
-		return nil, 0, false, false
+		return nil, 0, false, false, 0
 	}
 	if kind == ikeyKindDelete {
-		return nil, nseq, true, true
+		return nil, nseq, true, true, 0
 	}
 	if kind == ikeyKindSetTTL {
-		value, expiresAt, err := decodeExpiringValue(m.list.value(n))
-		if err != nil || expiresAt <= now {
-			return nil, nseq, true, true
+		value, exp, err := decodeExpiringValue(m.list.value(n))
+		if err != nil || exp <= now {
+			return nil, nseq, true, true, 0
 		}
-		return value, nseq, true, false
+		return value, nseq, true, false, exp
 	}
-	return m.list.value(n), nseq, true, false
+	return m.list.value(n), nseq, true, false, 0
 }
 
 // Iterator iterates internal entries in sorted order (user key ascending, seq

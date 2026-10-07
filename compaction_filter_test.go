@@ -35,7 +35,7 @@ func TestCompactionFilterKeepsAndDiscardsValues(t *testing.T) {
 	require.NoError(t, db.eng.Flush())
 	require.NoError(t, db.Put(PutOptions{Key: []byte("drop"), Value: []byte("new")}))
 	require.NoError(t, db.Put(PutOptions{Key: []byte("keep"), Value: []byte("value")}))
-	require.NoError(t, db.Put(PutOptions{Key: []byte("ttl"), Value: []byte("temporary"), TTL: time.Hour}))
+	require.NoError(t, db.Put(PutOptions{Key: []byte("ttl"), Value: []byte("temporary"), ExpiresAt: time.Now().Add(time.Hour).Unix()}))
 
 	require.NoError(t, db.CompactRange(nil, nil))
 	_, err := db.Get([]byte("drop"))
@@ -78,7 +78,7 @@ func TestCompactionFilterTTLAtCompactionCutoff(t *testing.T) {
 		require.NoError(t, s.CompactAll(maxIKeySeq, cc))
 		assert.Equal(t, []byte("key"), got.Key)
 		assert.Equal(t, []byte("value"), got.Value)
-		assert.Equal(t, 100*time.Nanosecond, got.TTL)
+		assert.Equal(t, 100*time.Second, got.TTL, "remaining lifetime is (expiresAt-cutoff) seconds")
 
 		value, found, deleted, err := s.getAtTime(1, []byte("key"), expiresAt-1)
 		require.NoError(t, err)

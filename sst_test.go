@@ -103,7 +103,7 @@ func TestSstIngestTTLAndDelete(t *testing.T) {
 	w, err := NewSstFileWriter(path, SstWriterOptions{})
 	require.NoError(t, err)
 	require.NoError(t, w.Put([]byte("keep"), []byte("v")))
-	require.NoError(t, w.PutTTL([]byte("live"), []byte("v"), time.Hour))
+	require.NoError(t, w.PutWithExpiry([]byte("live"), []byte("v"), time.Now().Add(time.Hour).Unix()))
 	require.NoError(t, w.Delete([]byte("zzz")))
 	require.NoError(t, w.Finish())
 

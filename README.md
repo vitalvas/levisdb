@@ -49,9 +49,9 @@ func main() {
 		log.Fatal(err)
 	}
 	if err := db.Put(levisdb.PutOptions{
-		Key:   []byte("key"),
-		Value: []byte("value"),
-		TTL:   24 * time.Hour,
+		Key:       []byte("key"),
+		Value:     []byte("value"),
+		ExpiresAt: time.Now().Add(24 * time.Hour).Unix(),
 	}); err != nil {
 		log.Fatal(err)
 	}
@@ -212,7 +212,7 @@ Package-level:
 
 | Method | Purpose |
 | --- | --- |
-| `Put(PutOptions) error` | Set a key, optionally with a TTL. |
+| `Put(PutOptions) error` | Set a key, optionally with an absolute `ExpiresAt`. |
 | `Delete(key []byte) error` | Remove a key. |
 | `DeleteRange(start, end []byte) error` | Remove every key in `[start, end)` in one record. |
 | `Get(key []byte) ([]byte, error)` | Read the latest value or `ErrNotFound`. |
@@ -236,7 +236,7 @@ Package-level:
 `*WALUpdates`: `Next() bool`, `Batch() []WALEntry`, `Error() error`, `Close() error`.
 
 `*SstFileWriter`: `NewSstFileWriter(path, SstWriterOptions)`, then `Put`,
-`PutTTL`, `PutWithExpiry` (exact absolute deadline), `Delete` (keys ascending),
+`PutWithExpiry` (absolute deadline), `Delete` (keys ascending),
 `Finish()`. Defer `Close()` to release an abandoned build; it removes unfinished
 output and preserves a successfully finished file.
 
@@ -427,8 +427,8 @@ consumer records the highest sequence it has durably applied.
 - `WALObserver` (above) delivers the live stream synchronously as batches commit.
 - `GetUpdatesSince(seq)` replays every committed mutation after `seq` for a
   consumer that fell behind. Each `WALEntry` carries `Seq`, `Kind`, `Key`,
-  `Value`, and for TTL puts both `TTL` (remaining at delivery) and `ExpiresAt`
-  (the absolute deadline, so a replica reproduces the exact expiry).
+  `Value`, and for TTL puts `ExpiresAt` (the absolute deadline, so a replica
+  reproduces the exact expiry by applying it as `PutOptions.ExpiresAt`).
 
 `GetUpdatesSince` serves mutations still in the live WAL for free. To serve
 mutations already flushed and retired, enable retention with `WALRetention` (a
@@ -563,12 +563,24 @@ binaries that do not recognize the recovery-boundary field cannot reopen it.
 
 ## TTL
 
-`PutOptions.TTL` is per value. Zero means no expiration; negative or
-unrepresentable durations return `ErrInvalidTTL`. Expiration is persisted as an
-absolute deadline, so recovery does not restart the TTL. Once the newest value
-expires it behaves as a tombstone and never reveals an older value. Point reads
-evaluate wall-clock expiry when called; each iterator captures one time at
-creation so a scan cannot change halfway through.
+`PutOptions.ExpiresAt` is a per-value absolute expiry, a Unix-second instant
+(for example `time.Now().Add(ttl).Unix()`; sub-second TTLs are not supported).
+Zero means no expiration; a
+negative or already-past value returns `ErrInvalidTTL`. The deadline is persisted
+as given, so recovery does not restart it. Once the newest value expires it
+behaves as a tombstone and never reveals an older value. Point reads evaluate
+wall-clock expiry when called; each iterator captures one time at creation so a
+scan cannot change halfway through.
+
+## Deduplication
+
+`Options.Deduplication` (off by default) skips a put whose key already holds an
+identical value and the same `ExpiresAt`: no WAL record, memtable version, or later
+compaction work is produced for an unchanged row. Because `ExpiresAt` is absolute,
+re-writing the same key/value/`ExpiresAt` is a byte-identical record, so a caller
+replaying an unchanged row any number of times stores one version. It costs one
+point lookup per put while enabled; deletes and range deletes are never
+deduplicated.
 
 ## Range deletes
 

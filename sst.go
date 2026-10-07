@@ -13,7 +13,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"time"
 )
 
 // ingestBuildSeq is the placeholder sequence SstFileWriter bakes into every key.
@@ -79,28 +78,15 @@ func (w *SstFileWriter) Put(key, value []byte) error {
 	return w.add(key, value, ikeyKindSet)
 }
 
-// PutTTL adds a key/value pair with a lifetime. A zero or negative ttl is an
-// error; use Put for a value without expiration.
-func (w *SstFileWriter) PutTTL(key, value []byte, ttl time.Duration) error {
-	if ttl <= 0 {
-		return ErrInvalidTTL
-	}
-	expiresAt, err := ttlExpiresAt(time.Now(), ttl)
-	if err != nil {
-		return err
-	}
-	return w.add(key, encodeExpiringValue(value, expiresAt), ikeyKindSetTTL)
-}
-
 // bytesWritten reports the compressed on-disk bytes flushed so far, so a caller
 // building a multi-file image can roll to a new file at a size target.
 func (w *SstFileWriter) bytesWritten() int64 { return w.tw.bytesWritten() }
 
-// PutWithExpiry adds a key/value pair with an absolute expiration (Unix nanos),
-// preserving an exact stored deadline rather than re-deriving one from the wall
-// clock the way PutTTL does. expiresAt must be positive. Keys must be added in
-// strictly ascending order. It is used to reproduce a source value's precise
-// expiry when building a bootstrap image (see Snapshot.WriteTo).
+// PutWithExpiry adds a key/value pair with an absolute expiration (Unix nanos).
+// expiresAt must be positive; use Put for a value without expiration. Keys must be
+// added in strictly ascending order. The stored deadline is exact, so ingesting a
+// value preserves the same expiry a put with that ExpiresAt would have (see
+// Snapshot.WriteTo for bootstrap images).
 func (w *SstFileWriter) PutWithExpiry(key, value []byte, expiresAt int64) error {
 	if expiresAt <= 0 {
 		return ErrInvalidTTL

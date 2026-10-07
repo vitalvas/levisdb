@@ -341,7 +341,7 @@ func (s *engineT) levelSummary() string {
 // Get resolves key at snapshot seq, returning the value or that it is absent or
 // deleted. It reads memtable, then the flushing memtable, then tables.
 func (s *engineT) get(seq uint64, key []byte) (value []byte, found, deleted bool, err error) {
-	return s.getAtTime(seq, key, time.Now().UnixNano())
+	return s.getAtTime(seq, key, time.Now().Unix())
 }
 
 // versionPick tracks the newest visible version of a key seen so far while a
@@ -351,49 +351,50 @@ type versionPick struct {
 	seq     uint64
 	found   bool
 	deleted bool
+	// expiresAt is the winning version's absolute TTL deadline (Unix seconds), 0 for
+	// a non-TTL value. Carried so Deduplication can compare it exactly without a
+	// second lookup.
+	expiresAt int64
 }
 
 // set records the first version found (no prior best to compare against).
-func (p *versionPick) set(v []byte, seq uint64, deleted bool) {
-	p.value, p.seq, p.found, p.deleted = v, seq, true, deleted
+func (p *versionPick) set(v []byte, seq uint64, deleted bool, expiresAt int64) {
+	p.value, p.seq, p.found, p.deleted, p.expiresAt = v, seq, true, deleted, expiresAt
 }
 
 // merge folds one candidate version into the best. A higher sequence wins; the
 // same sequence with a different kind or value is an impossible-under-unique-seqs
 // anomaly and returns a conflict error tagged with source. Ties with an identical
 // version are ignored (the same record read from more than one place).
-func (p *versionPick) merge(v []byte, seq uint64, deleted bool, source string) error {
+func (p *versionPick) merge(v []byte, seq uint64, deleted bool, expiresAt int64, source string) error {
 	switch {
 	case !p.found || seq > p.seq:
-		p.set(v, seq, deleted)
+		p.set(v, seq, deleted, expiresAt)
 	case seq == p.seq && (deleted != p.deleted || (!deleted && !bytes.Equal(v, p.value))):
 		return fmt.Errorf("%s: conflicting versions for key at sequence %d", source, seq)
 	}
 	return nil
 }
 
-func (s *engineT) getAtTime(seq uint64, key []byte, now int64) (value []byte, found, deleted bool, err error) {
-	// Hold the read lock for the whole lookup so a concurrent compaction cannot
-	// close and remove a table file mid-read; the compaction swap runs under
-	// the write lock.
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
+// pickVersion scans the memtable, flushing memtable, recovery memtables, and
+// every overlapping table, folding each candidate into the newest visible version
+// at seq (expiry evaluated against now). The caller holds s.mu.
+func (s *engineT) pickVersion(seq uint64, key []byte, now int64) (versionPick, error) {
 	var best versionPick
-	if v, vseq, f, d := s.mem.getVersionAt(seq, key, now); f {
-		best.set(v, vseq, d)
+	if v, vseq, f, d, exp := s.mem.getVersionAt(seq, key, now); f {
+		best.set(v, vseq, d, exp)
 	}
 	if s.imm != nil {
-		if v, vseq, f, d := s.imm.getVersionAt(seq, key, now); f {
-			if err := best.merge(v, vseq, d, "memtable"); err != nil {
-				return nil, false, false, err
+		if v, vseq, f, d, exp := s.imm.getVersionAt(seq, key, now); f {
+			if err := best.merge(v, vseq, d, exp, "memtable"); err != nil {
+				return versionPick{}, err
 			}
 		}
 	}
 	for _, recovered := range s.recoveryMems {
-		if v, vseq, f, d := recovered.getVersionAt(seq, key, now); f {
-			if err := best.merge(v, vseq, d, "recovery memtable"); err != nil {
-				return nil, false, false, err
+		if v, vseq, f, d, exp := recovered.getVersionAt(seq, key, now); f {
+			if err := best.merge(v, vseq, d, exp, "recovery memtable"); err != nil {
+				return versionPick{}, err
 			}
 		}
 	}
@@ -407,16 +408,49 @@ func (s *engineT) getAtTime(seq uint64, key []byte, now int64) (value []byte, fo
 		if !table.mayContain(key) {
 			continue
 		}
-		v, vseq, f, d, gerr := table.reader.lookupAtTime(key, seq, now, false)
+		r, gerr := table.reader.lookupAtTime(key, seq, now, false)
 		if gerr != nil {
-			return nil, false, false, gerr
+			return versionPick{}, gerr
 		}
-		if !f {
+		if !r.found {
 			continue
 		}
-		if err := best.merge(v, vseq, d, "table"); err != nil {
-			return nil, false, false, err
+		if err := best.merge(r.value, r.versionSeq, r.deleted, r.expiresAt, "table"); err != nil {
+			return versionPick{}, err
 		}
+	}
+	return best, nil
+}
+
+// getWithExpiry resolves key at seq and also reports the stored absolute TTL
+// deadline (0 for a non-TTL value), which Deduplication compares. A range
+// tombstone newer than the point version is not consulted here: a put whose key is
+// covered by a range delete is never treated as a duplicate (found stays false for
+// a shadowed value only when the point version itself is deleted/expired), so the
+// put proceeds, which is the safe direction.
+func (s *engineT) getWithExpiry(seq uint64, key []byte) (value []byte, expiresAt int64, found bool, err error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	best, err := s.pickVersion(seq, key, time.Now().Unix())
+	if err != nil {
+		return nil, 0, false, err
+	}
+	if !best.found || best.deleted {
+		return nil, 0, false, nil
+	}
+	return best.value, best.expiresAt, true, nil
+}
+
+func (s *engineT) getAtTime(seq uint64, key []byte, now int64) (value []byte, found, deleted bool, err error) {
+	// Hold the read lock for the whole lookup so a concurrent compaction cannot
+	// close and remove a table file mid-read; the compaction swap runs under
+	// the write lock.
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	best, err := s.pickVersion(seq, key, now)
+	if err != nil {
+		return nil, false, false, err
 	}
 	bestValue, bestSeq, bestFound, bestDeleted := best.value, best.seq, best.found, best.deleted
 	// A range tombstone visible at seq and newer than the best point version
@@ -474,7 +508,7 @@ func (s *engineT) maxCoveringRangeDelSeq(key []byte, readSeq uint64) (uint64, er
 // has reports whether key exists at snapshot seq, and whether the newest
 // visible version is a tombstone, without copying the value.
 func (s *engineT) has(seq uint64, key []byte) (found, deleted bool, err error) {
-	return s.hasAtTime(seq, key, time.Now().UnixNano())
+	return s.hasAtTime(seq, key, time.Now().Unix())
 }
 
 func (s *engineT) hasAtTime(seq uint64, key []byte, now int64) (found, deleted bool, err error) {
@@ -483,11 +517,11 @@ func (s *engineT) hasAtTime(seq uint64, key []byte, now int64) (found, deleted b
 
 	var bestSeq uint64
 	var bestFound, bestDeleted bool
-	if _, vseq, f, d := s.mem.getVersionAt(seq, key, now); f {
+	if _, vseq, f, d, _ := s.mem.getVersionAt(seq, key, now); f {
 		bestSeq, bestFound, bestDeleted = vseq, true, d
 	}
 	if s.imm != nil {
-		if _, vseq, f, d := s.imm.getVersionAt(seq, key, now); f {
+		if _, vseq, f, d, _ := s.imm.getVersionAt(seq, key, now); f {
 			switch {
 			case !bestFound || vseq > bestSeq:
 				bestSeq, bestFound, bestDeleted = vseq, true, d
@@ -497,7 +531,7 @@ func (s *engineT) hasAtTime(seq uint64, key []byte, now int64) (found, deleted b
 		}
 	}
 	for _, recovered := range s.recoveryMems {
-		if _, vseq, f, d := recovered.getVersionAt(seq, key, now); f {
+		if _, vseq, f, d, _ := recovered.getVersionAt(seq, key, now); f {
 			switch {
 			case !bestFound || vseq > bestSeq:
 				bestSeq, bestFound, bestDeleted = vseq, true, d
