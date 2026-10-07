@@ -9,12 +9,24 @@ import (
 	"time"
 )
 
-// maxTierDepth caps the tier ladder (like LevelDB's fixed level count). Output
-// never lands deeper than this; the deepest tier merges in place instead. It
-// bounds compaction depth (so a highly-compressible workload cannot march the
-// bottom tier downward forever), and with it read/recovery fan-out. Seven tiers
-// at the default size curve (2 MiB base, x2, capped at 16 MiB) cover terabytes.
+// maxTierDepth is the default (and largest) deepest-tier index, used when
+// Options.MaxLevels is unset. It caps the tier ladder (like LevelDB's fixed level
+// count): output never lands deeper, and the deepest tier merges in place
+// instead. That bounds compaction depth (so a highly-compressible workload cannot
+// march the bottom tier downward forever) and read/recovery fan-out. Eight tiers
+// (depths 0..7) at the default size curve (2 MiB base, x2, capped at 128 MiB)
+// cover terabytes; Options.MaxLevels can lower it.
 const maxTierDepth = 7
+
+// resolveMaxDepth maps a level count (1..8) to the deepest tier index, falling
+// back to the maxTierDepth default when the count is unset (zero), as direct
+// engine users and recovery leave it. A count of 1 yields depth 0 (single tier).
+func resolveMaxDepth(levels uint8) int {
+	if levels == 0 {
+		return maxTierDepth
+	}
+	return int(levels) - 1
+}
 
 // CompactionConfig tunes the size-tiered picker and the codecs/file sizes used
 // for merged output.
@@ -31,6 +43,9 @@ type compactionConfigT struct {
 	FileSizeBase       int64
 	FileSizeMultiplier int
 	FileSizeMax        int64
+	// MaxLevels is the tier count (1..8); the deepest tier (MaxLevels - 1) merges
+	// in place. Zero falls back to the maxTierDepth default.
+	MaxLevels uint8
 	// ExpireBefore is the newest wall-clock instant at which TTL entries may be
 	// reclaimed. Zero uses the compaction start time. DB compactions set it to
 	// the oldest live iterator's read time.
@@ -72,13 +87,14 @@ func (s *engineT) pickCompaction(ratio int, byteTrigger int64, tombstoneRatio fl
 		tombstones[t.depth] += t.tombstones
 	}
 	best := -1
+	capDepth := resolveMaxDepth(s.cfg.MaxLevels)
 	for depth, c := range counts {
-		// The cap tier (maxTierDepth) is terminal: there is no deeper tier to push
-		// to, and re-merging its distinct data by count or bytes reclaims nothing
-		// and would loop forever. Only a tombstone/overwrite-heavy cap tier is worth
+		// The cap tier (capDepth) is terminal: there is no deeper tier to push to,
+		// and re-merging its distinct data by count or bytes reclaims nothing and
+		// would loop forever. Only a tombstone/overwrite-heavy cap tier is worth
 		// compacting there, because that genuinely shrinks it.
 		ready := false
-		if depth < maxTierDepth {
+		if depth < capDepth {
 			ready = c >= ratio
 			if !ready && byteTrigger > 0 && c >= 2 {
 				ready = bytes[depth] >= byteTrigger
@@ -111,16 +127,18 @@ func (s *engineT) Compact(depth int, retainSeq uint64, cc compactionConfigT) err
 			maxDepth = t.depth
 		}
 	}
-	// Output normally lands one tier deeper, but is capped at maxTierDepth so the
-	// tier ladder cannot grow without bound. At the cap the deepest tier merges IN
-	// PLACE (outDepth == depth). Without the cap, a workload whose live data fits in
-	// fewer than TierRatio tables per tier would relocate the bottom one tier deeper
-	// every compaction cycle, marching the depth downward forever (an infinite
-	// compaction loop that starves flushes). The cap bounds recovery/read fan-out
-	// too. When the source is already at the cap, the merge collapses it in place.
+	// Output normally lands one tier deeper, but is capped at the configured
+	// deepest tier so the ladder cannot grow without bound. At the cap the deepest
+	// tier merges IN PLACE (outDepth == depth). Without the cap, a workload whose
+	// live data fits in fewer than TierRatio tables per tier would relocate the
+	// bottom one tier deeper every compaction cycle, marching the depth downward
+	// forever (an infinite compaction loop that starves flushes). The cap bounds
+	// recovery/read fan-out too. When the source is already at the cap, the merge
+	// collapses it in place.
+	capDepth := resolveMaxDepth(cc.MaxLevels)
 	outDepth := depth + 1
-	if outDepth > maxTierDepth {
-		outDepth = maxTierDepth
+	if outDepth > capDepth {
+		outDepth = capDepth
 	}
 	inPlace := outDepth == depth
 	var inputs []*tableMeta

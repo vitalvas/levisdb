@@ -40,9 +40,11 @@
 //	target(d) = min(FileSizeBase * FileSizeMultiplier^d, FileSizeMax)
 //
 // so hot shallow tiers hold small, cheap files and cold deep tiers hold fewer,
-// larger ones. MaxCompactionBytes caps the input merged in one non-bottom pass;
-// bottom merges include the whole tier and overlapping shallower tables so
-// tombstone GC stays correct after ingestion.
+// larger ones. MaxLevels (1..8, default 8) bounds the ladder: the deepest tier
+// merges in place so it never grows deeper, trading larger bottom merges for
+// tighter read and recovery fan-out. MaxCompactionBytes caps the input merged in
+// one non-bottom pass; bottom merges include the whole tier and overlapping
+// shallower tables so tombstone GC stays correct after ingestion.
 // TombstoneCompactionRatio compacts a delete-heavy tier early to reclaim space.
 //
 // Writes are throttled by fresh-tier table count so a burst cannot outrun the

@@ -108,9 +108,13 @@ type fileAllocator interface {
 
 // Config holds the engine tuning derived from the database options.
 type engineConfigT struct {
-	MemtableSize   int64
-	BloomBits      int
-	BlockSize      int
+	MemtableSize int64
+	BloomBits    int
+	BlockSize    int
+	// MaxLevels is the tier count (1..8); the deepest tier (MaxLevels - 1) merges
+	// in place. Zero falls back to the maxTierDepth default for direct engine users
+	// that leave it unset.
+	MaxLevels      uint8
 	FreshCodecName string
 	LevelCodecs    []string
 	Cache          *blockCacheT // shared block cache; nil disables caching

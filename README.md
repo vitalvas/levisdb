@@ -104,20 +104,29 @@ target a single slow spinning disk.
 | `TierRatio` | `4` | Size-tiered compaction fan-out (tables per tier before merge). |
 | `TierByteTrigger` | `8 x FileSizeMax` | Tier bytes that trigger compaction below the count ratio; negative disables. |
 | `TombstoneCompactionRatio` | `0.5` | Delete fraction that triggers early compaction; negative disables. |
-| `L0SlowdownTables` / `L0StopTables` | `16` / `24` | Fresh-tier table counts that slow, then stop, writers. A positive stop threshold must be at least `TierRatio` and the slowdown threshold. |
+| `L0SlowdownTables` | `16` | Fresh-tier table count that slows writers. |
+| `L0StopTables` | `24` | Fresh-tier table count that stops writers. A positive value must be at least `TierRatio` and `L0SlowdownTables`. |
 | `MaxCompactionBytes` | `10 x FileSizeMax` | Input byte cap per non-bottom compaction; negative disables. |
 | `DisableOverlapSelection` | `false` | Merge the whole tier instead of only the largest key-overlapping group. |
-| `FileSizeBase` / `FileSizeMultiplier` / `FileSizeMax` | `2 MiB` / `2` / `16 MiB` | Per-depth output size curve. |
-| `FreshCodec` / `BottomCodec` / `LevelCodecs` | `CodecS2` / `CodecS2` / nil | Compression (`none`/`s2`/`flate`/`zstd`). See [Compression](#compression). |
+| `MaxLevels` | `8` | Tier count, 1..8; the deepest tier merges in place. Fewer levels bound read/recovery fan-out at the cost of larger bottom merges. |
+| `FileSizeBase` | `2 MiB` | Fresh-tier target .sst size, the base of the per-depth size curve. |
+| `FileSizeMultiplier` | `2` | Per-depth growth factor of the size curve. |
+| `FileSizeMax` | `128 MiB` | Cap on the per-depth target size. |
+| `FreshCodec` | `CodecS2` | Compression for fresh (upper) tiers (`none`/`s2`/`flate`/`zstd`). See [Compression](#compression). |
+| `BottomCodec` | `CodecS2` | Compression for the bottom (oldest) tier. See [Compression](#compression). |
+| `LevelCodecs` | nil | Per-depth codec override; falls back to the fresh/bottom split. See [Compression](#compression). |
 | `BloomBits` | `10` | Bloom filter bits per key. |
 | `BlockSize` | `4 KiB` | SSTable data block size in bytes. |
-| `BlockCacheSize` / `DisableBlockCache` | `256 MiB` / `false` | Decoded-block cache capacity; or turn it off. |
+| `BlockCacheSize` | `256 MiB` | Decoded-block cache capacity in bytes. |
+| `DisableBlockCache` | `false` | Turn off decoded-block caching. |
 | `MaxOpenFiles` | `1000` | Open table descriptors kept at once; negative keeps all open. |
-| `NoSync` / `WALSyncInterval` | `false` / `1s` | WAL durability. See [Write-ahead log](#write-ahead-log). |
+| `NoSync` | `false` | Skip the per-commit fsync. See [Write-ahead log](#write-ahead-log). |
+| `WALSyncInterval` | `1s` | Background fsync interval bounding the `NoSync` loss window. See [Write-ahead log](#write-ahead-log). |
 | `StrictWALRecovery` | `false` | Fail open on any WAL corruption instead of salvaging the prefix. |
 | `ReadOnly` | `false` | Reject writes; make no filesystem changes. |
 | `WALObserver` | nil | Tap the committed stream for replication/CDC. |
-| `WALRetention` / `WALRetentionBytes` | `0` / `0` | Keep flushed WAL for `GetUpdatesSince` catch-up. `0` disables retention. See [Replication](#replication). |
+| `WALRetention` | `0` | Keep flushed WAL for this long for `GetUpdatesSince` catch-up; `0` disables. See [Replication](#replication). |
+| `WALRetentionBytes` | `0` | Keep up to this many flushed WAL bytes for catch-up; `0` disables. See [Replication](#replication). |
 | `CompactionFilter` | nil | Drop values during compaction. See [Compaction filtering](#compaction-filtering). |
 
 ## Examples
@@ -283,7 +292,7 @@ target(d) = min(FileSizeBase * FileSizeMultiplier^d, FileSizeMax)
 ```
 
 With the defaults (`FileSizeBase` 2 MiB, `FileSizeMultiplier` 2, `FileSizeMax`
-16 MiB):
+128 MiB):
 
 | Depth | Target size |
 | --- | --- |
@@ -291,13 +300,17 @@ With the defaults (`FileSizeBase` 2 MiB, `FileSizeMultiplier` 2, `FileSizeMax`
 | 1 | 4 MiB |
 | 2 | 8 MiB |
 | 3 | 16 MiB |
-| 4 and deeper | 16 MiB (capped) |
+| 4 | 32 MiB |
+| 5 | 64 MiB |
+| 6 | 128 MiB |
+| 7 (deepest) | 128 MiB (capped) |
 
 `MemtableSize` defaults to 4 MiB (matching LevelDB's `write_buffer_size`), so a
-full memtable flushes into two depth-0 files at the 2 MiB target. Raise
-`FileSizeMax` (or the multiplier) for larger bottom-tier files and fewer of them;
-the target is a per-file roll point, not a hard limit, so a single oversized key
-can still produce a larger file.
+full memtable flushes into two depth-0 files at the 2 MiB target. `FileSizeMax`
+defaults to 128 MiB (`FileSizeBase << (maxTierDepth - 1)`), so the cap scales with
+the base and holds the deepest tier at the same size as the one above it. Raise `FileSizeMax` (or the multiplier) for larger bottom-tier files and
+fewer of them; the target is a per-file roll point, not a hard limit, so a single
+oversized key can still produce a larger file.
 
 `TombstoneCompactionRatio` (default `0.5`) compacts a tier early once that
 fraction of its entries are deletes, reclaiming delete-heavy data toward the

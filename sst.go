@@ -360,7 +360,7 @@ func (db *DB) writeIngestTable(num uint32, path string, src *tableReader, seq ui
 		}
 	}()
 
-	depth := maxTierDepth
+	depth := resolveMaxDepth(db.eng.cfg.MaxLevels)
 	codecName := resolveLevelCodec(db.eng.cfg.LevelCodecs, depth, db.eng.cfg.FreshCodecName, db.opts.BottomCodec, true)
 	c, err := codecFromName(codecName)
 	if err != nil {

@@ -125,6 +125,44 @@ func TestCompactionRollsOnCompressedSize(t *testing.T) {
 		"the single output table's on-disk size is under target (compressed)")
 }
 
+// TestMaxLevelsCapsOutputDepth verifies a custom MaxLevels lowers the cap tier:
+// with MaxLevels=2 (cap depth 1) a compaction of the cap tier merges in place and
+// never produces a tier deeper than 1.
+func TestMaxLevelsCapsOutputDepth(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	tablePath := func(num uint32) (string, error) {
+		return filepath.Join(dir, fmt.Sprintf("%08x.sst", num)), nil
+	}
+	cfg := engineConfigT{MemtableSize: 1 << 30, BloomBits: 10, BlockSize: 256, FreshCodecName: "none", MaxLevels: 2}
+	s := newEngine(cfg, newAllocator(0), tablePath)
+	t.Cleanup(func() { s.Close() })
+
+	flushSingle(t, s, 1, "a", "1")
+	flushSingle(t, s, 2, "b", "2")
+	s.mu.Lock()
+	for _, tb := range s.tables {
+		tb.depth = 1 // the cap tier when MaxLevels=2
+	}
+	s.mu.Unlock()
+
+	cc := testCompactionConfig()
+	cc.MaxLevels = 2
+	require.NoError(t, s.Compact(1, uint64(1)<<62, cc))
+
+	s.mu.RLock()
+	maxd := 0
+	for _, tb := range s.tables {
+		if tb.depth > maxd {
+			maxd = tb.depth
+		}
+	}
+	s.mu.RUnlock()
+	assert.LessOrEqual(t, maxd, 1, "MaxLevels=2 caps output at tier 1")
+	assert.Equal(t, []byte("1"), mustGet(t, s, 100, "a"))
+	assert.Equal(t, []byte("2"), mustGet(t, s, 100, "b"))
+}
+
 func testCompactionConfig() compactionConfigT {
 	return compactionConfigT{
 		TierRatio:          2,
@@ -152,7 +190,7 @@ func TestTargetFileSize(t *testing.T) {
 	cc := compactionConfigT{
 		FileSizeBase:       DefaultFileSizeBase,       // 2 MiB
 		FileSizeMultiplier: DefaultFileSizeMultiplier, // 2
-		FileSizeMax:        DefaultFileSizeMax,        // 16 MiB
+		FileSizeMax:        DefaultFileSizeMax,        // 128 MiB
 	}
 	cases := []struct {
 		depth int
@@ -162,8 +200,11 @@ func TestTargetFileSize(t *testing.T) {
 		{1, 4 << 20},
 		{2, 8 << 20},
 		{3, 16 << 20},
-		{4, 16 << 20}, // capped
-		{9, 16 << 20}, // capped, no overflow
+		{4, 32 << 20},
+		{5, 64 << 20},
+		{6, 128 << 20},
+		{7, 128 << 20}, // capped (deepest tier)
+		{9, 128 << 20}, // capped, no overflow
 	}
 	for _, tc := range cases {
 		t.Run(fmt.Sprintf("depth-%d", tc.depth), func(t *testing.T) {

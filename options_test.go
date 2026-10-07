@@ -18,6 +18,7 @@ func TestDefaultOptions(t *testing.T) {
 	assert.Equal(t, int64(DefaultFileSizeBase), o.FileSizeBase)
 	assert.Equal(t, DefaultFileSizeMultiplier, o.FileSizeMultiplier)
 	assert.Equal(t, int64(DefaultFileSizeMax), o.FileSizeMax)
+	assert.Equal(t, uint8(DefaultMaxLevels), o.MaxLevels)
 	assert.Equal(t, DefaultBloomBits, o.BloomBits)
 	assert.Equal(t, DefaultBlockSize, o.BlockSize)
 	assert.Equal(t, int64(DefaultBlockCacheSize), o.BlockCacheSize)
@@ -85,6 +86,30 @@ func TestFillDefaultsTierByteTrigger(t *testing.T) {
 	})
 }
 
+func TestFillDefaultsMaxLevels(t *testing.T) {
+	t.Parallel()
+
+	t.Run("zero takes the default", func(t *testing.T) {
+		o := Options{Dir: "/d"}
+		o.fillDefaults()
+		assert.Equal(t, uint8(DefaultMaxLevels), o.MaxLevels)
+	})
+
+	t.Run("explicit value preserved", func(t *testing.T) {
+		o := Options{Dir: "/d", MaxLevels: 3}
+		o.fillDefaults()
+		assert.Equal(t, uint8(3), o.MaxLevels)
+	})
+}
+
+func TestResolveMaxDepth(t *testing.T) {
+	t.Parallel()
+	assert.Equal(t, maxTierDepth, resolveMaxDepth(0), "unset falls back to the default cap")
+	assert.Equal(t, 0, resolveMaxDepth(1), "one level caps at tier 0")
+	assert.Equal(t, 2, resolveMaxDepth(3))
+	assert.Equal(t, maxTierDepth, resolveMaxDepth(DefaultMaxLevels))
+}
+
 func TestValidate(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -105,6 +130,10 @@ func TestValidate(t *testing.T) {
 		{"non-positive file size base", func(o *Options) { o.FileSizeBase = -1 }, "FileSizeBase must be positive"},
 		{"file size multiplier too small", func(o *Options) { o.FileSizeMultiplier = 0 }, "FileSizeMultiplier must be >= 1"},
 		{"max below base", func(o *Options) { o.FileSizeMax = o.FileSizeBase - 1 }, "FileSizeMax"},
+		{"max levels zero rejected post-default", func(o *Options) { o.MaxLevels = 0 }, "MaxLevels must be in"},
+		{"max levels above eight", func(o *Options) { o.MaxLevels = 9 }, "MaxLevels must be in"},
+		{"max levels one ok", func(o *Options) { o.MaxLevels = 1 }, ""},
+		{"max levels eight ok", func(o *Options) { o.MaxLevels = 8 }, ""},
 		{"negative bloom", func(o *Options) { o.BloomBits = -1 }, "BloomBits must be positive"},
 		{"non-positive block size", func(o *Options) { o.BlockSize = 0 }, "BlockSize must be positive"},
 		{"negative block cache", func(o *Options) { o.BlockCacheSize = -1 }, "BlockCacheSize must be non-negative"},

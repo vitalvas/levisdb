@@ -73,9 +73,10 @@ const (
 	// compactions behind, and stop before the backlog grows unbounded.
 	DefaultL0SlowdownTables   = 16
 	DefaultL0StopTables       = 24
-	DefaultFileSizeBase       = 2 << 20 // 2 MiB
+	DefaultMaxLevels          = maxTierDepth + 1 // 8 tiers (depths 0..maxTierDepth)
+	DefaultFileSizeBase       = 2 << 20          // 2 MiB
 	DefaultFileSizeMultiplier = 2
-	DefaultFileSizeMax        = 16 << 20 // 16 MiB
+	DefaultFileSizeMax        = DefaultFileSizeBase << (maxTierDepth - 1) // 128 MiB
 	DefaultBloomBits          = 10
 	DefaultBlockSize          = 4 << 10   // 4 KiB
 	DefaultBlockCacheSize     = 256 << 20 // 256 MiB
@@ -99,9 +100,9 @@ const (
 	// files by default: a tier holding this many bytes is compacted even below the
 	// count threshold, catching the "few large tables never reach the ratio" stall
 	// without pre-empting the count trigger on ordinary fresh tiers. It is above
-	// DefaultTierRatio * FileSizeMax (4 * 16 = 64 MiB), so the count trigger fires
+	// DefaultTierRatio * FileSizeMax (4 * 128 = 512 MiB), so the count trigger fires
 	// first for a normal full tier; the density trigger only engages for 2-3 large
-	// tables that together exceed 128 MiB yet stay below the count of 4.
+	// tables that together exceed 1 GiB yet stay below the count of 4.
 	defaultTierByteTriggerFiles = 8
 
 	// maxMemtableSize caps the flush threshold. The skiplist arena addresses
@@ -161,6 +162,12 @@ type Options struct {
 	// value disables that threshold.
 	L0SlowdownTables int
 	L0StopTables     int
+
+	// MaxLevels is the number of tiers in the ladder, 1..8. The deepest tier
+	// merges in place so the ladder cannot grow without bound; fewer levels bound
+	// read and recovery fan-out more tightly at the cost of larger bottom-tier
+	// merges. Zero uses the default (8).
+	MaxLevels uint8
 
 	// FileSizeBase is the fresh-tier target .sst size in bytes.
 	FileSizeBase int64
@@ -297,6 +304,9 @@ func (o *Options) fillDefaults() {
 	if o.L0StopTables == 0 {
 		o.L0StopTables = DefaultL0StopTables
 	}
+	if o.MaxLevels == 0 {
+		o.MaxLevels = DefaultMaxLevels
+	}
 	if o.WALSyncInterval == 0 {
 		o.WALSyncInterval = DefaultWALSyncInterval
 	}
@@ -381,6 +391,9 @@ func (o *Options) validate() error {
 	}
 	if o.L0StopTables > 0 && o.L0StopTables < o.TierRatio {
 		return fmt.Errorf("levisdb: L0StopTables (%d) must be >= TierRatio (%d)", o.L0StopTables, o.TierRatio)
+	}
+	if o.MaxLevels < 1 || o.MaxLevels > DefaultMaxLevels {
+		return fmt.Errorf("levisdb: MaxLevels must be in [1, %d], got %d", DefaultMaxLevels, o.MaxLevels)
 	}
 	if o.FileSizeBase < 1 {
 		return fmt.Errorf("levisdb: FileSizeBase must be positive, got %d", o.FileSizeBase)
