@@ -20,17 +20,19 @@ import (
 // as-is for readability; anything else (any control or high byte) is base64
 // URL-encoded without padding, which is unambiguous and log-safe.
 //
-// A long value is capped to its first logKeyHead and last logKeyTail bytes, joined
-// by an elision that carries the full length, so a megabyte value cannot bloat a
-// log line (goleveldb shortens debug keys the same way). A slice short enough that
-// the head and tail would meet is rendered whole. A nil slice logs as empty.
+// A value up to logKeyMax bytes is rendered whole, so a timestamp, UUID, or path
+// key stays readable. A longer one is capped to its first logKeyHead and last
+// logKeyTail bytes, joined by an elision that carries the full length, so a
+// megabyte value cannot bloat a log line (goleveldb shortens debug keys the same
+// way). A nil slice logs as empty.
 const (
-	logKeyHead = 12
+	logKeyMax  = 128
+	logKeyHead = 112
 	logKeyTail = 8
 )
 
 func logBytes(b []byte) string {
-	if len(b) <= logKeyHead+logKeyTail {
+	if len(b) <= logKeyMax {
 		return encodeLogBytes(b)
 	}
 	return fmt.Sprintf("%s..(%dB)..%s", encodeLogBytes(b[:logKeyHead]), len(b), encodeLogBytes(b[len(b)-logKeyTail:]))

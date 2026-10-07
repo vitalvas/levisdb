@@ -1,6 +1,7 @@
 package levisdb
 
 import (
+	"bytes"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -30,10 +31,17 @@ func TestLogBytes(t *testing.T) {
 		{"tab forces base64", []byte("a\tb"), base64.RawURLEncoding.EncodeToString([]byte("a\tb"))},
 		// High bytes (md5/binary) are base64url without padding.
 		{"binary forces base64", []byte{0x00, 0xff, 0x80}, base64.RawURLEncoding.EncodeToString([]byte{0x00, 0xff, 0x80})},
-		// At the cap (head+tail = 20 bytes) it is still rendered whole.
-		{"at cap rendered whole", []byte("0123456789abcdefghij"), "0123456789abcdefghij"},
-		// Over the cap: first 12 + length + last 8.
-		{"over cap elided", []byte("0123456789abcdefghijklmnop"), "0123456789ab..(26B)..ijklmnop"},
+		// A human-readable timestamp key is rendered whole, not elided.
+		{"timestamp whole", []byte("2026-10-01 17:21,961"), "2026-10-01 17:21,961"},
+		// Exactly at the cap: still whole.
+		{"at cap rendered whole", bytes.Repeat([]byte("a"), logKeyMax), string(bytes.Repeat([]byte("a"), logKeyMax))},
+		// Over the cap: first logKeyHead + length + last logKeyTail. Total 200 bytes
+		// (> logKeyMax) so the elision path runs.
+		{
+			"over cap elided",
+			append(append(bytes.Repeat([]byte("h"), logKeyHead), bytes.Repeat([]byte("m"), 200-logKeyHead-logKeyTail)...), bytes.Repeat([]byte("t"), logKeyTail)...),
+			string(bytes.Repeat([]byte("h"), logKeyHead)) + fmt.Sprintf("..(%dB)..", 200) + string(bytes.Repeat([]byte("t"), logKeyTail)),
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -43,11 +51,11 @@ func TestLogBytes(t *testing.T) {
 }
 
 // TestLogBytesBoundsLength proves a huge value cannot bloat a log line: the
-// rendered form stays small no matter the input size.
+// rendered form stays bounded no matter the input size.
 func TestLogBytesBoundsLength(t *testing.T) {
 	t.Parallel()
 	got := logBytes(make([]byte, 1<<20))
-	assert.Less(t, len(got), 64)
+	assert.Less(t, len(got), logKeyMax+64, "rendered form must stay near the cap")
 }
 
 func TestOpenMissingManifestErrors(t *testing.T) {
