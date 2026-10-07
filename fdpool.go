@@ -4,6 +4,7 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // fdPool bounds the number of table files kept open at once. Every live SSTable
@@ -23,12 +24,15 @@ type fdPool struct {
 	ring  []*openFile // clock ring of open handles
 	hand  int         // clock hand position
 	open  int
+	// now returns the current Unix-nanosecond time, stamped on each access and read
+	// by the idle reaper. A field so tests can inject a deterministic clock.
+	now func() int64
 }
 
 // newFDPool returns a pool allowing at most limit descriptors open at once. A
 // limit <= 0 disables bounding: descriptors are opened once and kept.
 func newFDPool(limit int) *fdPool {
-	return &fdPool{limit: limit}
+	return &fdPool{limit: limit, now: func() int64 { return time.Now().UnixNano() }}
 }
 
 func (p *fdPool) newHandle(path string) *openFile {
@@ -48,7 +52,12 @@ type openFile struct {
 	// by the number of live tables. Guarded by rw; called without rw held.
 	onEvict func()
 
-	used     atomic.Bool  // recently-used flag for the clock; set lock-free by reads
+	used atomic.Bool // recently-used flag for the clock; set lock-free by reads
+	// lastUsed is the Unix-nanosecond time of the most recent access, set lock-free
+	// alongside used. The idle reaper closes descriptors untouched for longer than
+	// the configured timeout; separate from used so the count-based clock keeps its
+	// own second-chance semantics unchanged.
+	lastUsed atomic.Int64
 	inflight atomic.Int32 // reads currently in progress; the clock never evicts a busy handle
 	ringIx   int          // index in pool.ring, or -1; guarded by pool.mu
 	inRing   bool         // guarded by pool.mu
@@ -80,13 +89,20 @@ func (h *openFile) ReadAt(b []byte, off int64) (int, error) {
 	}
 }
 
+// markUsed records an access for both the clock (second-chance bit) and the idle
+// reaper (last-used time), lock-free.
+func (h *openFile) markUsed() {
+	h.used.Store(true)
+	h.lastUsed.Store(h.pool.now())
+}
+
 // ensureOpen guarantees the descriptor is open and marks it recently used. The
 // fast path (already open) sets an atomic flag and takes no pool lock.
 func (h *openFile) ensureOpen() error {
 	h.rw.RLock()
 	if h.file != nil {
 		h.rw.RUnlock()
-		h.used.Store(true)
+		h.markUsed()
 		return nil
 	}
 	h.rw.RUnlock()
@@ -94,7 +110,7 @@ func (h *openFile) ensureOpen() error {
 	h.rw.Lock()
 	if h.file != nil {
 		h.rw.Unlock()
-		h.used.Store(true)
+		h.markUsed()
 		return nil
 	}
 	f, err := os.Open(h.path)
@@ -105,7 +121,7 @@ func (h *openFile) ensureOpen() error {
 	h.file = f
 	h.rw.Unlock()
 
-	h.used.Store(true)
+	h.markUsed()
 	h.pool.admit(h)
 	return nil
 }
@@ -148,8 +164,13 @@ func (p *fdPool) admit(h *openFile) {
 	}
 	p.mu.Unlock()
 
-	// Close evicted descriptors outside pool.mu. A reader may have reopened one
-	// (back inRing), so re-check under the handle lock and skip those.
+	p.closeVictims(victims)
+}
+
+// closeVictims closes descriptors removed from the ring, outside pool.mu. A reader
+// may have reopened one (back inRing), so re-check under the handle lock and skip
+// those. Shared by the count-based clock (admit) and the idle reaper.
+func (p *fdPool) closeVictims(victims []*openFile) {
 	for _, v := range victims {
 		v.rw.Lock()
 		p.mu.Lock()
@@ -169,6 +190,33 @@ func (p *fdPool) admit(h *openFile) {
 			onEvict()
 		}
 	}
+}
+
+// reapIdle removes and closes every open descriptor untouched for at least
+// timeout, returning those file descriptors to the OS during quiet periods. A
+// handle with a read in progress is left alone and gets another full timeout once
+// idle. Count-based eviction (admit) still runs independently; this only adds
+// time-based reclamation. Returns the number of descriptors closed.
+func (p *fdPool) reapIdle(timeout int64) int {
+	cutoff := p.now() - timeout
+	var victims []*openFile
+	p.mu.Lock()
+	// Iterate a snapshot of the ring: removeLocked swaps the last element into the
+	// removed slot, so collect first, then remove, to avoid skipping entries.
+	for _, v := range append([]*openFile(nil), p.ring...) {
+		if v.inflight.Load() > 0 {
+			continue
+		}
+		if v.lastUsed.Load() > cutoff {
+			continue
+		}
+		p.removeLocked(v)
+		victims = append(victims, v)
+	}
+	p.mu.Unlock()
+
+	p.closeVictims(victims)
+	return len(victims)
 }
 
 // clockEvict runs a second-chance sweep and removes+returns the first handle

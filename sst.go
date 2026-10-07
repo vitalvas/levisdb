@@ -335,7 +335,9 @@ func (db *DB) checkIngestOverlap(minKey, maxKey []byte) error {
 // entry's sequence to seq. It mirrors engineT.writeTable but reads from a table
 // iterator and re-stamps the key trailer.
 func (db *DB) writeIngestTable(num uint32, path string, src *tableReader, seq uint64) (*tableMeta, error) {
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o644)
+	// O_EXCL: num came from the allocator, so the destination table must not exist.
+	// Reusing a live number here would truncate its data; fail loudly instead.
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o644)
 	if err != nil {
 		return nil, err
 	}

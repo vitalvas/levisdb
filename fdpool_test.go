@@ -118,6 +118,60 @@ func TestFDPoolReadError(t *testing.T) {
 	assert.Error(t, err)
 }
 
+func TestFDPoolReapIdle(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	const timeout = int64(1000) // nanoseconds, in the injected clock's units
+
+	t.Run("closes idle, keeps recent", func(t *testing.T) {
+		var now int64
+		pool := newFDPool(10)
+		pool.now = func() int64 { return now }
+
+		data := []byte("v")
+		idle := pool.newHandle(writeTempFile(t, dir, "idle", data))
+		recent := pool.newHandle(writeTempFile(t, dir, "recent", data))
+
+		now = 100
+		_, err := idle.ReadAt(make([]byte, 1), 0) // last used at 100
+		require.NoError(t, err)
+		now = 1000
+		_, err = recent.ReadAt(make([]byte, 1), 0) // last used at 1000
+		require.NoError(t, err)
+
+		// Advance so idle (100) is older than timeout but recent (1000) is not.
+		now = 1500
+		closed := pool.reapIdle(timeout)
+		assert.Equal(t, 1, closed, "only the idle descriptor is reaped")
+
+		pool.mu.Lock()
+		open := pool.open
+		pool.mu.Unlock()
+		assert.Equal(t, 1, open, "the recently-used descriptor stays open")
+
+		// The reaped handle transparently reopens on the next read.
+		buf := make([]byte, 1)
+		n, err := idle.ReadAt(buf, 0)
+		require.NoError(t, err)
+		assert.Equal(t, data, buf[:n])
+	})
+
+	t.Run("never reaps an in-flight handle", func(t *testing.T) {
+		var now int64
+		pool := newFDPool(10)
+		pool.now = func() int64 { return now }
+		h := pool.newHandle(writeTempFile(t, dir, "busy", []byte("v")))
+
+		now = 1
+		_, err := h.ReadAt(make([]byte, 1), 0)
+		require.NoError(t, err)
+		h.inflight.Add(1) // simulate a read in progress
+		now = 1_000_000
+		assert.Zero(t, pool.reapIdle(timeout), "an in-flight descriptor is never reaped")
+		h.inflight.Add(-1)
+	})
+}
+
 func FuzzFDPoolOps(f *testing.F) {
 	f.Add([]byte{0, 1, 2, 3, 0, 1})
 	f.Add([]byte{5, 5, 5, 200, 5})

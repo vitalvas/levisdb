@@ -206,6 +206,14 @@ type Options struct {
 	// default; a negative value keeps every table open (unbounded).
 	MaxOpenFiles int
 
+	// FDIdleTimeout closes a table descriptor left unused for at least this long,
+	// returning the file descriptor to the OS during quiet periods (it reopens on
+	// the next read). MaxOpenFiles already caps descriptors by count; this adds
+	// time-based release so an idle database below the cap does not hold descriptors
+	// open indefinitely. Zero (the default) disables it, leaving count-based
+	// eviction as the only reclaimer.
+	FDIdleTimeout time.Duration
+
 	// FreshCodec compresses fresh (upper) tiers: CodecS2, CodecFlate, CodecZstd,
 	// or CodecNone.
 	FreshCodec string

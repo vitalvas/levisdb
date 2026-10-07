@@ -92,6 +92,10 @@ type DB struct {
 	walSyncStop chan struct{}
 	walSyncWG   sync.WaitGroup
 
+	// fdReapStop stops the idle-descriptor reaper loop; fdReapWG awaits it.
+	fdReapStop chan struct{}
+	fdReapWG   sync.WaitGroup
+
 	// checkpointWG tracks the at-most-one background WAL checkpoint launched from
 	// the write path (maybeCheckpoint), so Close and crash can wait for it to
 	// finish before they touch the WAL fields it mutates. checkpointRunning is a
@@ -222,6 +226,7 @@ func Open(opts Options) (*DB, error) {
 		return nil, err
 	}
 	db.startWALSyncLoop()
+	db.startFDReapLoop()
 	registerMetrics(db)
 	db.log.Info("database opened", "op", "open", "recovered_seq", db.readSeq.Load())
 	return db, nil
@@ -265,6 +270,51 @@ func (db *DB) stopWALSyncLoop() {
 		db.walSyncStop = nil
 	}
 	db.walSyncWG.Wait()
+}
+
+// startFDReapLoop runs a background sweep that closes table descriptors idle for
+// at least FDIdleTimeout, returning them to the OS during quiet periods. It is a
+// no-op for read-only opens, when the timeout is disabled, or when descriptors are
+// never bounded (no pool). The sweep runs at half the timeout so an idle handle is
+// closed within about 1.5 timeouts of its last use.
+func (db *DB) startFDReapLoop() {
+	if db.opts.ReadOnly || db.opts.FDIdleTimeout <= 0 || db.fds == nil {
+		return
+	}
+	timeout := db.opts.FDIdleTimeout
+	interval := timeout / 2
+	if interval < time.Second {
+		interval = time.Second
+	}
+	stop := make(chan struct{})
+	db.fdReapStop = stop
+	db.fdReapWG.Add(1)
+	go func() {
+		defer db.fdReapWG.Done()
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-t.C:
+				if n := db.fds.reapIdle(int64(timeout)); n > 0 {
+					db.log.Debug("closed idle table descriptors",
+						"op", "fd_reap", "closed", n, "idle_timeout", timeout)
+				}
+			}
+		}
+	}()
+}
+
+// stopFDReapLoop signals the reaper and waits for it to exit. Safe to call more
+// than once and when the loop never started.
+func (db *DB) stopFDReapLoop() {
+	if db.fdReapStop != nil {
+		close(db.fdReapStop)
+		db.fdReapStop = nil
+	}
+	db.fdReapWG.Wait()
 }
 
 // closeAfterOpenError releases resources created during a partial Open without
@@ -332,8 +382,24 @@ func (db *DB) load() error {
 	if lerr != nil {
 		return lerr
 	}
+	// Every on-disk table must bound the allocator, not just those the manifest
+	// records. A crash can leave a table file whose number exceeds every manifested
+	// one (an output written and synced before its manifest edit committed).
+	// writeTable opens with O_CREATE|O_TRUNC, so if the allocator ever reissues an
+	// existing number it silently truncates that file. Seeding start only from the
+	// manifest relied on table numbers happening to be below it; scanning the actual
+	// directory enforces the "never reuse a file number" invariant instead.
+	tables, terr := db.store.listTables()
+	if terr != nil {
+		return terr
+	}
 	start := db.highestFileNum(state)
 	for _, n := range logs {
+		if n > start {
+			start = n
+		}
+	}
+	for _, n := range tables {
 		if n > start {
 			start = n
 		}
@@ -546,7 +612,9 @@ func (db *DB) openWAL(startSeq uint64) error {
 	if err != nil {
 		return err
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o644)
+	// O_EXCL: a fresh allocator number must not name an existing WAL segment;
+	// reusing one would truncate a live segment, so fail loudly instead.
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o644)
 	if err != nil {
 		return err
 	}
@@ -701,6 +769,7 @@ func (db *DB) Close() error {
 	// Stop the background WAL syncer before closing the WAL so it cannot fsync a
 	// closed file. It holds no db locks, so this is safe here.
 	db.stopWALSyncLoop()
+	db.stopFDReapLoop()
 	if db.sched != nil {
 		db.sched.Close()
 	}
@@ -802,6 +871,7 @@ func (db *DB) crash() {
 	// the checkpoint goroutine against walFile.Close.
 	db.checkpointWG.Wait()
 	db.stopWALSyncLoop()
+	db.stopFDReapLoop()
 	if db.sched != nil {
 		db.sched.Close()
 	}
@@ -1283,7 +1353,9 @@ func (db *DB) checkpointWALMode(force bool) (uint64, error) {
 	if err != nil {
 		return db.filterSafeSeq.Load(), err
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o644)
+	// O_EXCL: a fresh allocator number must not name an existing WAL segment;
+	// reusing one would truncate a live segment, so fail loudly instead.
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o644)
 	if err != nil {
 		return db.filterSafeSeq.Load(), err
 	}

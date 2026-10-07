@@ -681,7 +681,10 @@ func (s *engineT) Flush() error {
 // at the given tier depth, persists any range tombstones, and opens it for
 // reading.
 func (s *engineT) writeTable(num uint32, depth int, path string, it *memtableIterator, rts []rangeTombstone) (*tableMeta, error) {
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o644)
+	// O_EXCL: the number came from the allocator, so this file must not pre-exist.
+	// If it does, a reused file number is about to overwrite live data; fail loudly
+	// instead of silently truncating it.
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o644)
 	if err != nil {
 		return nil, err
 	}

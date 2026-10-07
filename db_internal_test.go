@@ -116,6 +116,80 @@ func TestRecoverUnflushedWrites(t *testing.T) {
 	}
 }
 
+// TestFDIdleReaperClosesDescriptors proves the background reaper closes a table
+// descriptor left idle past FDIdleTimeout. Uses a short real timeout; the
+// deterministic reap logic itself is covered by TestFDPoolReapIdle.
+func TestFDIdleReaperClosesDescriptors(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	o := DefaultOptions(dir)
+	o.MemtableSize = 512
+	o.FreshCodec = CodecNone
+	o.BottomCodec = CodecNone
+	o.NoSync = true
+	o.FDIdleTimeout = time.Second // ticker fires at the 1s floor
+	db, err := Open(o)
+	require.NoError(t, err)
+	defer db.Close()
+
+	require.NoError(t, db.Put(PutOptions{Key: []byte("k"), Value: []byte("v")}))
+	require.NoError(t, db.eng.Flush())
+	// Open a descriptor by reading the flushed table.
+	_, err = db.Get([]byte("k"))
+	require.NoError(t, err)
+	db.fds.mu.Lock()
+	openNow := db.fds.open
+	db.fds.mu.Unlock()
+	require.Positive(t, openNow, "a read must have opened a table descriptor")
+
+	// Left untouched, the descriptor is closed within a couple of reaper sweeps.
+	require.Eventually(t, func() bool {
+		db.fds.mu.Lock()
+		defer db.fds.mu.Unlock()
+		return db.fds.open == 0
+	}, 5*time.Second, 50*time.Millisecond, "reaper must close the idle descriptor")
+}
+
+// TestAllocatorStartsAboveStrandedTableFile reproduces the file-number reuse
+// hazard: a crash can leave a table file on disk whose number is higher than any
+// the manifest records (an output synced before its manifest edit committed).
+// writeTable opens with O_TRUNC, so an allocator that resumed only from the
+// manifest would reissue that number and silently truncate the existing file. The
+// allocator must start above every on-disk table, not just the manifested ones.
+func TestAllocatorStartsAboveStrandedTableFile(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+
+	db := openAt(t, dir, 1<<30)
+	require.NoError(t, db.Put(PutOptions{Key: []byte("k"), Value: []byte("v")}))
+	require.NoError(t, db.eng.Flush()) // one committed, manifested table
+	require.NoError(t, db.Close())
+
+	// Strand a table file numbered far above anything the manifest knows, as a crash
+	// between fsync and manifest-commit would. Its content is a marker we check is
+	// never truncated.
+	strandedNum := uint32(1000)
+	strandedPath := filepath.Join(dir, tableName(strandedNum))
+	marker := []byte("stranded-table-contents")
+	require.NoError(t, os.WriteFile(strandedPath, marker, 0o644))
+
+	db = openAt(t, dir, 1<<30)
+	defer db.Close()
+
+	// Every number the allocator hands out must exceed the stranded file, so no
+	// future write can open it with O_TRUNC.
+	for i := 0; i < 5; i++ {
+		assert.Greater(t, db.alloc.Next(), strandedNum,
+			"allocator must never reissue an existing on-disk table number")
+	}
+
+	// The stranded file is still intact (cleanupTables may remove it, but nothing
+	// truncated it in place).
+	if got, err := os.ReadFile(strandedPath); err == nil {
+		assert.Equal(t, marker, got, "stranded file must not be overwritten")
+	}
+}
+
 func TestRecoverMixedFlushedAndWAL(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
