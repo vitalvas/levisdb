@@ -72,6 +72,42 @@ func (tw *tableWriter) setRangeTombstones(rts []rangeTombstone) { tw.rangeDels =
 // LevelDB, which rolls on Writer.BytesLen == the file offset).
 func (tw *tableWriter) bytesWritten() int64 { return int64(tw.offset) }
 
+// estimatedTrailerBytes is an upper bound on the bytes finish() still appends
+// beyond the already-flushed data blocks (bytesWritten): the in-flight data block
+// and its index entry, then the bloom filter, index block, optional range-del
+// block, and footer. bytesWritten counts only flushed blocks, so a roll decision
+// that ignored all this overshot the target by it; on a 128 MiB table of small
+// keys the bloom alone is several MiB. Rolling at
+// bytesWritten + estimatedTrailerBytes >= target keeps the finished file at or
+// under the target, which matters on HDDs where an oversized file straddles an
+// extra allocation. Every term over-estimates so the bound never under-reserves:
+//   - pending data block: its uncompressed builder size plus a block trailer (the
+//     codec only shrinks it); finish() flushes it before writing the trailer.
+//   - its index entry: that flush adds one separator-key + handle entry to the
+//     index, so include lastKey plus a fixed handle/varint allowance.
+//   - bloom: the exact pow2 sizing build() applies to the keys seen so far.
+//   - index block: its current uncompressed length plus the pending entry above,
+//     plus a block trailer; the codec only shrinks it.
+//   - range-del block and footer: fixed encodings.
+func (tw *tableWriter) estimatedTrailerBytes() int64 {
+	// A flushed index entry: varint key len + key + an encoded block handle (two
+	// varints, <= 20 bytes). Over-allow the varints generously.
+	const indexEntryOverhead = 32
+	pendingIndexEntry := 0
+	pendingData := 0
+	if !tw.data.empty() {
+		pendingData = tw.data.size() + blockTrailerLen
+		pendingIndexEntry = len(tw.lastKey) + indexEntryOverhead
+	}
+	bloom := pow2Bytes(tw.entries*tw.bloom.bitsPerKey) + 1 + blockTrailerLen
+	index := len(tw.index.buf) + pendingIndexEntry + blockTrailerLen
+	rangeDel := 0
+	if len(tw.rangeDels) > 0 {
+		rangeDel = len(encodeRangeDelBlock(nil, tw.rangeDels)) + blockTrailerLen
+	}
+	return int64(pendingData + bloom + index + rangeDel + footerLen)
+}
+
 // minUserKey and maxUserKey return the smallest and largest USER keys written,
 // or nil for an empty table. They are the table's key-range bounds, recorded in
 // the manifest so reads can skip a table whose range excludes the lookup key.

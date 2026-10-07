@@ -109,9 +109,9 @@ target a single slow spinning disk.
 | `MaxCompactionBytes` | `10 x FileSizeMax` | Input byte cap per non-bottom compaction; negative disables. |
 | `DisableOverlapSelection` | `false` | Merge the whole tier instead of only the largest key-overlapping group. |
 | `MaxLevels` | `8` | Tier count, 1..8; the deepest tier merges in place. Fewer levels bound read/recovery fan-out at the cost of larger bottom merges. |
-| `FileSizeBase` | `2 MiB` | Fresh-tier target .sst size, the base of the per-depth size curve. |
+| `FileSizeBase` | `2 MiB` | Depth-1 compaction-output roll size, the base of the per-depth size curve (L0 flush is unsized). |
 | `FileSizeMultiplier` | `2` | Per-depth growth factor of the size curve. |
-| `FileSizeMax` | `128 MiB` | Cap on the per-depth target size. |
+| `FileSizeMax` | `128 MiB` | Ceiling on compacted-file size; the roll reserves trailer space so finished files stay at or under it. |
 | `FreshCodec` | `CodecS2` | Compression for fresh (upper) tiers (`none`/`s2`/`flate`/`zstd`). See [Compression](#compression). |
 | `BottomCodec` | `CodecS2` | Compression for the bottom (oldest) tier. See [Compression](#compression). |
 | `LevelCodecs` | nil | Per-depth codec override; falls back to the fresh/bottom split. See [Compression](#compression). |
@@ -306,16 +306,21 @@ With the defaults (`FileSizeBase` 2 MiB, `FileSizeMultiplier` 2, `FileSizeMax`
 | 7 (deepest) | 128 MiB (capped) |
 
 A memtable flush writes exactly one depth-0 file, whatever that memtable
-compresses to; only compaction (depth 1 and below) rolls output at a size target,
-checked against compressed on-disk bytes (matching LevelDB, where `max_file_size`
-governs compaction output but not the L0 flush). `MemtableSize` defaults to 8 MiB
-(double LevelDB's `write_buffer_size`), so a full memtable flushes into a depth-0
-file of roughly `8 MiB / compression ratio`, and `FileSizeBase` (2 MiB) governs the
-depth-1 target those L0 files merge up into. `FileSizeMax`
-defaults to 128 MiB (`FileSizeBase << (maxTierDepth - 1)`), so the cap scales with
-the base and holds the deepest tier at the same size as the one above it. Raise `FileSizeMax` (or the multiplier) for larger bottom-tier files and
-fewer of them; the target is a per-file roll point, not a hard limit, so a single
-oversized key can still produce a larger file.
+compresses to; only compaction (depth 1 and below) rolls output at a size target.
+The roll projects the finished file size - the compressed data bytes written so
+far plus the bloom filter, index, and footer that close the file - and rolls
+before that projection exceeds the target, so a compacted file lands at or under
+it (unlike LevelDB, whose `max_file_size` bounds data bytes only and is exceeded
+on disk by the trailer, several MiB on a large table of small keys). `MemtableSize`
+defaults to 8 MiB (double LevelDB's `write_buffer_size`), so a full memtable
+flushes into a depth-0 file of roughly `8 MiB / compression ratio`, and
+`FileSizeBase` (2 MiB) governs the depth-1 target those L0 files merge up into.
+`FileSizeMax` defaults to 128 MiB (`FileSizeBase << (maxTierDepth - 1)`), so the
+cap scales with the base and holds the deepest tier at the same size as the one
+above it. Raise `FileSizeMax` (or the multiplier) for larger bottom-tier files and
+fewer of them. The ceiling binds compacted output; a single key larger than the
+target still produces a one-key file above it, and an L0 flush is sized by the
+memtable, not this target.
 
 `TombstoneCompactionRatio` (default `0.5`) compacts a tier early once that
 fraction of its entries are deletes, reclaiming delete-heavy data toward the

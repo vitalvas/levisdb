@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -43,6 +44,31 @@ func TestTableWriter(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, int64(buf.Len()), size)
 		assert.Greater(t, size, int64(footerLen))
+	})
+
+	// estimatedTrailerBytes must upper-bound the bloom/index/footer that finish()
+	// appends after the data blocks, so the compaction roll (bytesWritten +
+	// estimatedTrailerBytes >= target) keeps a finished table at or under the
+	// target. Many small keys make the bloom/index trailer a large, lumpy fraction
+	// (the pow2 bloom step), the case that overshot before. Checked over a range of
+	// key counts so a bloom pow2 jump between estimate and finish never under-reserves.
+	t.Run("trailer_estimate_upper_bounds_actual", func(t *testing.T) {
+		for _, n := range []int{1, 100, 5000, 50000} {
+			var buf bytes.Buffer
+			tw := newTableWriter(&buf, tableWriterConfig{codec: c, bloomBits: 10, blockSize: 4096})
+			for i := 0; i < n; i++ {
+				k := ikeyEncode(nil, []byte(fmt.Sprintf("key%012d", i)), 1, ikeyKindSet)
+				require.NoError(t, tw.Add(k, []byte{byte(i), byte(i >> 8)}))
+			}
+			dataBytes := tw.bytesWritten()
+			estTrailer := tw.estimatedTrailerBytes()
+			size, err := tw.finish()
+			require.NoError(t, err)
+			actualTrailer := size - dataBytes
+			assert.GreaterOrEqualf(t, estTrailer, actualTrailer,
+				"n=%d: estimated trailer %d under-reserved actual %d (final size %d would exceed target)",
+				n, estTrailer, actualTrailer, size)
+		}
 	})
 
 	t.Run("out_of_order_rejected", func(t *testing.T) {

@@ -903,15 +903,20 @@ func (s *compactionSink) add(key, value []byte) error {
 	return nil
 }
 
-// rollIfNeeded closes the current output table once its COMPRESSED on-disk size
-// reaches the target, so file sizes track real disk footprint and highly
-// compressible data does not spray many tiny SSTs. bytesWritten counts only
-// blocks already flushed to the file, so a table always holds at least one full
-// block before it can roll (it never produces an almost-empty SST); the current
-// in-memory block adds at most one blockSize of overshoot. Called at user-key
-// boundaries, so a key's versions never split across tables.
+// rollIfNeeded closes the current output table once its projected final on-disk
+// size reaches the target, so file sizes track real disk footprint and highly
+// compressible data does not spray many tiny SSTs. The projection is
+// bytesWritten (flushed data blocks) plus estimatedTrailerBytes (the bloom
+// filter, index, and footer finish() still appends): rolling on data bytes alone
+// overshot the target by the trailer, which on a 128 MiB table of small keys is
+// several MiB, enough to push a file meant to fit an allocation budget over it,
+// a real cost on HDDs with huge datasets. bytesWritten counts only flushed
+// blocks, so a table always holds at least one full block before it can roll (it
+// never produces an almost-empty SST); the current in-memory block adds at most
+// one blockSize of overshoot. Called at user-key boundaries, so a key's versions
+// never split across tables.
 func (s *compactionSink) rollIfNeeded() error {
-	if s.out != nil && s.out.w.bytesWritten() >= s.target {
+	if s.out != nil && s.out.w.bytesWritten()+s.out.w.estimatedTrailerBytes() >= s.target {
 		return s.finish()
 	}
 	return nil

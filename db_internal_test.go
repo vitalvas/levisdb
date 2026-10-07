@@ -459,6 +459,7 @@ func TestManifestNoAccumulationAcrossRestarts(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	o := DefaultOptions(dir)
+	o.NoSync = true // asserts manifest count, not durability; skip fsyncs for speed
 
 	// Several clean open/close cycles plus a crash, then a final open.
 	for i := 0; i < 5; i++ {
@@ -485,6 +486,7 @@ func TestManifestRotationBoundsGrowth(t *testing.T) {
 
 	dir := t.TempDir()
 	o := DefaultOptions(dir)
+	o.NoSync = true          // reopen checks data survival after clean Close, not crash durability
 	o.MemtableSize = 1 << 30 // flush each batch explicitly to produce manifest edits
 	db, err := Open(o)
 	require.NoError(t, err)
