@@ -168,7 +168,7 @@ func TestMaxLevelsCapsOutputDepth(t *testing.T) {
 func TestLevelSummaryAndNewestTable(t *testing.T) {
 	t.Parallel()
 	s := newTestEngine(t, 1<<30)
-	assert.Equal(t, "0", s.levelSummary(), "empty engine is a single zero tier")
+	assert.Equal(t, "L0:0", s.levelSummary(), "empty engine is a single zero tier")
 
 	flushSingle(t, s, 1, "a", "1")
 	flushSingle(t, s, 2, "b", "2")
@@ -181,7 +181,7 @@ func TestLevelSummaryAndNewestTable(t *testing.T) {
 	s.mu.Lock()
 	s.tables[1].depth = 2
 	s.mu.Unlock()
-	assert.Equal(t, "1 0 1", s.levelSummary(), "tiers 0..2 with an empty tier 1")
+	assert.Equal(t, "L0:1 L1:0 L2:1", s.levelSummary(), "tiers 0..2 with an empty tier 1")
 }
 
 // TestCompactionResultReportsOutputDepth guards the compaction-log detail: the

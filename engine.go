@@ -296,10 +296,11 @@ func (s *engineT) newestTable() (num uint32, entries int, size int64) {
 	return t.num, t.entries, t.size
 }
 
-// levelSummary renders the live tables as a per-tier histogram, mirroring
-// LevelDB's "files[ ... ]" line so a log reader sees the whole ladder after an
-// operation. It reports every tier from 0 to the deepest with a live table, so a
-// gap reads as 0.
+// levelSummary renders the live tables as a per-tier histogram so a log reader
+// sees the whole ladder after an operation. Each tier is labelled "L<depth>:
+// <count>" (e.g. "L0:1 L1:2 L2:2") rather than LevelDB's bare positional
+// "files[ 1 2 2 ]", so the numbers are self-describing. Every tier from 0 to the
+// deepest with a live table is reported, so a gap reads as 0.
 func (s *engineT) levelSummary() string {
 	s.mu.RLock()
 	counts := make(map[int]int)
@@ -316,7 +317,7 @@ func (s *engineT) levelSummary() string {
 		if d > 0 {
 			b.WriteByte(' ')
 		}
-		fmt.Fprintf(&b, "%d", counts[d])
+		fmt.Fprintf(&b, "L%d:%d", d, counts[d])
 	}
 	return b.String()
 }
