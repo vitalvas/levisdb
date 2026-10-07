@@ -3,6 +3,7 @@ package levisdb
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"fmt"
 	"log/slog"
 	"os"
@@ -11,6 +12,40 @@ import (
 	"sync/atomic"
 	"time"
 )
+
+// logBytes renders an arbitrary key or value for a log field. Keys and values are
+// raw bytes (an md5 hash, binary, control characters), so printing them as a
+// string mangles the output and can inject newlines or terminal escapes into
+// logs. Each rendered run of bytes made entirely of printable ASCII is logged
+// as-is for readability; anything else (any control or high byte) is base64
+// URL-encoded without padding, which is unambiguous and log-safe.
+//
+// A long value is capped to its first logKeyHead and last logKeyTail bytes, joined
+// by an elision that carries the full length, so a megabyte value cannot bloat a
+// log line (goleveldb shortens debug keys the same way). A slice short enough that
+// the head and tail would meet is rendered whole. A nil slice logs as empty.
+const (
+	logKeyHead = 12
+	logKeyTail = 8
+)
+
+func logBytes(b []byte) string {
+	if len(b) <= logKeyHead+logKeyTail {
+		return encodeLogBytes(b)
+	}
+	return fmt.Sprintf("%s..(%dB)..%s", encodeLogBytes(b[:logKeyHead]), len(b), encodeLogBytes(b[len(b)-logKeyTail:]))
+}
+
+// encodeLogBytes returns b as-is when it is all printable ASCII, else base64
+// URL-encoded without padding. A nil or empty slice yields "".
+func encodeLogBytes(b []byte) string {
+	for _, c := range b {
+		if c < 0x20 || c > 0x7e {
+			return base64.RawURLEncoding.EncodeToString(b)
+		}
+	}
+	return string(b)
+}
 
 // DB is an open levisdb database.
 type DB struct {
@@ -1528,7 +1563,7 @@ func (db *DB) logCompactionOutputs(outs []compactionOutputInfo) {
 		db.log.Debug("compaction output",
 			"op", "compaction", "table_file", tableName(o.Num), "depth", o.Depth,
 			"entries", o.Entries, "bytes", o.Size,
-			"min_key", string(o.MinKey), "max_key", string(o.MaxKey))
+			"min_key", logBytes(o.MinKey), "max_key", logBytes(o.MaxKey))
 	}
 }
 
@@ -1558,7 +1593,7 @@ func (db *DB) CompactRange(start, end []byte) error {
 	// (the whole keyspace is compacted), but logging them records the request.
 	db.log.Debug("manual compaction requested",
 		"op", "compaction", "manual", true,
-		"start", string(start), "end", string(end))
+		"start", logBytes(start), "end", logBytes(end))
 	return db.compactEngineFully()
 }
 

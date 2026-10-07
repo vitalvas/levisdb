@@ -1,6 +1,7 @@
 package levisdb
 
 import (
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"os"
@@ -12,6 +13,42 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestLogBytes(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		in   []byte
+		want string
+	}{
+		{"nil", nil, ""},
+		{"empty", []byte{}, ""},
+		{"printable ascii as-is", []byte("user:42/name"), "user:42/name"},
+		{"space and tilde bounds", []byte{0x20, 0x7e}, " ~"},
+		// A control byte must not reach the log verbatim (newline injection).
+		{"newline forces base64", []byte("a\nb"), base64.RawURLEncoding.EncodeToString([]byte("a\nb"))},
+		{"tab forces base64", []byte("a\tb"), base64.RawURLEncoding.EncodeToString([]byte("a\tb"))},
+		// High bytes (md5/binary) are base64url without padding.
+		{"binary forces base64", []byte{0x00, 0xff, 0x80}, base64.RawURLEncoding.EncodeToString([]byte{0x00, 0xff, 0x80})},
+		// At the cap (head+tail = 20 bytes) it is still rendered whole.
+		{"at cap rendered whole", []byte("0123456789abcdefghij"), "0123456789abcdefghij"},
+		// Over the cap: first 12 + length + last 8.
+		{"over cap elided", []byte("0123456789abcdefghijklmnop"), "0123456789ab..(26B)..ijklmnop"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, logBytes(tc.in))
+		})
+	}
+}
+
+// TestLogBytesBoundsLength proves a huge value cannot bloat a log line: the
+// rendered form stays small no matter the input size.
+func TestLogBytesBoundsLength(t *testing.T) {
+	t.Parallel()
+	got := logBytes(make([]byte, 1<<20))
+	assert.Less(t, len(got), 64)
+}
 
 func TestOpenMissingManifestErrors(t *testing.T) {
 	t.Parallel()
