@@ -1,9 +1,9 @@
 module github.com/vitalvas/levisdb
 
-go 1.26.5
+go 1.27
 
 require (
-	github.com/klauspost/compress v1.19.2
+	github.com/klauspost/compress v1.20.1
 	github.com/stretchr/testify v1.12.1
 )
 
