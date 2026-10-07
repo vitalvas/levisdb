@@ -1566,7 +1566,7 @@ func (db *DB) compactEngineFully() error {
 	}
 	logCompaction := db.log.Enabled(context.Background(), slog.LevelDebug)
 	start := time.Now()
-	err = db.eng.CompactAll(retain, cc)
+	err = db.compactTiered(retain, cc)
 	release()
 	if err != nil {
 		return err
@@ -1583,6 +1583,43 @@ func (db *DB) compactEngineFully() error {
 			"levels", db.eng.levelSummary(), "dur", time.Since(start))
 	}
 	return nil
+}
+
+// compactTiered runs a full manual compaction one tier at a time instead of
+// merging every tier in a single pass. CompactAll opens an iterator over every
+// table at once and commits only after the whole merge, so on a large dataset it
+// needs scratch space for both the old and new tables (~2x the data), holds a
+// merge heap over all sources (memory), and leaves the entire reclaim in one
+// non-atomic window that a crash wastes. Compacting tier by tier bounds each
+// merge to a single tier's tables and commits (deleting those inputs) before the
+// next tier starts, so scratch, memory, and the crash blast radius are all
+// bounded to one tier.
+//
+// The cascade relocates every shallower tier down into the deepest populated tier
+// (bottom), then collapses that tier in place to drop tombstones. It stops at the
+// deepest populated tier rather than the configured cap so data already low in the
+// ladder is not rewritten once per intervening tier down to the cap.
+//
+// The filter and tombstone drop run only on that final bottom pass: Compact
+// applies cc.Filter whenever it is set, so a key relocated through N tiers would be
+// filtered N times, violating the once-per-surviving-key contract. Intermediate
+// hops therefore relocate with Filter disabled (they never drop tombstones anyway,
+// only the bottom does); the final pass carries the filter, collapses in place
+// (CollapseInPlace), and via RewriteSingle runs even after the cascade collapsed
+// the data to a single bottom table.
+func (db *DB) compactTiered(retain uint64, cc compactionConfigT) error {
+	bottom := db.eng.maxPopulatedDepth()
+	for depth := 0; depth < bottom; depth++ {
+		hop := cc
+		hop.Filter = nil
+		if err := db.eng.Compact(depth, retain, hop); err != nil {
+			return err
+		}
+	}
+	final := cc
+	final.CollapseInPlace = true
+	final.RewriteSingle = true
+	return db.eng.Compact(bottom, retain, final)
 }
 
 // NewIterator returns an iterator over the whole keyspace at the latest

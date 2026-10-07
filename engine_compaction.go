@@ -64,6 +64,18 @@ type compactionConfigT struct {
 	// whole tier, so a lookup touches at most one output table per non-overlapping
 	// group. The bottom tier still merges wholly (tombstone GC needs it).
 	OverlapSelection bool
+	// RewriteSingle lets a bottom in-place merge proceed with a single input table,
+	// so a full (manual) compaction can apply the filter and drop tombstones even
+	// after the cascade has collapsed the data to one bottom table. Normal
+	// size-tiered compaction leaves it false: a lone table is not worth rewriting.
+	RewriteSingle bool
+	// CollapseInPlace forces the merge output to stay at the source depth instead
+	// of moving one tier deeper. A full (manual) compaction's final pass uses it to
+	// collapse the deepest populated tier in place (dropping tombstones there)
+	// without first relocating the data down to the configured cap tier, which would
+	// rewrite it once per intervening tier. Normal size-tiered compaction leaves it
+	// false and lets output descend one tier per cycle.
+	CollapseInPlace bool
 }
 
 // pickCompaction returns the tier depth to compact, or -1 if none is ready. A
@@ -157,6 +169,36 @@ type compactionOutputInfo struct {
 	MaxKey  []byte
 }
 
+// resolveOutDepth returns the tier a compaction of the given source depth writes
+// to. Output normally lands one tier deeper, capped at the configured deepest
+// tier so the ladder cannot grow without bound (at the cap the merge is in place).
+// CollapseInPlace overrides this to keep the output at the source depth, used by a
+// full compaction's final pass to collapse the deepest populated tier in place
+// rather than relocating it down to the cap (which would rewrite it once per
+// intervening tier).
+func resolveOutDepth(depth int, cc compactionConfigT) int {
+	if cc.CollapseInPlace {
+		return depth
+	}
+	capDepth := resolveMaxDepth(cc.MaxLevels)
+	if outDepth := depth + 1; outDepth <= capDepth {
+		return outDepth
+	}
+	return capDepth
+}
+
+// worthCompacting reports whether a merge of n input tables should run. A lone
+// table normally is not worth rewriting (it reclaims nothing), so a tier needs at
+// least two tables. The exception is a full compaction's final bottom in-place
+// pass (bottomRewrite), which must run even on a single table to apply the filter
+// and drop tombstones after the cascade collapsed the data there.
+func worthCompacting(n int, bottomRewrite bool) bool {
+	if n == 0 {
+		return false
+	}
+	return n >= 2 || bottomRewrite
+}
+
 // Compact merges all tables at the given depth into tables at depth+1 (or in
 // place at the cap tier), rolling output at configured size targets.
 // It collapses each user key to its newest version, retaining older versions
@@ -183,11 +225,7 @@ func (s *engineT) Compact(depth int, retainSeq uint64, cc compactionConfigT) err
 	// forever (an infinite compaction loop that starves flushes). The cap bounds
 	// recovery/read fan-out too. When the source is already at the cap, the merge
 	// collapses it in place.
-	capDepth := resolveMaxDepth(cc.MaxLevels)
-	outDepth := depth + 1
-	if outDepth > capDepth {
-		outDepth = capDepth
-	}
+	outDepth := resolveOutDepth(depth, cc)
 	inPlace := outDepth == depth
 	var inputs []*tableMeta
 	// Non-input tables at ANY depth can contain older versions: ingest puts
@@ -202,7 +240,7 @@ func (s *engineT) Compact(depth int, retainSeq uint64, cc compactionConfigT) err
 	}
 	s.mu.RUnlock()
 
-	if len(inputs) < 2 {
+	if !worthCompacting(len(inputs), cc.RewriteSingle && inPlace && depth == maxDepth) {
 		s.setLastCompaction(compactionResult{})
 		return nil
 	}

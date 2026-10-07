@@ -247,6 +247,22 @@ func (s *engineT) depth0Count() int {
 	return n
 }
 
+// maxPopulatedDepth returns the deepest tier that currently holds a table, or 0
+// when the engine is empty. A per-tier full compaction cascades down to this tier
+// and collapses it in place, so it never rewrites data below where it already
+// lives.
+func (s *engineT) maxPopulatedDepth() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	deepest := 0
+	for _, t := range s.tables {
+		if t.depth > deepest {
+			deepest = t.depth
+		}
+	}
+	return deepest
+}
+
 // tierTableCount returns the number of live tables at the given tier depth. Used
 // by the flush/compaction logging to report input/output sizes.
 func (s *engineT) tierTableCount(depth int) int {

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -832,6 +833,82 @@ func TestCheckpointRecoveryBoundarySurvivesManifestRotation(t *testing.T) {
 			require.Equal(t, "new", string(v))
 		})
 	}
+}
+
+// TestCompactTieredCascadesAcrossTiers drives data into several tiers, then runs
+// a full manual compaction and asserts the per-tier cascade: every live key
+// survives, tombstoned keys are gone, the user filter sees each surviving key
+// exactly once (not once per tier it was relocated through), and the result ends
+// up collapsed in a single tier.
+func TestCompactTieredCascadesAcrossTiers(t *testing.T) {
+	t.Parallel()
+	var mu sync.Mutex
+	filtered := map[string]int{}
+	db := openTestDB(t, func(o *Options) {
+		o.TierRatio = 2
+		o.MaxLevels = 4
+		o.WALRetention = time.Hour // make the written seqs filter-safe
+		o.CompactionFilter = func(e CompactionFilterEntry) bool {
+			mu.Lock()
+			filtered[string(e.Key)]++
+			mu.Unlock()
+			return string(e.Key) != "drop"
+		}
+	})
+
+	// Build a multi-tier layout: flush L0 tables, push them down with a partial
+	// per-tier compaction, then flush more fresh data on top. After this the live
+	// keys sit at more than one depth, so the cascade has real tiers to walk.
+	put := func(k, v string) { require.NoError(t, db.Put(PutOptions{Key: []byte(k), Value: []byte(v)})) }
+	put("keep1", "a")
+	put("drop", "x")
+	require.NoError(t, db.eng.Flush())
+	put("keep2", "b")
+	require.NoError(t, db.eng.Flush())
+	// Relocate L0 -> L1 (filter off here; the full compaction applies it later).
+	retain, cc, release, err := db.compactionRunConfig(false)
+	require.NoError(t, err)
+	cc.Filter = nil
+	require.NoError(t, db.eng.Compact(0, retain, cc))
+	release()
+	require.Positive(t, db.eng.maxPopulatedDepth(), "data should have moved below L0")
+	// Fresh data back on L0, plus a delete of a key that lives deeper.
+	put("keep3", "c")
+	require.NoError(t, db.Delete([]byte("drop")))
+	require.NoError(t, db.eng.Flush())
+
+	preDepths := map[int]int{}
+	db.eng.mu.RLock()
+	for _, tbl := range db.eng.tables {
+		preDepths[tbl.depth]++
+	}
+	db.eng.mu.RUnlock()
+	require.Greaterf(t, len(preDepths), 1, "layout must span >1 tier to exercise the cascade, got %v", preDepths)
+
+	require.NoError(t, db.CompactRange(nil, nil))
+
+	for _, k := range []string{"keep1", "keep2", "keep3"} {
+		v, err := db.Get([]byte(k))
+		require.NoError(t, err, k)
+		require.NotEmpty(t, v, k)
+	}
+	_, err = db.Get([]byte("drop"))
+	require.ErrorIs(t, err, ErrNotFound, "filtered key and its tombstone are gone")
+
+	mu.Lock()
+	defer mu.Unlock()
+	for k, n := range filtered {
+		assert.Equalf(t, 1, n, "filter saw %q %d times; the contract is exactly once", k, n)
+	}
+
+	// Everything collapsed into a single tier.
+	depths := map[int]int{}
+	db.eng.mu.RLock()
+	for _, tbl := range db.eng.tables {
+		depths[tbl.depth]++
+	}
+	db.eng.mu.RUnlock()
+	assert.Lenf(t, depths, 1, "compacted output should occupy one tier, got %v", depths)
 }
 
 func TestCheckpointManifestFailurePreservesRecovery(t *testing.T) {
