@@ -63,6 +63,11 @@ type DB struct {
 	checkpointWG      sync.WaitGroup
 	checkpointRunning atomic.Bool
 
+	// writeSlowing latches whether writers are currently in the soft slowdown, so
+	// the throttle logs once on entry and once on exit instead of one line per
+	// write (a burst over the mark would otherwise flood the log).
+	writeSlowing atomic.Bool
+
 	closeMu      sync.Mutex // serializes Close/crash teardown
 	manMu        sync.Mutex // guards manifest appends from concurrent scheduler workers
 	checkpointMu sync.Mutex
@@ -969,15 +974,23 @@ func (db *DB) throttleWrite() {
 			time.Sleep(writeStopPoll)
 		}
 	}
-	// Soft slowdown: a single brief delay when the fresh tier is over the mark
-	// (skip if the hard path already stalled this write).
-	if n := db.eng.depth0Count(); !stalled && slow > 0 && n >= slow {
+	// Soft slowdown: a brief delay on every write while the fresh tier is over the
+	// mark (skip if the hard path already stalled this write). The delay is
+	// per-write backpressure, but the log is coalesced via writeSlowing: one line
+	// when writers enter the slowdown and one when it clears, not one per write.
+	n := db.eng.depth0Count()
+	if !stalled && slow > 0 && n >= slow {
 		db.metrics.writeStalls.Add(1)
-		// LevelDB's "Current memtable full; waiting...".
-		db.log.Debug("write slowed: fresh tier over slowdown mark",
-			"op", "stall", "reason", "slowdown", "l0_tables", n, "l0_slowdown", slow,
-			"delay", writeSlowdownDelay)
+		if db.writeSlowing.CompareAndSwap(false, true) {
+			// LevelDB's "Current memtable full; waiting...".
+			db.log.Debug("write slowdown started: fresh tier over slowdown mark",
+				"op", "stall", "reason", "slowdown", "l0_tables", n, "l0_slowdown", slow,
+				"delay", writeSlowdownDelay)
+		}
 		time.Sleep(writeSlowdownDelay)
+	} else if !stalled && db.writeSlowing.CompareAndSwap(true, false) {
+		db.log.Debug("write slowdown ended: fresh tier back under slowdown mark",
+			"op", "stall", "reason", "slowdown", "l0_tables", n, "l0_slowdown", slow)
 	}
 }
 
@@ -1337,91 +1350,117 @@ func (db *DB) publishSeq(seq uint64) {
 func (db *DB) flushEngine() {
 	s := db.eng
 
-	// A writer can fill the new active memtable while an older immutable is being
-	// flushed. Such writes cannot signal another flush until the immutable is
-	// installed, so re-check here and drain every over-limit active table.
+	// Flush and compaction alternate: flush any over-limit memtable, then drain
+	// every ready tier, and repeat until neither has work. A flush-until-drained
+	// loop followed by a one-shot compaction pass let a continuous write stream
+	// keep needFlush true and service flushes forever, never compacting, so the
+	// fresh tier grew until writes hard stopped (the 12s-per-flush stall). Pairing
+	// each flush round with a compaction round bounds the fresh tier: L0 can no
+	// longer outrun the compactor within a pass. needFlush stays true across the
+	// flush (imm is installed mid-flush, so a writer that fills the next active
+	// memtable can't re-signal), which is why the flush is re-checked in-loop
+	// rather than relying on the scheduler to re-arm.
 	for {
-		logFlush := db.log.Enabled(context.Background(), slog.LevelDebug)
-		var memSize int64
-		var start time.Time
-		if logFlush {
-			memSize = s.memSize()
-			start = time.Now()
-			db.log.Debug("flush started",
-				"op", "flush", "memtable_entries", s.memCount(), "memtable_bytes", memSize)
+		flushed := false
+		if s.needFlush() {
+			if !db.flushOnce(s) {
+				return
+			}
+			flushed = true
 		}
-		if err := s.Flush(); err != nil {
-			db.log.Error("flush failed", "op", "flush", "err", err)
-			db.setBackgroundError(err)
+		compacted := db.compactOnce(s)
+		if db.backgroundError() != nil {
 			return
 		}
-		if logFlush {
-			l0Tables, l0Bytes := s.tierTableStats(0)
-			tableNum, tableEntries, tableBytes := s.newestTable()
-			db.log.Debug("memtable flushed",
-				"op", "flush", "memtable_bytes", memSize,
-				"table_file", tableName(tableNum), "table_entries", tableEntries, "table_bytes", tableBytes,
-				"l0_tables", l0Tables, "l0_bytes", l0Bytes,
-				"levels", s.levelSummary(), "dur", time.Since(start))
-		}
-		if !s.needFlush() {
-			break
+		if !flushed && !compacted {
+			return
 		}
 	}
+}
 
-	// Drain all ready tiers so a burst of flushes does not leave the engine
-	// permanently over the tier ratio, and reclaim delete-heavy tiers early.
-	for {
-		// A tombstone can only be dropped when the retained sequence covers it.
-		// While a live snapshot pins the oldest retained sequence below the
-		// committed one, a tombstone-triggered compaction reclaims nothing and
-		// merely relocates the delete-heavy tier one level deeper, where it
-		// re-fires without bound. Gate the trigger off in that state; count-based
-		// compaction still runs.
-		tombstoneRatio := db.opts.TombstoneCompactionRatio
-		if db.snaps.oldest(db.readSeq.Load()) < db.readSeq.Load() {
-			tombstoneRatio = 0
-		}
-		depth := s.pickCompaction(db.opts.TierRatio, db.opts.TierByteTrigger, tombstoneRatio)
-		if depth < 0 {
-			break
-		}
-		// Retain versions a live snapshot might still read; with no snapshots,
-		// oldest returns the current committed seq so only the newest survives.
-		retain, cc, release, err := db.compactionRunConfig(true)
-		if err != nil {
-			if err != ErrClosed {
-				db.setBackgroundError(err)
-			}
-			break
-		}
-		logCompaction := db.log.Enabled(context.Background(), slog.LevelDebug)
-		var start time.Time
-		if logCompaction {
-			start = time.Now()
-			db.log.Debug("compaction started",
-				"op", "compaction", "depth", depth, "input_tables", s.tierTableCount(depth))
-		}
-		err = s.Compact(depth, retain, cc)
-		release()
-		if err != nil {
-			db.log.Error("compaction failed", "op", "compaction", "depth", depth, "err", err)
-			db.setBackgroundError(err)
-			break
-		}
-		if res := s.takeLastCompaction(); logCompaction && res.Done {
-			db.logCompactionOutputs(res.Outputs)
-			db.log.Debug("compaction done",
-				"op", "compaction", "depth", depth, "output_depth", res.OutputDepth,
-				"input_tables", res.InputTables, "input_tables_next", res.InputTablesNext,
-				"input_files", tableNames(res.InputNums), "input_bytes", res.InputBytes,
-				"output_tables", res.OutputTables, "output_files", tableNames(res.OutputNums),
-				"output_bytes", res.OutputBytes, "keys_written", res.KeysWritten,
-				"keys_dropped", res.KeysDropped, "retain_seq", res.RetainSeq,
-				"min_seq", res.MinSeq, "max_seq", res.MaxSeq,
-				"levels", s.levelSummary(), "dur", time.Since(start))
-		}
+// flushOnce flushes the active memtable once, logging the before/after detail.
+// It returns false (and latches the background error) on flush failure.
+func (db *DB) flushOnce(s *engineT) bool {
+	logFlush := db.log.Enabled(context.Background(), slog.LevelDebug)
+	var memSize int64
+	var start time.Time
+	if logFlush {
+		memSize = s.memSize()
+		start = time.Now()
+		db.log.Debug("flush started",
+			"op", "flush", "memtable_entries", s.memCount(), "memtable_bytes", memSize)
 	}
+	if err := s.Flush(); err != nil {
+		db.log.Error("flush failed", "op", "flush", "err", err)
+		db.setBackgroundError(err)
+		return false
+	}
+	if logFlush {
+		l0Tables, l0Bytes := s.tierTableStats(0)
+		tableNum, tableEntries, tableBytes := s.newestTable()
+		db.log.Debug("memtable flushed",
+			"op", "flush", "memtable_bytes", memSize,
+			"table_file", tableName(tableNum), "table_entries", tableEntries, "table_bytes", tableBytes,
+			"l0_tables", l0Tables, "l0_bytes", l0Bytes,
+			"levels", s.levelSummary(), "dur", time.Since(start))
+	}
+	return true
+}
+
+// compactOnce runs a single ready-tier compaction and returns whether one ran.
+// false means nothing was ready (or setup/compaction failed, in which case the
+// background error is latched). Reclaims delete-heavy tiers early.
+func (db *DB) compactOnce(s *engineT) bool {
+	// A tombstone can only be dropped when the retained sequence covers it.
+	// While a live snapshot pins the oldest retained sequence below the
+	// committed one, a tombstone-triggered compaction reclaims nothing and
+	// merely relocates the delete-heavy tier one level deeper, where it
+	// re-fires without bound. Gate the trigger off in that state; count-based
+	// compaction still runs.
+	tombstoneRatio := db.opts.TombstoneCompactionRatio
+	if db.snaps.oldest(db.readSeq.Load()) < db.readSeq.Load() {
+		tombstoneRatio = 0
+	}
+	depth := s.pickCompaction(db.opts.TierRatio, db.opts.TierByteTrigger, tombstoneRatio)
+	if depth < 0 {
+		return false
+	}
+	// Retain versions a live snapshot might still read; with no snapshots,
+	// oldest returns the current committed seq so only the newest survives.
+	retain, cc, release, err := db.compactionRunConfig(true)
+	if err != nil {
+		if err != ErrClosed {
+			db.setBackgroundError(err)
+		}
+		return false
+	}
+	logCompaction := db.log.Enabled(context.Background(), slog.LevelDebug)
+	var start time.Time
+	if logCompaction {
+		start = time.Now()
+		db.log.Debug("compaction started",
+			"op", "compaction", "depth", depth, "input_tables", s.tierTableCount(depth))
+	}
+	err = s.Compact(depth, retain, cc)
+	release()
+	if err != nil {
+		db.log.Error("compaction failed", "op", "compaction", "depth", depth, "err", err)
+		db.setBackgroundError(err)
+		return false
+	}
+	if res := s.takeLastCompaction(); logCompaction && res.Done {
+		db.logCompactionOutputs(res.Outputs)
+		db.log.Debug("compaction done",
+			"op", "compaction", "depth", depth, "output_depth", res.OutputDepth,
+			"input_tables", res.InputTables, "input_tables_next", res.InputTablesNext,
+			"input_files", tableNames(res.InputNums), "input_bytes", res.InputBytes,
+			"output_tables", res.OutputTables, "output_files", tableNames(res.OutputNums),
+			"output_bytes", res.OutputBytes, "keys_written", res.KeysWritten,
+			"keys_dropped", res.KeysDropped, "retain_seq", res.RetainSeq,
+			"min_seq", res.MinSeq, "max_seq", res.MaxSeq,
+			"levels", s.levelSummary(), "dur", time.Since(start))
+	}
+	return true
 }
 
 // logCompactionOutputs emits one Debug line per table a compaction produced,
