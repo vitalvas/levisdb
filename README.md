@@ -100,7 +100,7 @@ target a single slow spinning disk.
 | Option | Default | Purpose |
 | --- | --- | --- |
 | `Dir` | (required) | Data directory. |
-| `MemtableSize` | `4 MiB` | Memtable flush threshold in bytes. |
+| `MemtableSize` | `8 MiB` | Memtable flush threshold in bytes. |
 | `TierRatio` | `4` | Size-tiered compaction fan-out (tables per tier before merge). |
 | `TierByteTrigger` | `8 x FileSizeMax` | Tier bytes that trigger compaction below the count ratio; negative disables. |
 | `TombstoneCompactionRatio` | `0.5` | Delete fraction that triggers early compaction; negative disables. |
@@ -296,7 +296,7 @@ With the defaults (`FileSizeBase` 2 MiB, `FileSizeMultiplier` 2, `FileSizeMax`
 
 | Depth | Target size |
 | --- | --- |
-| 0 (fresh, from a memtable flush) | 2 MiB |
+| 0 (fresh, from a memtable flush) | none (one file per memtable flush) |
 | 1 | 4 MiB |
 | 2 | 8 MiB |
 | 3 | 16 MiB |
@@ -305,8 +305,13 @@ With the defaults (`FileSizeBase` 2 MiB, `FileSizeMultiplier` 2, `FileSizeMax`
 | 6 | 128 MiB |
 | 7 (deepest) | 128 MiB (capped) |
 
-`MemtableSize` defaults to 4 MiB (matching LevelDB's `write_buffer_size`), so a
-full memtable flushes into two depth-0 files at the 2 MiB target. `FileSizeMax`
+A memtable flush writes exactly one depth-0 file, whatever that memtable
+compresses to; only compaction (depth 1 and below) rolls output at a size target,
+checked against compressed on-disk bytes (matching LevelDB, where `max_file_size`
+governs compaction output but not the L0 flush). `MemtableSize` defaults to 8 MiB
+(double LevelDB's `write_buffer_size`), so a full memtable flushes into a depth-0
+file of roughly `8 MiB / compression ratio`, and `FileSizeBase` (2 MiB) governs the
+depth-1 target those L0 files merge up into. `FileSizeMax`
 defaults to 128 MiB (`FileSizeBase << (maxTierDepth - 1)`), so the cap scales with
 the base and holds the deepest tier at the same size as the one above it. Raise `FileSizeMax` (or the multiplier) for larger bottom-tier files and
 fewer of them; the target is a per-file roll point, not a hard limit, so a single

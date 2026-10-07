@@ -62,7 +62,12 @@ type WALObserver interface {
 // Default option values. All are tunable so the engine can be calibrated
 // against a real spindle.
 const (
-	DefaultMemtableSize = 4 << 20 // 4 MiB, matching LevelDB's write_buffer_size
+	// DefaultMemtableSize is 8 MiB: double LevelDB's 4 MiB write_buffer_size, which
+	// shifts the memtable:FileSizeBase ratio from 2:1 to 4:1 so a flushed L0 table
+	// compresses nearer the 2 MiB FileSizeBase target and fewer, larger tables are
+	// produced on bulk loads. The cost mirrors LevelDB's note: up to two buffers
+	// live in memory and a larger buffer lengthens recovery replay.
+	DefaultMemtableSize = 8 << 20
 	DefaultTierRatio    = 4
 	// DefaultTombstoneCompactionRatio compacts a tier once half its entries are
 	// tombstones, reclaiming delete-heavy data without waiting for the table-count
