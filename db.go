@@ -693,9 +693,9 @@ func (db *DB) Close() error {
 	// covers the crash case; this covers the graceful one. A background flush may
 	// already have sealed an immutable memtable, so the first pass drains it and
 	// the second captures the active memtable too.
-	if err := db.eng.Flush(); err != nil {
+	if err := db.flushAndLog(); err != nil {
 		setErr(err)
-	} else if err := db.eng.Flush(); err != nil {
+	} else if err := db.flushAndLog(); err != nil {
 		setErr(err)
 	}
 	// A manifest rotation can fail at the final directory sync after its
@@ -1246,11 +1246,12 @@ func (db *DB) checkpointWALMode(force bool) (uint64, error) {
 
 	// Two passes cover the case where an immutable memtable already existed when
 	// the checkpoint began: the first drains it, the second captures the active
-	// table that contains every write from the retired segment.
-	if err := db.eng.Flush(); err != nil {
+	// table that contains every write from the retired segment. flushAndLog so a
+	// checkpoint flush is traceable like a scheduled one.
+	if err := db.flushAndLog(); err != nil {
 		return db.filterSafeSeq.Load(), err
 	}
-	if err := db.eng.Flush(); err != nil {
+	if err := db.flushAndLog(); err != nil {
 		return db.filterSafeSeq.Load(), err
 	}
 	if err := db.backgroundError(); err != nil {
@@ -1407,6 +1408,36 @@ func (db *DB) flushOnce(s *engineT) bool {
 	return true
 }
 
+// flushAndLog flushes once from a non-scheduler caller (shutdown) and logs the
+// same detail as flushOnce, but only when a table was actually written: the
+// shutdown path flushes unconditionally and twice, so the active-memtable pass
+// and any no-op second pass must stay silent rather than emit a phantom flush
+// line with stale numbers. A written table changes the newest table number.
+func (db *DB) flushAndLog() error {
+	logFlush := db.log.Enabled(context.Background(), slog.LevelDebug)
+	var memSize int64
+	var start time.Time
+	beforeNum, _, _ := db.eng.newestTable()
+	if logFlush {
+		memSize = db.eng.memSize()
+		start = time.Now()
+	}
+	if err := db.eng.Flush(); err != nil {
+		db.log.Error("flush failed", "op", "flush", "err", err)
+		return err
+	}
+	afterNum, tableEntries, tableBytes := db.eng.newestTable()
+	if logFlush && afterNum != beforeNum {
+		l0Tables, l0Bytes := db.eng.tierTableStats(0)
+		db.log.Debug("memtable flushed",
+			"op", "flush", "memtable_bytes", memSize,
+			"table_file", tableName(afterNum), "table_entries", tableEntries, "table_bytes", tableBytes,
+			"l0_tables", l0Tables, "l0_bytes", l0Bytes,
+			"levels", db.eng.levelSummary(), "dur", time.Since(start))
+	}
+	return nil
+}
+
 // compactOnce runs a single ready-tier compaction and returns whether one ran.
 // false means nothing was ready (or setup/compaction failed, in which case the
 // background error is latched). Reclaims delete-heavy tiers early.
@@ -1525,7 +1556,7 @@ func (db *DB) validateManualCompaction() error {
 // compactEngineFully flushes then merges all tables into sized bottom-tier
 // outputs, reclaiming tombstones and dead versions.
 func (db *DB) compactEngineFully() error {
-	if err := db.eng.Flush(); err != nil {
+	if err := db.flushAndLog(); err != nil {
 		return err
 	}
 
