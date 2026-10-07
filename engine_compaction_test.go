@@ -163,6 +163,88 @@ func TestMaxLevelsCapsOutputDepth(t *testing.T) {
 	assert.Equal(t, []byte("2"), mustGet(t, s, 100, "b"))
 }
 
+// TestLevelSummaryAndNewestTable covers the logging helpers: levelSummary renders
+// the per-tier histogram (with gaps as 0) and newestTable reports the last table.
+func TestLevelSummaryAndNewestTable(t *testing.T) {
+	t.Parallel()
+	s := newTestEngine(t, 1<<30)
+	assert.Equal(t, "0", s.levelSummary(), "empty engine is a single zero tier")
+
+	flushSingle(t, s, 1, "a", "1")
+	flushSingle(t, s, 2, "b", "2")
+	num, entries, size := s.newestTable()
+	assert.NotZero(t, num)
+	assert.Equal(t, 1, entries)
+	assert.Positive(t, size)
+
+	// Relocate one table to tier 2 so tier 1 is an empty gap in the summary.
+	s.mu.Lock()
+	s.tables[1].depth = 2
+	s.mu.Unlock()
+	assert.Equal(t, "1 0 1", s.levelSummary(), "tiers 0..2 with an empty tier 1")
+}
+
+// TestCompactionResultReportsOutputDepth guards the compaction-log detail: the
+// result records the actual output tier (depth+1 for a normal merge, the same
+// depth for an in-place merge at the cap) plus input/output table counts and
+// bytes, so the "compaction done" log cannot report the wrong tier.
+func TestCompactionResultReportsOutputDepth(t *testing.T) {
+	t.Parallel()
+
+	t.Run("normal merge lands one tier deeper", func(t *testing.T) {
+		s := newTestEngine(t, 1<<30)
+		flushSingle(t, s, 1, "a", "1")
+		flushSingle(t, s, 2, "b", "2")
+		require.NoError(t, s.Compact(0, uint64(1)<<62, testCompactionConfig()))
+
+		res := s.takeLastCompaction()
+		assert.True(t, res.Done)
+		assert.Equal(t, 1, res.OutputDepth, "depth-0 merge outputs at tier 1")
+		assert.Equal(t, 2, res.InputTables)
+		assert.Equal(t, 0, res.InputTablesNext, "no output-tier tables pulled in")
+		assert.Positive(t, res.InputBytes)
+		assert.Positive(t, res.OutputTables)
+		assert.Positive(t, res.OutputBytes)
+		assert.Len(t, res.InputNums, 2, "both input file numbers listed")
+		assert.Len(t, res.OutputNums, res.OutputTables, "every output file number listed")
+		assert.Equal(t, 2, res.KeysWritten, "both live keys written")
+		assert.Equal(t, uint64(1)<<62, res.RetainSeq, "GC watermark recorded")
+		assert.Equal(t, uint64(1), res.MinSeq, "lowest written sequence")
+		assert.Equal(t, uint64(2), res.MaxSeq, "highest written sequence")
+	})
+
+	t.Run("in-place cap merge reports its own depth", func(t *testing.T) {
+		dir := t.TempDir()
+		tablePath := func(num uint32) (string, error) {
+			return filepath.Join(dir, fmt.Sprintf("%08x.sst", num)), nil
+		}
+		cfg := engineConfigT{MemtableSize: 1 << 30, BloomBits: 10, BlockSize: 256, FreshCodecName: "none", MaxLevels: 2}
+		s := newEngine(cfg, newAllocator(0), tablePath)
+		t.Cleanup(func() { s.Close() })
+		flushSingle(t, s, 1, "a", "1")
+		flushSingle(t, s, 2, "b", "2")
+		s.mu.Lock()
+		for _, tb := range s.tables {
+			tb.depth = 1 // the cap tier when MaxLevels=2
+		}
+		s.mu.Unlock()
+		cc := testCompactionConfig()
+		cc.MaxLevels = 2
+		require.NoError(t, s.Compact(1, uint64(1)<<62, cc))
+
+		res := s.takeLastCompaction()
+		assert.True(t, res.Done)
+		assert.Equal(t, 1, res.OutputDepth, "in-place cap merge outputs at the same tier")
+	})
+
+	t.Run("fewer than two inputs does nothing", func(t *testing.T) {
+		s := newTestEngine(t, 1<<30)
+		flushSingle(t, s, 1, "a", "1")
+		require.NoError(t, s.Compact(0, uint64(1)<<62, testCompactionConfig()))
+		assert.False(t, s.takeLastCompaction().Done, "a single-input tier is a no-op")
+	})
+}
+
 func testCompactionConfig() compactionConfigT {
 	return compactionConfigT{
 		TierRatio:          2,

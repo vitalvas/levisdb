@@ -17,9 +17,10 @@ import (
 // ponytail: RWMutex over the skiplist; swap for an atomic lock-free skiplist
 // only if benchmarks show the lock is the write-path bottleneck.
 type memtableT struct {
-	mu   sync.RWMutex
-	list *skiplist
-	size int64
+	mu    sync.RWMutex
+	list  *skiplist
+	size  int64
+	count int // buffered entries (points plus range tombstones), for flush logging
 	// rts holds range tombstones buffered by DeleteRange, in insertion order. They
 	// are applied by the engine read path (a range tombstone can shadow a point key
 	// in any source), persisted on flush, and carried through compaction.
@@ -36,6 +37,14 @@ func (m *memtableT) Size() int64 {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.size
+}
+
+// Len returns the number of buffered entries (points plus range tombstones), for
+// flush logging.
+func (m *memtableT) Len() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.count
 }
 
 // Empty reports whether the memtable holds no entries and no range tombstones.
@@ -87,6 +96,7 @@ func (m *memtableT) delRange(seq uint64, start, end []byte) {
 	m.mu.Lock()
 	m.rts = append(m.rts, rt)
 	m.size += int64(len(rt.start) + len(rt.end))
+	m.count++
 	m.mu.Unlock()
 }
 
@@ -106,6 +116,7 @@ func (m *memtableT) add(seq uint64, kind ikeyKind, key, value []byte) {
 	m.mu.Lock()
 	m.list.insert(ik, value)
 	m.size += int64(len(ik) + len(value))
+	m.count++
 	m.mu.Unlock()
 }
 

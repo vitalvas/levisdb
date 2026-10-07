@@ -30,6 +30,9 @@ const (
 	// width keeps the "%08x" + suffix file name at a fixed 12 chars so lexical
 	// sort still equals numeric sort.
 	tableSuffix = ".sst"
+	// logSuffix is the on-disk extension for WAL segments, same fixed width as
+	// tableSuffix so the "%08x" + suffix name stays 12 chars.
+	logSuffix = ".log"
 )
 
 // Storage owns a database directory and its exclusive lock.
@@ -99,7 +102,49 @@ func (s *storageT) Close() error {
 
 // TablePath returns the path to a table file.
 func (s *storageT) tablePath(num uint32) (string, error) {
-	return filepath.Join(s.dir, fmt.Sprintf("%08x%s", num, tableSuffix)), nil
+	return filepath.Join(s.dir, tableName(num)), nil
+}
+
+// hexStem writes num as 8 fixed-width lowercase hex digits into dst and returns
+// the extended slice, the stem shared by every on-disk file name. Done by hand
+// (not fmt) so the renderers below are real formatters, not stdlib wrappers.
+func hexStem(dst []byte, num uint32) []byte {
+	var buf [8]byte
+	for i := 7; i >= 0; i-- {
+		buf[i] = "0123456789abcdef"[num&0xf]
+		num >>= 4
+	}
+	return append(dst, buf[:]...)
+}
+
+// fileName renders a file number as its 8-hex stem plus suffix, the on-disk name
+// for tables (.sst) and WAL segments (.log). Single source of truth for those
+// names, used by the path builders and by logging so a log entry names a file an
+// operator can find on disk.
+func fileName(num uint32, suffix string) string {
+	return string(append(hexStem(nil, num), suffix...))
+}
+
+// tableName and walName render a table or WAL segment number as its on-disk file
+// name (8 hex digits + .sst / .log).
+func tableName(num uint32) string { return fileName(num, tableSuffix) }
+func walName(num uint32) string   { return fileName(num, logSuffix) }
+
+// tableNames renders a list of table numbers as their on-disk file names for
+// logging a compaction's inputs or outputs.
+func tableNames(nums []uint32) []string {
+	names := make([]string, len(nums))
+	for i, n := range nums {
+		names[i] = tableName(n)
+	}
+	return names
+}
+
+// manifestFileName renders a manifest number as its on-disk file name
+// (MANIFEST-<8 hex>).
+func manifestFileName(num uint32) string {
+	out := append([]byte(manifestName), '-')
+	return string(hexStem(out, num))
 }
 
 // listTables returns the canonical table file numbers present in the database
@@ -133,7 +178,7 @@ func (s *storageT) listTables() ([]uint32, error) {
 // database directory. The file number comes from the global allocator, so
 // segment numbers never collide with table numbers.
 func (s *storageT) logPath(num uint32) (string, error) {
-	return filepath.Join(s.dir, fmt.Sprintf("%08x.log", num)), nil
+	return filepath.Join(s.dir, walName(num)), nil
 }
 
 // listLogs returns the WAL segment numbers present, ascending. On a clean
@@ -174,7 +219,7 @@ func (s *storageT) removeLog(num uint32) error {
 
 // ManifestPath returns the path to a manifest file.
 func (s *storageT) manifestPath(num uint32) string {
-	return filepath.Join(s.dir, fmt.Sprintf("%s-%08x", manifestName, num))
+	return filepath.Join(s.dir, manifestFileName(num))
 }
 
 // RemoveManifest deletes an obsolete manifest file after rotation.
@@ -230,7 +275,7 @@ func (s *storageT) readCurrent() (num uint32, ok bool, err error) {
 
 // SetCurrent atomically points CURRENT at the given manifest number.
 func (s *storageT) setCurrent(num uint32) error {
-	name := fmt.Sprintf("%s-%08x", manifestName, num)
+	name := manifestFileName(num)
 	tmp := filepath.Join(s.dir, fmt.Sprintf("%s.tmp", currentName))
 	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {

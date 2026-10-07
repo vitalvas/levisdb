@@ -280,7 +280,8 @@ func (db *DB) IngestExternalFile(path string) error {
 	}
 	db.advanceReapHorizon(seq)
 	db.log.Info("ingested external file",
-		"op", "ingest", "path", path, "table", num, "seq", seq, "bytes", size)
+		"op", "ingest", "path", path, "table_file", tableName(num),
+		"entries", meta.entries, "seq", seq, "bytes", size)
 	return nil
 }
 

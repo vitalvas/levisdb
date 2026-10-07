@@ -40,7 +40,7 @@ func (db *DB) Verify() ([]CorruptTable, error) {
 	for i, f := range faults {
 		out[i] = CorruptTable{Table: f.num, Err: f.err}
 		db.log.Error("table verification failed",
-			"op", "verify", "table", f.num, "err", f.err)
+			"op", "verify", "table_file", tableName(f.num), "err", f.err)
 	}
 	return out, nil
 }

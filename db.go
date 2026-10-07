@@ -606,6 +606,9 @@ func (db *DB) maybeRotateManifest() {
 	db.manNum = num
 	old.Close()
 	_ = db.store.removeManifest(oldNum)
+	// LevelDB's "Delete type=manifest #num": the superseded manifest after rotation.
+	db.log.Debug("deleted obsolete file",
+		"op", "gc", "type", "manifest", "file", manifestFileName(oldNum), "new_file", manifestFileName(num))
 }
 
 // manifestRotateEdits is the edit threshold that triggers a manifest rotation.
@@ -945,10 +948,13 @@ func (db *DB) throttleWrite() {
 	// Hard stop: block while the fresh tier is at or above the stop threshold,
 	// re-signalling the scheduler so it drains, until it falls below stop.
 	if stop > 0 {
-		for db.eng.depth0Count() >= stop {
+		for n := db.eng.depth0Count(); n >= stop; n = db.eng.depth0Count() {
 			if !stalled {
 				db.metrics.writeStalls.Add(1)
 				stalled = true
+				// LevelDB's "Too many L0 files; waiting...".
+				db.log.Debug("write stalled: too many fresh-tier tables",
+					"op", "stall", "reason", "stop", "l0_tables", n, "l0_stop", stop)
 			}
 			db.mu.RLock()
 			closed := db.closed
@@ -965,8 +971,12 @@ func (db *DB) throttleWrite() {
 	}
 	// Soft slowdown: a single brief delay when the fresh tier is over the mark
 	// (skip if the hard path already stalled this write).
-	if !stalled && slow > 0 && db.eng.depth0Count() >= slow {
+	if n := db.eng.depth0Count(); !stalled && slow > 0 && n >= slow {
 		db.metrics.writeStalls.Add(1)
+		// LevelDB's "Current memtable full; waiting...".
+		db.log.Debug("write slowed: fresh tier over slowdown mark",
+			"op", "stall", "reason", "slowdown", "l0_tables", n, "l0_slowdown", slow,
+			"delay", writeSlowdownDelay)
 		time.Sleep(writeSlowdownDelay)
 	}
 }
@@ -1186,13 +1196,14 @@ func (db *DB) checkpointWALMode(force bool) (uint64, error) {
 		return db.filterSafeSeq.Load(), nil
 	}
 	ckStart := time.Now()
-	db.log.Debug("wal checkpoint started",
-		"op", "checkpoint", "force", force, "wal_bytes", db.maxWALSegmentSize())
+	walBytes := db.maxWALSegmentSize()
 	// Rotate the WAL to a fresh segment, recording the retired segment.
 	num := db.alloc.Next()
 	if num == 0 {
 		return db.filterSafeSeq.Load(), ErrFileNumberExhausted
 	}
+	db.log.Debug("wal checkpoint started",
+		"op", "checkpoint", "force", force, "wal_bytes", walBytes, "new_wal", walName(num))
 	path, err := db.store.logPath(num)
 	if err != nil {
 		return db.filterSafeSeq.Load(), err
@@ -1336,6 +1347,8 @@ func (db *DB) flushEngine() {
 		if logFlush {
 			memSize = s.memSize()
 			start = time.Now()
+			db.log.Debug("flush started",
+				"op", "flush", "memtable_entries", s.memCount(), "memtable_bytes", memSize)
 		}
 		if err := s.Flush(); err != nil {
 			db.log.Error("flush failed", "op", "flush", "err", err)
@@ -1343,10 +1356,13 @@ func (db *DB) flushEngine() {
 			return
 		}
 		if logFlush {
-			_, l0Bytes := s.tierTableStats(0)
+			l0Tables, l0Bytes := s.tierTableStats(0)
+			tableNum, tableEntries, tableBytes := s.newestTable()
 			db.log.Debug("memtable flushed",
 				"op", "flush", "memtable_bytes", memSize,
-				"l0_tables", s.tierTableCount(0), "l0_bytes", l0Bytes, "dur", time.Since(start))
+				"table_file", tableName(tableNum), "table_entries", tableEntries, "table_bytes", tableBytes,
+				"l0_tables", l0Tables, "l0_bytes", l0Bytes,
+				"levels", s.levelSummary(), "dur", time.Since(start))
 		}
 		if !s.needFlush() {
 			break
@@ -1380,13 +1396,11 @@ func (db *DB) flushEngine() {
 			break
 		}
 		logCompaction := db.log.Enabled(context.Background(), slog.LevelDebug)
-		var startTables int
 		var start time.Time
 		if logCompaction {
-			startTables = s.tierTableCount(depth)
 			start = time.Now()
 			db.log.Debug("compaction started",
-				"op", "compaction", "depth", depth, "input_tables", startTables)
+				"op", "compaction", "depth", depth, "input_tables", s.tierTableCount(depth))
 		}
 		err = s.Compact(depth, retain, cc)
 		release()
@@ -1395,13 +1409,31 @@ func (db *DB) flushEngine() {
 			db.setBackgroundError(err)
 			break
 		}
-		if logCompaction {
-			outTables, outBytes := s.tierTableStats(depth + 1)
+		if res := s.takeLastCompaction(); logCompaction && res.Done {
+			db.logCompactionOutputs(res.Outputs)
 			db.log.Debug("compaction done",
-				"op", "compaction", "depth", depth,
-				"input_tables", startTables, "output_tables", outTables,
-				"output_bytes", outBytes, "dur", time.Since(start))
+				"op", "compaction", "depth", depth, "output_depth", res.OutputDepth,
+				"input_tables", res.InputTables, "input_tables_next", res.InputTablesNext,
+				"input_files", tableNames(res.InputNums), "input_bytes", res.InputBytes,
+				"output_tables", res.OutputTables, "output_files", tableNames(res.OutputNums),
+				"output_bytes", res.OutputBytes, "keys_written", res.KeysWritten,
+				"keys_dropped", res.KeysDropped, "retain_seq", res.RetainSeq,
+				"min_seq", res.MinSeq, "max_seq", res.MaxSeq,
+				"levels", s.levelSummary(), "dur", time.Since(start))
 		}
+	}
+}
+
+// logCompactionOutputs emits one Debug line per table a compaction produced,
+// mirroring LevelDB's "Generated table #num@level: keys, bytes" and goleveldb's
+// "table@build created" line: the file, its tier, entry count,
+// size, and user-key range.
+func (db *DB) logCompactionOutputs(outs []compactionOutputInfo) {
+	for _, o := range outs {
+		db.log.Debug("compaction output",
+			"op", "compaction", "table_file", tableName(o.Num), "depth", o.Depth,
+			"entries", o.Entries, "bytes", o.Size,
+			"min_key", string(o.MinKey), "max_key", string(o.MaxKey))
 	}
 }
 
@@ -1427,8 +1459,11 @@ func (db *DB) CompactRange(start, end []byte) error {
 	if err := db.validateManualCompaction(); err != nil {
 		return err
 	}
-	_ = start
-	_ = end
+	// LevelDB's "Manual compaction at level-N from .. to ..". Bounds are advisory
+	// (the whole keyspace is compacted), but logging them records the request.
+	db.log.Debug("manual compaction requested",
+		"op", "compaction", "manual", true,
+		"start", string(start), "end", string(end))
 	return db.compactEngineFully()
 }
 
@@ -1459,9 +1494,25 @@ func (db *DB) compactEngineFully() error {
 	if err != nil {
 		return err
 	}
+	logCompaction := db.log.Enabled(context.Background(), slog.LevelDebug)
+	start := time.Now()
 	err = db.eng.CompactAll(retain, cc)
 	release()
-	return err
+	if err != nil {
+		return err
+	}
+	if res := db.eng.takeLastCompaction(); logCompaction && res.Done {
+		db.logCompactionOutputs(res.Outputs)
+		db.log.Debug("compaction done",
+			"op", "compaction", "manual", true, "output_depth", res.OutputDepth,
+			"input_tables", res.InputTables, "input_files", tableNames(res.InputNums),
+			"input_bytes", res.InputBytes, "output_tables", res.OutputTables,
+			"output_files", tableNames(res.OutputNums), "output_bytes", res.OutputBytes,
+			"keys_written", res.KeysWritten, "keys_dropped", res.KeysDropped,
+			"retain_seq", res.RetainSeq, "min_seq", res.MinSeq, "max_seq", res.MaxSeq,
+			"levels", db.eng.levelSummary(), "dur", time.Since(start))
+	}
+	return nil
 }
 
 // NewIterator returns an iterator over the whole keyspace at the latest

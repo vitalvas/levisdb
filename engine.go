@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -148,6 +149,10 @@ type engineT struct {
 	// flushMu serializes Flush and Compact so at most one runs at a time; the
 	// finer mu guards the fields those operations read and swap.
 	flushMu sync.Mutex
+	// lastCompaction records the most recent Compact outcome for logging. It is
+	// written under flushMu and read by the caller right after Compact returns on
+	// the same goroutine, so it needs no separate guard.
+	lastCompaction compactionResult
 }
 
 // engineSeed fixes the memtable skiplist RNG so memtable layout is
@@ -213,6 +218,13 @@ func (s *engineT) memSize() int64 {
 	return s.mem.Size()
 }
 
+// memCount returns the active memtable's buffered entry count, for flush logging.
+func (s *engineT) memCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.mem.Len()
+}
+
 // NeedFlush reports whether the active memtable has reached the flush
 // threshold and no flush is already in progress.
 func (s *engineT) needFlush() bool {
@@ -261,6 +273,52 @@ func (s *engineT) tierTableStats(depth int) (count int, bytes int64) {
 		}
 	}
 	return count, bytes
+}
+
+// setLastCompaction records a compaction outcome. Called from Compact under
+// flushMu.
+func (s *engineT) setLastCompaction(res compactionResult) { s.lastCompaction = res }
+
+// takeLastCompaction returns the most recent compaction outcome, for the caller
+// to log after Compact returns.
+func (s *engineT) takeLastCompaction() compactionResult { return s.lastCompaction }
+
+// newestTable returns the number, entry count, and size of the most recently
+// created live table, for flush logging (the table just written). It returns
+// zeros when no table exists.
+func (s *engineT) newestTable() (num uint32, entries int, size int64) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if len(s.tables) == 0 {
+		return 0, 0, 0
+	}
+	t := s.tables[len(s.tables)-1]
+	return t.num, t.entries, t.size
+}
+
+// levelSummary renders the live tables as a per-tier histogram, mirroring
+// LevelDB's "files[ ... ]" line so a log reader sees the whole ladder after an
+// operation. It reports every tier from 0 to the deepest with a live table, so a
+// gap reads as 0.
+func (s *engineT) levelSummary() string {
+	s.mu.RLock()
+	counts := make(map[int]int)
+	maxDepth := 0
+	for _, t := range s.tables {
+		counts[t.depth]++
+		if t.depth > maxDepth {
+			maxDepth = t.depth
+		}
+	}
+	s.mu.RUnlock()
+	var b strings.Builder
+	for d := 0; d <= maxDepth; d++ {
+		if d > 0 {
+			b.WriteByte(' ')
+		}
+		fmt.Fprintf(&b, "%d", counts[d])
+	}
+	return b.String()
 }
 
 // Get resolves key at snapshot seq, returning the value or that it is absent or

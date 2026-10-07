@@ -152,7 +152,7 @@ func TestWriteMergedDetectsSameSeqValueConflict(t *testing.T) {
 	b := srcFrom(5, [2]string{"k", "valueB"})
 	m := newMergeIter(a, b)
 
-	_, err := s.writeMerged(mergeWrite{
+	_, _, err := s.writeMerged(mergeWrite{
 		depth:     1,
 		merged:    m,
 		retainSeq: uint64(1) << 62,

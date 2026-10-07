@@ -110,12 +110,60 @@ func (s *engineT) pickCompaction(ratio int, byteTrigger int64, tombstoneRatio fl
 	return best
 }
 
-// Compact merges all tables at the given depth into tables at depth+1, rolling
-// output at configured size targets.
+// compactionResult reports what the most recent compaction did, for logging.
+// Done is false when the tier had fewer than two inputs and nothing merged.
+// InputTablesNext is how many of the inputs came from the output tier (the
+// "+ n@level+1" that overlap selection and bottom merges pull in), mirroring
+// LevelDB's "n@level + m@level+1" accounting.
+type compactionResult struct {
+	Done            bool
+	OutputDepth     int
+	InputTables     int
+	InputTablesNext int
+	InputBytes      int64
+	OutputTables    int
+	OutputBytes     int64
+	// InputNums and OutputNums are the file numbers merged and produced, so a log
+	// reader can see exactly which tables a compaction consumed and created (as
+	// LevelDB's VersionEdit and goleveldb's table@compaction lines do).
+	InputNums  []uint32
+	OutputNums []uint32
+	// KeysWritten and KeysDropped are the entries kept in the output and the
+	// entries the merge discarded (superseded versions, reclaimed tombstones),
+	// mirroring goleveldb's Ke and D counters.
+	KeysWritten int
+	KeysDropped int
+	// RetainSeq is the GC watermark the merge used: versions at or below it are
+	// collapsed to the newest, deciding what this compaction reclaimed. MinSeq and
+	// MaxSeq are the sequence span of the entries written. No LevelDB/goleveldb
+	// equivalent, but the key to tracing version visibility and GC.
+	RetainSeq uint64
+	MinSeq    uint64
+	MaxSeq    uint64
+	// Outputs is the per-output-table detail (file, depth, entries, size, key
+	// range), mirroring LevelDB's "Generated table" and goleveldb's "table@build
+	// created" lines.
+	Outputs []compactionOutputInfo
+}
+
+// compactionOutputInfo describes one table a compaction produced, for the
+// per-output log detail.
+type compactionOutputInfo struct {
+	Num     uint32
+	Depth   int
+	Entries int
+	Size    int64
+	MinKey  []byte
+	MaxKey  []byte
+}
+
+// Compact merges all tables at the given depth into tables at depth+1 (or in
+// place at the cap tier), rolling output at configured size targets.
 // It collapses each user key to its newest version, retaining older versions
 // with seq >= retainSeq so live read snapshots still see them, and, when the
 // output is the deepest tier, drops tombstones and fully shadowed versions to
 // reclaim space. Pass retainSeq 0 (or MaxSeq for "keep only newest") per policy.
+// The outcome is recorded in s.lastCompaction for the caller to log.
 func (s *engineT) Compact(depth int, retainSeq uint64, cc compactionConfigT) error {
 	s.flushMu.Lock()
 	defer s.flushMu.Unlock()
@@ -155,6 +203,7 @@ func (s *engineT) Compact(depth int, retainSeq uint64, cc compactionConfigT) err
 	s.mu.RUnlock()
 
 	if len(inputs) < 2 {
+		s.setLastCompaction(compactionResult{})
 		return nil
 	}
 	// The output is the bottom tier when nothing lives deeper than it. An in-place
@@ -242,7 +291,7 @@ func (s *engineT) Compact(depth int, retainSeq uint64, cc compactionConfigT) err
 		noDeeperTier = func(user []byte) bool { return !rangesMayContain(deeper, user) }
 	}
 
-	metas, err := s.writeMerged(mergeWrite{
+	metas, stats, err := s.writeMerged(mergeWrite{
 		depth:          outDepth,
 		merged:         merged,
 		bottomCodec:    bottomCodec,
@@ -256,7 +305,68 @@ func (s *engineT) Compact(depth int, retainSeq uint64, cc compactionConfigT) err
 		return err
 	}
 
-	return s.commitCompaction(inputs, metas)
+	if err := s.commitCompaction(inputs, metas); err != nil {
+		return err
+	}
+
+	s.setLastCompaction(summarizeCompaction(compactionSummaryInput{
+		depth:     depth,
+		outDepth:  outDepth,
+		retainSeq: retainSeq,
+		inputs:    inputs,
+		outputs:   metas,
+		stats:     stats,
+	}))
+	return nil
+}
+
+// compactionSummaryInput bundles the facts summarizeCompaction needs, so its
+// signature stays within the parameter limit.
+type compactionSummaryInput struct {
+	depth     int
+	outDepth  int
+	retainSeq uint64
+	inputs    []*tableMeta
+	outputs   []*tableMeta
+	stats     mergeStats
+}
+
+// summarizeCompaction builds the log summary for a finished compaction: the
+// output tier, the input tables (split into those from the source tier and those
+// pulled in from the output tier) with their bytes, and the output tables with
+// their bytes.
+func summarizeCompaction(in compactionSummaryInput) compactionResult {
+	res := compactionResult{
+		Done:        true,
+		OutputDepth: in.outDepth,
+		KeysDropped: in.stats.dropped,
+		RetainSeq:   in.retainSeq,
+		MinSeq:      in.stats.minSeq,
+		MaxSeq:      in.stats.maxSeq,
+	}
+	for _, t := range in.inputs {
+		res.InputTables++
+		res.InputBytes += t.size
+		res.InputNums = append(res.InputNums, t.num)
+		if t.depth != in.depth {
+			res.InputTablesNext++
+		}
+	}
+	for _, t := range in.outputs {
+		res.OutputTables++
+		res.OutputBytes += t.size
+		res.OutputNums = append(res.OutputNums, t.num)
+		res.KeysWritten += t.entries
+		res.Outputs = append(res.Outputs, compactionOutputInfo{
+			Num:     t.num,
+			Depth:   t.depth,
+			Entries: t.entries,
+			Size:    t.size,
+			MinKey:  t.minKey,
+			MaxKey:  t.maxKey,
+		})
+	}
+	return res
 }
 
 // collectInputRangeDels gathers every range tombstone from the input tables. The
@@ -475,7 +585,7 @@ func (s *engineT) CompactAll(retainSeq uint64, cc compactionConfigT) error {
 	for i, t := range inputs {
 		srcs[i] = t.reader.newIterator()
 	}
-	metas, err := s.writeMerged(mergeWrite{
+	metas, stats, err := s.writeMerged(mergeWrite{
 		depth:          maxDepth,
 		merged:         newMergeIter(srcs...),
 		bottomCodec:    true,
@@ -487,7 +597,18 @@ func (s *engineT) CompactAll(retainSeq uint64, cc compactionConfigT) error {
 	if err != nil {
 		return err
 	}
-	return s.commitCompaction(inputs, metas)
+	if err := s.commitCompaction(inputs, metas); err != nil {
+		return err
+	}
+	s.setLastCompaction(summarizeCompaction(compactionSummaryInput{
+		depth:     maxDepth,
+		outDepth:  maxDepth,
+		retainSeq: retainSeq,
+		inputs:    inputs,
+		outputs:   metas,
+		stats:     stats,
+	}))
+	return nil
 }
 
 // mergeWrite bundles the inputs for writeMerged.
@@ -508,14 +629,34 @@ type mergeWrite struct {
 	noDeeperTier func(userKey []byte) bool
 }
 
+// spanSeq widens the [lo,hi] sequence span to include seq. A zero lo means the
+// span is empty (no entry written yet), so the first seq seeds both ends.
+func spanSeq(lo, hi, seq uint64) (uint64, uint64) {
+	if lo == 0 || seq < lo {
+		lo = seq
+	}
+	if seq > hi {
+		hi = seq
+	}
+	return lo, hi
+}
+
+// mergeStats reports what a merge discarded and the sequence span it wrote, for
+// the compaction log's version-GC detail (no equivalent in LevelDB/goleveldb,
+// but the key to reasoning about what a compaction reclaimed and why).
+type mergeStats struct {
+	dropped        int
+	minSeq, maxSeq uint64 // sequence span of the entries written (0,0 if none)
+}
+
 // writeMerged writes the merged stream to a new table, dropping older versions
 // of each user key and, at the bottom tier, tombstones as well. Output rolls at
 // user-key boundaries according to the configured per-depth file-size curve.
-func (s *engineT) writeMerged(mw mergeWrite) ([]*tableMeta, error) {
+func (s *engineT) writeMerged(mw mergeWrite) ([]*tableMeta, mergeStats, error) {
 	codecName := resolveLevelCodec(mw.cc.LevelCodecs, mw.depth, mw.cc.FreshCodecName, mw.cc.BottomCodecName, mw.bottomCodec)
 	c, err := codecFromName(codecName)
 	if err != nil {
-		return nil, err
+		return nil, mergeStats{}, err
 	}
 	sink := compactionSink{
 		eng:              s,
@@ -531,7 +672,8 @@ func (s *engineT) writeMerged(mw mergeWrite) ([]*tableMeta, error) {
 	var lastSeq uint64
 	var lastKind ikeyKind
 	var lastValue []byte
-	droppedBelow := false // a version at or below retainSeq was already kept
+	var minSeq, maxSeq uint64 // sequence span of entries written
+	droppedBelow := false     // a version at or below retainSeq was already kept
 	// reclaimHere is true for the current key when tombstones/dead versions can
 	// be dropped: at the bottom tier, or at an intermediate tier when no deeper
 	// tier can hold the key. Recomputed per new user key.
@@ -569,6 +711,7 @@ func (s *engineT) writeMerged(mw mergeWrite) ([]*tableMeta, error) {
 					kind:  lastKind,
 				}, now)
 				if expiryErr == nil && kind == expiredKind && bytes.Equal(value, expiredValue) {
+					sink.dropped++
 					continue
 				}
 				return sink.fail(fmt.Errorf("compaction: conflicting kinds at sequence %d", seq))
@@ -576,12 +719,14 @@ func (s *engineT) writeMerged(mw mergeWrite) ([]*tableMeta, error) {
 			if !bytes.Equal(value, lastValue) {
 				return sink.fail(fmt.Errorf("compaction: conflicting values at sequence %d", seq))
 			}
+			sink.dropped++
 			continue // identical internal key replayed into more than one table
 		case seq < mw.retainSeq && droppedBelow:
 			// Older version of a key: a snapshot needs versions with
 			// seq >= retainSeq plus the single newest one strictly below
 			// retainSeq. Once that below-watermark version is kept, drop the
 			// rest for this key.
+			sink.dropped++
 			continue
 		}
 		// lastValue must own its bytes: value aliases the merge iterator's reusable
@@ -598,6 +743,7 @@ func (s *engineT) writeMerged(mw mergeWrite) ([]*tableMeta, error) {
 		// on read, so no version is lost for a snapshot that still needs it.
 		if reclaimHere && maxCoveringRangeDelSeqLE(mw.rangeDels, user, mw.retainSeq) > seq {
 			droppedBelow = true
+			sink.dropped++
 			continue
 		}
 		writeKey, value, kind, err := resolveCompactionEntry(mw.cc, mergeEntry{
@@ -617,6 +763,7 @@ func (s *engineT) writeMerged(mw mergeWrite) ([]*tableMeta, error) {
 			// seq > retainSeq a snapshot may still need the pre-delete value, so
 			// the tombstone and older versions are kept.)
 			droppedBelow = true
+			sink.dropped++
 			continue
 		}
 		if seq <= mw.retainSeq {
@@ -625,6 +772,7 @@ func (s *engineT) writeMerged(mw mergeWrite) ([]*tableMeta, error) {
 		if err := sink.add(writeKey, value); err != nil {
 			return sink.fail(err)
 		}
+		minSeq, maxSeq = spanSeq(minSeq, maxSeq, seq)
 	}
 	if err := mw.merged.Error(); err != nil {
 		return sink.fail(err)
@@ -639,7 +787,12 @@ func (s *engineT) writeMerged(mw mergeWrite) ([]*tableMeta, error) {
 	if err := sink.finish(); err != nil {
 		return sink.fail(err)
 	}
-	return sink.metas, nil
+	stats := mergeStats{
+		dropped: sink.dropped,
+		minSeq:  minSeq,
+		maxSeq:  maxSeq,
+	}
+	return sink.metas, stats, nil
 }
 
 // mergeEntry is one entry the compaction merge is deciding on.
@@ -701,6 +854,10 @@ type compactionSink struct {
 	target               int64
 	out                  *compactionOutput
 	metas                []*tableMeta
+	// dropped counts entries the merge discarded (superseded versions, reclaimed
+	// tombstones, range-deleted points), for the compaction log's "dropped" field,
+	// mirroring goleveldb's D counter.
+	dropped int
 	// pendingRangeDels are range tombstones carried from the input tables that have
 	// not yet been written to an output. They are attached to the first output
 	// table produced (one carrier is enough: the read path scans every table's
@@ -805,7 +962,7 @@ func (s *compactionSink) finish() error {
 	return nil
 }
 
-func (s *compactionSink) fail(err error) ([]*tableMeta, error) {
+func (s *compactionSink) fail(err error) ([]*tableMeta, mergeStats, error) {
 	if s.out != nil {
 		_ = s.out.f.Close()
 		_ = removeFileDurable(s.out.path)
@@ -815,7 +972,7 @@ func (s *compactionSink) fail(err error) ([]*tableMeta, error) {
 		_ = meta.releaseOwner(true)
 	}
 	s.metas = nil
-	return nil, err
+	return nil, mergeStats{}, err
 }
 
 func (cc compactionConfigT) targetFileSize(depth int) int64 {

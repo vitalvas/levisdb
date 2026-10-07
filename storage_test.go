@@ -44,6 +44,16 @@ func TestStoragePaths(t *testing.T) {
 	})
 }
 
+// TestFileNameHelpers pins the on-disk name renderers used by both the path
+// builders and the logging, so the two can never drift from the real file names.
+func TestFileNameHelpers(t *testing.T) {
+	t.Parallel()
+	assert.Equal(t, "000000ff.sst", tableName(255))
+	assert.Equal(t, "00000001.log", walName(1))
+	assert.Equal(t, "MANIFEST-0000002a", manifestFileName(42))
+	assert.Equal(t, []string{"00000001.sst", "0000000a.sst"}, tableNames([]uint32{1, 10}))
+}
+
 func TestStorageListAndRemoveLogs(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()

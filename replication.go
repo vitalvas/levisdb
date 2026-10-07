@@ -84,6 +84,9 @@ func (db *DB) reapRetainedWAL(liveNum uint32) {
 		if err := db.store.removeLog(c.num); err != nil {
 			continue // retry next reap
 		}
+		// LevelDB's "Delete type=log #num": a retained WAL segment past both horizons.
+		db.log.Debug("deleted obsolete file",
+			"op", "gc", "type", "wal", "file", walName(c.num), "bytes", c.size)
 		total -= c.size
 	}
 	// Every deletable segment was removed; the newest retained segment is kept, so

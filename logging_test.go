@@ -82,6 +82,67 @@ func TestLoggingEmitsStorageEvents(t *testing.T) {
 	}
 }
 
+// TestLoggingCompactionDetail confirms the flush and compaction logs carry the
+// LevelDB/goleveldb-style detail: the flushed table's number and entry count, and
+// a compaction's actual output tier, input/output counts and bytes, and the
+// per-tier level summary.
+func TestLoggingCompactionDetail(t *testing.T) {
+	t.Parallel()
+	var buf bytes.Buffer
+	var mu sync.Mutex
+	logger := slog.New(slog.NewTextHandler(&syncWriter{mu: &mu, w: &buf}, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	db := openTestDB(t, func(o *Options) {
+		o.Logger = logger
+		o.MemtableSize = 1024
+		o.L0SlowdownTables = 2 // low, so a burst trips the slowdown stall
+		o.L0StopTables = 100
+	})
+	value := bytes.Repeat([]byte("v"), 1024)
+	for i := 0; i < 8; i++ {
+		require.NoError(t, db.Put(PutOptions{Key: []byte(fmt.Sprintf("k%06d", i)), Value: value}))
+		db.sched.drain()
+	}
+	require.NoError(t, db.CompactRange(nil, nil)) // exercise the manual path
+	require.NoError(t, db.Close())
+
+	mu.Lock()
+	out := buf.String()
+	mu.Unlock()
+	for _, want := range []string{
+		// flush: started line + detail line.
+		`msg="flush started"`, "memtable_entries=",
+		"table_file=", ".sst", "table_entries=", "table_bytes=",
+		"l0_tables=", "l0_bytes=",
+		// write stall (slowdown path).
+		`op=stall`, "reason=slowdown", "l0_slowdown=",
+		// compaction started + per-output + done, every field.
+		`msg="compaction started"`, `msg="compaction output"`, `msg="compaction done"`,
+		"output_depth=", "input_tables_next=", "input_files=", "input_bytes=",
+		"output_files=", "output_bytes=", "keys_written=", "keys_dropped=",
+		"retain_seq=", "min_seq=", "max_seq=",
+		"min_key=", "max_key=", "levels=",
+		// manual compaction request + obsolete-file GC (manifest rotation is rare,
+		// so assert only the manual request, which always fires here).
+		`msg="manual compaction requested"`, "manual=true",
+	} {
+		assert.Containsf(t, out, want, "log must contain %q", want)
+	}
+}
+
+// syncWriter serializes concurrent writes from background flush/compaction
+// goroutines into one buffer for assertion.
+type syncWriter struct {
+	mu *sync.Mutex
+	w  *bytes.Buffer
+}
+
+func (s *syncWriter) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.w.Write(p)
+}
+
 // TestLoggingNilIsSafe confirms a nil Logger disables logging without error.
 func TestLoggingNilIsSafe(t *testing.T) {
 	t.Parallel()
