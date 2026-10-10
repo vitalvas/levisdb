@@ -262,17 +262,21 @@ type Options struct {
 	// enable it for idempotent or replayed write streams. Deletes and range deletes
 	// are never deduplicated.
 	Deduplication bool
-	// NoSync disables the per-group WAL fsync, leaving durability to the OS page
-	// cache. The default (false) is durable: group commit fsyncs once per batch.
-	// Enabling it is faster but widens the crash-loss window; use only for
-	// rebuildable or cache-like data.
+	// NoSync drops the per-commit fsync: group commit no longer fsyncs each batch.
+	// Durability is NOT left to OS page-cache eviction; instead a levisdb-owned
+	// background goroutine blocking-fsyncs the WAL every WALSyncInterval, so the
+	// crash-loss window is bounded by that interval rather than by non-deterministic
+	// OS flushing. The default (false) is durable: group commit fsyncs once per
+	// batch. Enabling NoSync trades per-op durability for throughput while keeping a
+	// bounded, predictable loss window; use for rebuildable or cache-like data.
 	NoSync bool
 
-	// WALSyncInterval bounds the NoSync crash-loss window: a background goroutine
-	// fsyncs the WAL this often so unsynced writes are not lost indefinitely. It
-	// applies only when NoSync is set (durable mode already fsyncs per group).
-	// Zero uses the default; a negative value disables the periodic sync (writes
-	// then persist only when the OS flushes the page cache).
+	// WALSyncInterval is the window for the levisdb-owned WAL fsync under NoSync: a
+	// background goroutine fsyncs the WAL this often, bounding the crash-loss window
+	// to at most one interval. It applies only when NoSync is set (durable mode
+	// already fsyncs per group). Zero uses the default; it must not be negative
+	// (that would disable the bound and leave durability to OS page-cache eviction,
+	// which NoSync explicitly does not do).
 	WALSyncInterval time.Duration
 
 	// StrictWALRecovery makes Open fail on any WAL corruption encountered during
@@ -429,6 +433,15 @@ func (o *Options) validate() error {
 	}
 	if o.BlockCacheSize < 0 {
 		return fmt.Errorf("levisdb: BlockCacheSize must be non-negative, got %d", o.BlockCacheSize)
+	}
+	// WALSyncInterval is never negative. Under NoSync it is the levisdb-owned
+	// blocking fsync window that bounds durability (never left to OS page-cache
+	// eviction), so disabling it would reintroduce unbounded, non-deterministic
+	// loss. Under durable mode group commit fsyncs per batch and the loop never
+	// runs, so a negative value is meaningless there too. Zero means "use the
+	// default" (see fillDefaults).
+	if o.WALSyncInterval < 0 {
+		return fmt.Errorf("levisdb: WALSyncInterval must not be negative, got %v", o.WALSyncInterval)
 	}
 	if !validCodecs[o.FreshCodec] {
 		return fmt.Errorf("levisdb: unknown FreshCodec %q", o.FreshCodec)

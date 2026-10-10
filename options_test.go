@@ -3,6 +3,7 @@ package levisdb
 import (
 	"math"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -141,6 +142,9 @@ func TestValidate(t *testing.T) {
 		{"unknown bottom codec", func(o *Options) { o.BottomCodec = "lz4" }, "unknown BottomCodec"},
 		{"unknown level codec", func(o *Options) { o.LevelCodecs = []string{CodecS2, "lz4"} }, "unknown LevelCodecs[1]"},
 		{"level codecs with empty gap ok", func(o *Options) { o.LevelCodecs = []string{CodecZstd, "", CodecNone} }, ""},
+		{"negative wal sync interval rejected", func(o *Options) { o.WALSyncInterval = -1 }, "WALSyncInterval must not be negative"},
+		{"negative wal sync interval rejected under nosync", func(o *Options) { o.NoSync = true; o.WALSyncInterval = -time.Second }, "WALSyncInterval must not be negative"},
+		{"positive wal sync interval under nosync ok", func(o *Options) { o.NoSync = true; o.WALSyncInterval = 10 * time.Millisecond }, ""},
 	}
 
 	for _, tt := range tests {

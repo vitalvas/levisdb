@@ -67,9 +67,11 @@
 //
 // Every mutation is appended to the WAL before it is visible. Concurrent writes
 // are coalesced into one grouped journal write and one fsync (group commit). By
-// default a returned write is crash-durable. NoSync trades that for speed,
-// leaving durability to the OS page cache; a background goroutine then fsyncs
-// every WALSyncInterval to bound the loss window. On open the WAL replays into
+// default a returned write is crash-durable. NoSync trades the per-commit fsync
+// for throughput but does NOT leave durability to OS page-cache eviction: a
+// levisdb-owned background goroutine blocking-fsyncs the WAL every
+// WALSyncInterval, so the loss window is bounded by that interval, not by
+// non-deterministic OS flushing. The interval must not be negative under NoSync. On open the WAL replays into
 // the memtable. A torn crash tail is always tolerated, and by default recovery
 // is lenient about deeper corruption, keeping the intact prefix; set
 // StrictWALRecovery to fail the open instead. A WALObserver taps the committed

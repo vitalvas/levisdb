@@ -26,8 +26,9 @@ not supported.
 - Bloom filters, a bounded block cache, and a bounded table descriptor pool
 - non-mutating read-only opens, including in-memory replay of a crash WAL
 - optional ordered WAL observation for replication or change-data capture
-- per-value TTL persisted across WAL recovery and compaction
+- per-value absolute-expiry TTL persisted across WAL recovery and compaction
 - optional compaction filtering with key, value, and remaining TTL context
+- optional write deduplication of unchanged key/value/expiry puts
 - monitoring through `Stats`, LevelDB-style `GetProperty`, and a process `expvar`
 
 ## Basic use
@@ -70,9 +71,11 @@ Use `DefaultOptions` and then adjust the workload-specific values. The zero
 values accepted by `Open` receive defaults, but `Dir` is required. Notable
 safety and performance controls include:
 
-- `NoSync`: skips per-group WAL `fsync`; writes are not crash-durable when
-  `Put`/`Write` returns. `WALSyncInterval` defaults to one second to bound the
-  usual loss window; a negative interval disables that periodic sync.
+- `NoSync`: skips the per-commit WAL `fsync`; a write is not crash-durable the
+  instant `Put`/`Write` returns. Durability is not left to OS page-cache eviction:
+  a levisdb-owned background goroutine blocking-fsyncs every `WALSyncInterval`
+  (default one second), so the loss window is bounded by that interval. The
+  interval must not be negative.
 - `ReadOnly`: rejects mutations and makes no filesystem changes.
 - `DisableBlockCache`: explicitly disables decoded-block caching.
 - `TombstoneCompactionRatio`: defaults to `0.5`; set a negative value to disable
@@ -129,6 +132,7 @@ target a single slow spinning disk.
 | `WALRetention` | `0` | Keep flushed WAL for this long for `GetUpdatesSince` catch-up; `0` disables. See [Replication](#replication). |
 | `WALRetentionBytes` | `0` | Keep up to this many flushed WAL bytes for catch-up; `0` disables. See [Replication](#replication). |
 | `CompactionFilter` | nil | Drop values during compaction. See [Compaction filtering](#compaction-filtering). |
+| `Deduplication` | `false` | Skip a put identical in key, value, and `ExpiresAt`. See [Deduplication](#deduplication). |
 
 ## Examples
 
@@ -517,10 +521,11 @@ reader never sees a batch half-applied.
 
 **Durability modes.** By default (`NoSync` false) the committer fsyncs once per
 group, so a returned write is crash-durable and the loss window is just the
-in-flight group. `NoSync` skips that fsync and leaves the data in the OS page
-cache: faster, but a crash can lose everything written since the last sync. Under
-`NoSync` a background goroutine still fsyncs every `WALSyncInterval` (default one
-second; negative disables it) to bound that window.
+in-flight group. `NoSync` skips that per-commit fsync for throughput, but
+durability is still levisdb's responsibility, not the OS's: a background goroutine
+blocking-fsyncs every `WALSyncInterval` (default one second), so the loss window is
+bounded by that interval rather than by non-deterministic page-cache eviction. The
+interval must not be negative; zero uses the default.
 
 **Rotation and checkpoint.** When the live segment grows past its size bound the
 WAL rotates to a fresh segment and checkpoints: the memtable the old segment
