@@ -1030,6 +1030,56 @@ func TestCompactTieredCascadesAcrossTiers(t *testing.T) {
 	assert.Lenf(t, depths, 1, "compacted output should occupy one tier, got %v", depths)
 }
 
+// TestCompactRangeIsIdempotentOnOptimalData guards against manual-compaction churn:
+// repeatedly compacting already-optimal data (no filter, no tombstones, no
+// overlap to merge) must not rewrite tables into new file numbers each call. This
+// reproduces the reload loop where CompactRange kept producing fresh .sst files
+// that reclaimed nothing.
+func TestCompactRangeIsIdempotentOnOptimalData(t *testing.T) {
+	t.Parallel()
+	db := openTestDB(t, func(o *Options) {
+		o.MemtableSize = 1 << 20
+		o.TierRatio = 2
+		o.MaxLevels = 4
+	})
+	// Two disjoint key ranges, flushed separately, compacted once into the ladder.
+	for _, k := range []string{"a1", "a2"} {
+		require.NoError(t, db.Put(PutOptions{Key: []byte(k), Value: []byte("v")}))
+	}
+	require.NoError(t, db.eng.Flush())
+	for _, k := range []string{"b1", "b2"} {
+		require.NoError(t, db.Put(PutOptions{Key: []byte(k), Value: []byte("v")}))
+	}
+	require.NoError(t, db.eng.Flush())
+
+	// First compaction brings the data to its steady state.
+	require.NoError(t, db.CompactRange(nil, nil))
+	nums := func() []uint32 {
+		tables := db.eng.Tables()
+		out := make([]uint32, 0, len(tables))
+		for _, t := range tables {
+			out = append(out, t.Num)
+		}
+		return out
+	}
+	stable := nums()
+	require.NotEmpty(t, stable)
+
+	// Further compactions on the now-optimal data must be no-ops: the exact same
+	// table file numbers, not rewrites into fresh ones.
+	for i := 0; i < 3; i++ {
+		require.NoError(t, db.CompactRange(nil, nil))
+		assert.Equalf(t, stable, nums(), "CompactRange rewrote optimal data on call %d", i+1)
+	}
+
+	// Data is still intact.
+	for _, k := range []string{"a1", "a2", "b1", "b2"} {
+		v, err := db.Get([]byte(k))
+		require.NoError(t, err, k)
+		assert.Equal(t, []byte("v"), v.Value)
+	}
+}
+
 func TestCheckpointManifestFailurePreservesRecovery(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()

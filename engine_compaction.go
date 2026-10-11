@@ -187,16 +187,37 @@ func resolveOutDepth(depth int, cc compactionConfigT) int {
 	return capDepth
 }
 
-// worthCompacting reports whether a merge of n input tables should run. A lone
-// table normally is not worth rewriting (it reclaims nothing), so a tier needs at
-// least two tables. The exception is a full compaction's final bottom in-place
-// pass (bottomRewrite), which must run even on a single table to apply the filter
-// and drop tombstones after the cascade collapsed the data there.
-func worthCompacting(n int, bottomRewrite bool) bool {
+// worthCompacting reports whether a merge should run. Two or more inputs always
+// merge. A single input is normally skipped (rewriting one table reclaims
+// nothing). The exception is a full compaction's final bottom in-place pass
+// (bottomRewrite) AND only when that rewrite would actually change something --
+// a filter is set, or the table holds tombstones to drop at the bottom. Without a
+// reason, a lone bottom table is left as is, so a manual compaction on
+// already-optimal data is a no-op instead of rewriting the same file every call.
+func worthCompacting(n int, bottomRewrite, hasReason bool) bool {
 	if n == 0 {
 		return false
 	}
-	return n >= 2 || bottomRewrite
+	if n >= 2 {
+		return true
+	}
+	return bottomRewrite && hasReason
+}
+
+// hasRewriteReason reports whether rewriting a lone bottom table would change
+// anything: the filter may drop values, or a tombstone can be reclaimed at the
+// bottom. With no reason the rewrite would reproduce the same data under a new file
+// number, so a manual compaction on already-optimal data is left as a no-op.
+func hasRewriteReason(cc compactionConfigT, inputs []*tableMeta) bool {
+	if cc.Filter != nil {
+		return true
+	}
+	for _, t := range inputs {
+		if t.tombstones > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // Compact merges all tables at the given depth into tables at depth+1 (or in
@@ -240,7 +261,8 @@ func (s *engineT) Compact(depth int, retainSeq uint64, cc compactionConfigT) err
 	}
 	s.mu.RUnlock()
 
-	if !worthCompacting(len(inputs), cc.RewriteSingle && inPlace && depth == maxDepth) {
+	bottomRewrite := cc.RewriteSingle && inPlace && depth == maxDepth
+	if !worthCompacting(len(inputs), bottomRewrite, hasRewriteReason(cc, inputs)) {
 		s.setLastCompaction(compactionResult{})
 		return nil
 	}
