@@ -1,4 +1,4 @@
-module github.com/vitalvas/levisdb
+module go.vitalvas.com/levisdb
 
 go 1.27
 

@@ -40,7 +40,7 @@ import (
 	"log"
 	"time"
 
-	"github.com/vitalvas/levisdb"
+	"go.vitalvas.com/levisdb"
 )
 
 func main() {
