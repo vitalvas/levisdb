@@ -5,6 +5,70 @@ memtable backed by a write-ahead log, flush to sorted on-disk tables, and merge
 through size-tiered compaction. A scheduler serializes flush and compaction off
 the write path, so a single spinning disk sees mostly sequential I/O.
 
+## Architecture
+
+```mermaid
+flowchart TB
+    W[Put / Delete / Write batch] --> WAL[(Write-ahead log)]
+    WAL -->|group commit| MEM[Active memtable]
+    MEM -->|full| IMM[Immutable memtable]
+    IMM -->|flush| L0[L0 tables]
+    subgraph disk [On-disk SSTable tiers]
+        L0 -->|compaction| L1[L1 tables]
+        L1 -->|compaction| LN[... deeper tiers]
+        LN -->|compaction, in place| CAP[Cap tier]
+    end
+    SCHED[Scheduler goroutine] -.drives.-> IMM
+    SCHED -.drives.-> L0
+    R[Get / Has / Iterator] --> MEM
+    R --> IMM
+    R --> disk
+```
+
+The write path appends to the WAL, then applies to the memtable; the read path
+consults the memtable, the immutable memtable, then overlapping tables newest-first
+(bloom-gated). A single scheduler goroutine performs every flush and compaction, so
+writes never block on background I/O.
+
+### Write path
+
+```mermaid
+sequenceDiagram
+    participant C as Caller
+    participant DB
+    participant WAL
+    participant MEM as Memtable
+    participant SCHED as Scheduler
+    C->>DB: Write(batch)
+    DB->>DB: throttle if L0 backlog high
+    DB->>WAL: append + group-commit fsync (unless NoSync)
+    WAL->>MEM: apply entries, publish readSeq
+    DB-->>C: return (durable, or bounded by WALSyncInterval)
+    Note over MEM,SCHED: memtable full -> seal immutable -> signal
+    SCHED->>MEM: flush immutable to an L0 table
+    SCHED->>SCHED: compact ready tiers; checkpoint + retire WAL
+```
+
+### Read path
+
+```mermaid
+flowchart LR
+    G[Get key] --> M{Active memtable?}
+    M -->|hit| V[Resolve newest visible version]
+    M -->|miss| I{Immutable memtable?}
+    I -->|hit| V
+    I -->|miss| T[Scan overlapping tables]
+    T --> KR{Key in table range?}
+    KR -->|no| SKIP[skip table]
+    KR -->|yes| BL{Bloom may contain?}
+    BL -->|no| SKIP
+    BL -->|yes| BLK[Read data block]
+    BLK --> V
+    V --> RD{Range tombstone newer?}
+    RD -->|yes| NF[ErrNotFound]
+    RD -->|no| OUT[Value + ExpiresAt]
+```
+
 ## Platform support
 
 levisdb supports Linux and macOS only. It uses advisory `flock` locking and
@@ -273,6 +337,19 @@ chunking), keep the maximum chunk well under the cap.
 
 ## Compaction and backpressure
 
+```mermaid
+flowchart TB
+    FL[Memtable flush] --> L0["L0 - unsized, one file per flush"]
+    L0 -->|"4 tables / density / tombstones"| L1["L1 - target 4 MiB"]
+    L1 -->|trigger| L2["L2 - target 8 MiB"]
+    L2 -->|trigger| L3["L3 - 16 MiB ... grows x2 per depth"]
+    L3 -->|trigger| CAP["Cap tier - target FileSizeMax, merges in place"]
+```
+
+Each tier compacts one step deeper when a trigger fires; output file size grows by
+`FileSizeMultiplier` per depth up to `FileSizeMax`, so deep tiers hold fewer,
+larger files.
+
 Compaction is size-tiered: a tier compacts into the next once it accumulates
 `TierRatio` tables (the count trigger), or once its aggregate on-disk size reaches
 `TierByteTrigger` (the density trigger, defaults to `8 x FileSizeMax`). The density
@@ -513,6 +590,18 @@ The file's key range must not overlap keys still in the memtable; overlapping
 already-flushed tables is fine.
 
 ## Write-ahead log
+
+```mermaid
+stateDiagram-v2
+    [*] --> Live: open / rotate
+    Live --> Live: append (group commit)
+    Live --> Retiring: size >= WALSegmentBytes or a flush
+    Retiring --> Retired: flush captures records, manifest records boundary
+    Retired --> Deleted: retention off
+    Retired --> Reaped: retention on, past age/size horizon
+    Deleted --> [*]
+    Reaped --> [*]
+```
 
 Every mutation is first appended to the WAL, so a committed write survives a
 crash even before the memtable is flushed to a table.
