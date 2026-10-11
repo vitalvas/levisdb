@@ -92,6 +92,12 @@ const (
 	// does not set one.
 	DefaultWALSyncInterval = time.Second
 
+	// DefaultWALSegmentBytes is the live-WAL size that triggers a checkpoint (flush
+	// + rotate + retire). Smaller values keep the WAL and crash-recovery replay
+	// smaller at the cost of more frequent flush barriers; larger values let a bulk
+	// writer run longer between barriers.
+	DefaultWALSegmentBytes = 64 << 20 // 64 MiB
+
 	// defaultMaxCompactionFiles sets MaxCompactionBytes to this many FileSizeMax
 	// files by default: large enough that ordinary tiers merge in one pass, small
 	// enough to bound a runaway tier's single merge.
@@ -283,6 +289,16 @@ type Options struct {
 	// which NoSync explicitly does not do).
 	WALSyncInterval time.Duration
 
+	// WALSegmentBytes is the live-WAL size that triggers a checkpoint: a flush that
+	// captures the segment's records into tables, a rotation to a fresh segment, and
+	// retirement of the old one. It bounds the on-disk WAL and the crash-recovery
+	// replay to roughly this size. A flush also triggers the checkpoint check, so the
+	// WAL does not retain already-flushed records far past this bound when writes go
+	// idle. Smaller trades more frequent flush barriers for a smaller WAL; larger
+	// lets a bulk writer run longer between barriers. Zero uses the default; a
+	// negative value is rejected.
+	WALSegmentBytes int64
+
 	// StrictWALRecovery makes Open fail on any WAL corruption encountered during
 	// replay. The default (false, lenient) instead stops replay at the first
 	// corrupt record and recovers the intact prefix, so a single bit-rotted
@@ -334,6 +350,9 @@ func (o *Options) fillDefaults() {
 	}
 	if o.WALSyncInterval == 0 {
 		o.WALSyncInterval = DefaultWALSyncInterval
+	}
+	if o.WALSegmentBytes == 0 {
+		o.WALSegmentBytes = DefaultWALSegmentBytes
 	}
 	if o.FileSizeBase == 0 {
 		o.FileSizeBase = DefaultFileSizeBase
@@ -446,6 +465,9 @@ func (o *Options) validate() error {
 	// default" (see fillDefaults).
 	if o.WALSyncInterval < 0 {
 		return fmt.Errorf("levisdb: WALSyncInterval must not be negative, got %v", o.WALSyncInterval)
+	}
+	if o.WALSegmentBytes < 1 {
+		return fmt.Errorf("levisdb: WALSegmentBytes must be positive, got %d", o.WALSegmentBytes)
 	}
 	if !validCodecs[o.FreshCodec] {
 		return fmt.Errorf("levisdb: unknown FreshCodec %q", o.FreshCodec)

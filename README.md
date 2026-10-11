@@ -126,6 +126,7 @@ target a single slow spinning disk.
 | `FDIdleTimeout` | `0` (off) | Close a table descriptor left unused this long, returning the fd to the OS; reopens on next read. |
 | `NoSync` | `false` | Skip the per-commit fsync. See [Write-ahead log](#write-ahead-log). |
 | `WALSyncInterval` | `1s` | Background fsync interval bounding the `NoSync` loss window. See [Write-ahead log](#write-ahead-log). |
+| `WALSegmentBytes` | `64 MiB` | Live-WAL size that triggers a checkpoint (flush + rotate + retire), bounding on-disk WAL and recovery replay. See [Write-ahead log](#write-ahead-log). |
 | `StrictWALRecovery` | `false` | Fail open on any WAL corruption instead of salvaging the prefix. |
 | `ReadOnly` | `false` | Reject writes; make no filesystem changes. |
 | `WALObserver` | nil | Tap the committed stream for replication/CDC. |
@@ -535,14 +536,16 @@ blocking-fsyncs every `WALSyncInterval` (default one second), so the loss window
 bounded by that interval rather than by non-deterministic page-cache eviction. The
 interval must not be negative; zero uses the default.
 
-**Rotation and checkpoint.** When the live segment grows past its size bound the
-WAL rotates to a fresh segment and checkpoints: the memtable the old segment
-covered is flushed, then the manifest records the first segment still needed for
-recovery. Earlier segments are removed or retained for replication; recovery skips
-them even when they remain on disk, so filtered values cannot reappear. The
-checkpoint runs on a background goroutine, so a write never blocks on the flush
-barrier (backpressure already bounds how far writes get ahead); `Close` waits for
-an in-flight checkpoint before it returns. Enabling a `CompactionFilter` can force
+**Rotation and checkpoint.** When the live segment grows past `WALSegmentBytes`
+(default 64 MiB) the WAL rotates to a fresh segment and checkpoints: the memtable
+the old segment covered is flushed, then the manifest records the first segment
+still needed for recovery. Earlier segments are removed or retained for
+replication; recovery skips them even when they remain on disk, so filtered values
+cannot reappear. A background flush also triggers the checkpoint check, so the WAL
+does not keep already-flushed records on disk after writes go idle. The checkpoint
+runs on a background goroutine, so a write never blocks on the flush barrier
+(backpressure already bounds how far writes get ahead); `Close` waits for an
+in-flight checkpoint before it returns. Enabling a `CompactionFilter` can force
 an extra checkpoint before filtering so a crash cannot replay a value the filter
 discarded.
 

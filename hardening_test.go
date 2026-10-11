@@ -375,12 +375,9 @@ func TestReadOnlyLargeWALReplayStaysInMemory(t *testing.T) {
 }
 
 func TestWALCheckpointBoundsSegmentsAndSurvivesCrash(t *testing.T) {
-	oldLimit := walSegmentBytes
-	walSegmentBytes = 1024
-	defer func() { walSegmentBytes = oldLimit }()
-
 	dir := t.TempDir()
 	o := DefaultOptions(dir)
+	o.WALSegmentBytes = 1024
 	o.MemtableSize = 1 << 30
 	db, err := Open(o)
 	require.NoError(t, err)
@@ -411,28 +408,56 @@ func TestWALCheckpointBoundsSegmentsAndSurvivesCrash(t *testing.T) {
 	}
 }
 
+// TestWALStaysBoundedWhenWritesIdle guards that the on-disk WAL does not retain
+// already-flushed records after writes stop: a background flush triggers the
+// checkpoint check, so once the system quiesces the WAL is bounded near
+// WALSegmentBytes rather than holding every record written since open.
+func TestWALStaysBoundedWhenWritesIdle(t *testing.T) {
+	dir := t.TempDir()
+	o := DefaultOptions(dir)
+	o.WALSegmentBytes = 8 << 10 // small so a modest write volume crosses it
+	o.MemtableSize = 4 << 10    // flush often, so most WAL data is captured in tables
+	o.NoSync = true
+	db, err := Open(o)
+	require.NoError(t, err)
+	defer db.Close()
+
+	value := make([]byte, 512)
+	for i := 0; i < 200; i++ { // ~100 KiB logical, well over a few WAL segments
+		require.NoError(t, db.Put(PutOptions{Key: []byte(fmt.Sprintf("k%06d", i)), Value: value}))
+	}
+	// Quiesce: let the scheduler finish flushing/compacting and drain any in-flight
+	// checkpoint the flush loop triggered.
+	db.sched.drain()
+	db.checkpointWG.Wait()
+
+	// The live WAL segment is bounded near WALSegmentBytes -- flush progress retired
+	// the rest, so it does not hold all ~100 KiB of records written since open.
+	assert.Less(t, db.maxWALSegmentSize(), o.WALSegmentBytes*walCheckpointStallMultiple,
+		"idle WAL must be bounded, not accumulate every flushed record")
+
+	// Data is intact.
+	for i := 0; i < 200; i++ {
+		got, err := db.Get([]byte(fmt.Sprintf("k%06d", i)))
+		require.NoError(t, err, i)
+		assert.Equal(t, value, got.Value)
+	}
+}
+
 // TestWALStallsWhenCheckpointLagsBehind guards the WAL-size cap on the async
 // checkpoint: when a checkpoint is already in flight and the live WAL has grown
-// past walCheckpointStallMultiple * walSegmentBytes, maybeCheckpoint must block
+// past walCheckpointStallMultiple * WALSegmentBytes, maybeCheckpoint must block
 // the writer until the in-flight checkpoint drains, rather than let the WAL grow
 // without bound. It drives the guard deterministically by holding a fake
 // in-flight checkpoint, so it does not depend on flush timing.
 func TestWALStallsWhenCheckpointLagsBehind(t *testing.T) {
-	oldLimit := walSegmentBytes
-	walSegmentBytes = 4096 // small so a few writes push the live WAL over the cap
-
 	o := DefaultOptions(t.TempDir())
+	o.WALSegmentBytes = 4096 // small so a few writes push the live WAL over the cap
 	o.MemtableSize = 1 << 30
 	o.NoSync = true
 	db, err := Open(o)
 	require.NoError(t, err)
-	// Close and restore the global while still inside the test body (not via a
-	// deferred/Cleanup restore that could run while background goroutines still
-	// read walSegmentBytes, which the race detector flags).
-	defer func() {
-		db.Close()
-		walSegmentBytes = oldLimit
-	}()
+	defer db.Close()
 
 	// Simulate a slow in-flight checkpoint by holding the single-flight guard and
 	// the WaitGroup, so no real checkpoint can fire and retire the WAL.
@@ -444,7 +469,7 @@ func TestWALStallsWhenCheckpointLagsBehind(t *testing.T) {
 	// grow the WAL by appending to the WAL directly here (bypassing the Put path's
 	// maybeCheckpoint) until it is over the cap.
 	value := make([]byte, 2048)
-	walCap := walSegmentBytes * walCheckpointStallMultiple
+	walCap := o.WALSegmentBytes * walCheckpointStallMultiple
 	sw := db.wal.wal
 	for i := 0; sw.currentSize() < walCap; i++ {
 		require.NoError(t, sw.append([]walEntry{{
@@ -491,18 +516,13 @@ func TestWALStallsWhenCheckpointLagsBehind(t *testing.T) {
 // stall. The old Wait()-based code stayed blocked until checkpointWG.Done(), so
 // this exercises exactly the code path that no longer touches the WaitGroup.
 func TestWALStallReleasesWithoutWaitGroup(t *testing.T) {
-	oldLimit := walSegmentBytes
-	walSegmentBytes = 4096
-
 	o := DefaultOptions(t.TempDir())
+	o.WALSegmentBytes = 4096
 	o.MemtableSize = 1 << 30
 	o.NoSync = true
 	db, err := Open(o)
 	require.NoError(t, err)
-	defer func() {
-		db.Close()
-		walSegmentBytes = oldLimit
-	}()
+	defer db.Close()
 
 	// Fake an in-flight checkpoint via the single-flight guard ONLY - deliberately
 	// NOT touching checkpointWG. The fix's stall polls checkpointRunning, so it must
@@ -510,7 +530,7 @@ func TestWALStallReleasesWithoutWaitGroup(t *testing.T) {
 	require.True(t, db.checkpointRunning.CompareAndSwap(false, true))
 
 	value := make([]byte, 2048)
-	walCap := walSegmentBytes * walCheckpointStallMultiple
+	walCap := o.WALSegmentBytes * walCheckpointStallMultiple
 	sw := db.wal.wal
 	for i := 0; sw.currentSize() < walCap; i++ {
 		require.NoError(t, sw.append([]walEntry{{

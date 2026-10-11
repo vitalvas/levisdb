@@ -725,20 +725,13 @@ func (db *DB) maybeRotateManifest() {
 // It is a var only so tests can lower it; it is otherwise constant.
 var manifestRotateEdits = 4096
 
-// walSegmentBytes bounds a live WAL segment. Rotation checkpoints (flushes)
-// before retiring the old segment; it is a var so tests can exercise rotation.
-// At 256 MiB the barrier checkpoint fires rarely enough that a bulk writer is
-// not stalled by it; the WAL-size cap still bounds the live WAL at
-// walCheckpointStallMultiple x this.
-var walSegmentBytes int64 = 256 << 20
-
 // walCheckpointStallMultiple caps how far the live WAL may outgrow
-// walSegmentBytes before a writer stops firing checkpoints asynchronously and
-// instead blocks until the in-flight checkpoint drains. Checkpointing is normally
-// async so writes do not stall on the flush barrier, but a sustained writer can
-// outrun a single background checkpoint and grow the WAL without bound (and with
-// it, crash-recovery cost). Once the segment reaches this multiple of
-// walSegmentBytes, the writer waits, bounding the live WAL at roughly this size.
+// Options.WALSegmentBytes before a writer stops firing checkpoints asynchronously
+// and instead blocks until the in-flight checkpoint drains. Checkpointing is
+// normally async so writes do not stall on the flush barrier, but a sustained
+// writer can outrun a single background checkpoint and grow the WAL without bound
+// (and with it, crash-recovery cost). Once the segment reaches this multiple of
+// WALSegmentBytes, the writer waits, bounding the live WAL at roughly this size.
 var walCheckpointStallMultiple int64 = 2
 
 // Close flushes and releases the database. It is safe to call more than once.
@@ -1263,18 +1256,21 @@ func (db *DB) maxWALSegmentSize() int64 {
 }
 
 // maybeCheckpoint rotates and retires the WAL once it grows past
-// walSegmentBytes. It runs the checkpoint on a background goroutine so a writer
-// never blocks on the flush barrier; write backpressure (throttleWrite) already
-// bounds how far ahead writes can get. Only one checkpoint runs at a time
-// (checkpointRunning), and Close/crash wait for an in-flight one via
-// checkpointWG. The synchronous force path (prepareCompactionFilter) still calls
-// checkpointWALMode directly.
+// Options.WALSegmentBytes. It runs the checkpoint on a background goroutine so a
+// writer never blocks on the flush barrier; write backpressure (throttleWrite)
+// already bounds how far ahead writes can get. It is called both from the write
+// path and after a background flush, so WAL retirement tracks flush progress and
+// the WAL does not retain already-flushed records when writes go idle. Only one
+// checkpoint runs at a time (checkpointRunning), and Close/crash wait for an
+// in-flight one via checkpointWG. The synchronous force path
+// (prepareCompactionFilter) still calls checkpointWALMode directly.
 func (db *DB) maybeCheckpoint() {
-	if walSegmentBytes <= 0 || db.opts.ReadOnly {
+	if db.opts.ReadOnly {
 		return
 	}
+	segBytes := db.opts.WALSegmentBytes
 	size := db.maxWALSegmentSize()
-	if size < walSegmentBytes {
+	if size < segBytes {
 		return
 	}
 	// Single-flight: at most one checkpoint runs at a time. If one is already
@@ -1282,9 +1278,9 @@ func (db *DB) maybeCheckpoint() {
 	// live WAL has grown past the hard cap, the writer has outrun the background
 	// checkpoint, so stall here until it drains rather than let the WAL grow
 	// without bound. This bounds the live WAL (and crash-recovery cost) at roughly
-	// walCheckpointStallMultiple * walSegmentBytes.
+	// walCheckpointStallMultiple * WALSegmentBytes.
 	if !db.checkpointRunning.CompareAndSwap(false, true) {
-		for size >= walSegmentBytes*walCheckpointStallMultiple {
+		for size >= segBytes*walCheckpointStallMultiple {
 			db.mu.RLock()
 			closed := db.closed
 			db.mu.RUnlock()
@@ -1347,7 +1343,7 @@ func (db *DB) checkpointWALMode(force bool) (uint64, error) {
 	if db.opts.ReadOnly {
 		return db.filterSafeSeq.Load(), ErrReadOnly
 	}
-	if !force && db.maxWALSegmentSize() < walSegmentBytes {
+	if !force && db.maxWALSegmentSize() < db.opts.WALSegmentBytes {
 		return db.filterSafeSeq.Load(), nil
 	}
 	if force && db.readSeq.Load() <= db.filterSafeSeq.Load() {
@@ -1515,6 +1511,11 @@ func (db *DB) flushEngine() {
 				return
 			}
 			flushed = true
+			// A flush captured memtable data into a table, so the WAL records it
+			// covered are now redundant. Trigger the checkpoint check here (not just
+			// on the write path) so WAL retirement tracks flush progress and the WAL
+			// does not stay large when writes go idle after a flush.
+			db.maybeCheckpoint()
 		}
 		compacted := db.compactOnce(s)
 		if db.backgroundError() != nil {

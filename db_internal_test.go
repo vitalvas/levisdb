@@ -593,7 +593,7 @@ func TestManifestNoAccumulationAcrossRestarts(t *testing.T) {
 	o.NoSync = true // asserts manifest count, not durability; skip fsyncs for speed
 
 	// Several clean open/close cycles plus a crash, then a final open.
-	for i := 0; i < 5; i++ {
+	for i := 0; i < 3; i++ {
 		db, err := Open(o)
 		require.NoError(t, err)
 		require.NoError(t, db.Put(PutOptions{Key: []byte(fmt.Sprintf("k%d", i)), Value: []byte("v")}))

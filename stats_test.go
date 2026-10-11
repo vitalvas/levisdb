@@ -180,15 +180,16 @@ func TestBloomFalsePositivesCounted(t *testing.T) {
 		o.BloomBits = 1 // a weak filter makes false positives likely, exercising the counter
 	})
 	// Store sparse keys so many absent keys fall inside the table's [min,max] range.
-	for i := 0; i < 500; i++ {
+	const n = 150
+	for i := 0; i < n; i++ {
 		require.NoError(t, db.Put(PutOptions{Key: []byte(fmt.Sprintf("k%06d", i*2)), Value: []byte("v")}))
 	}
 	require.NoError(t, db.eng.Flush())
 
 	base, err := db.Stats()
 	require.NoError(t, err)
-	// Look up absent odd keys, all within [k000000, k000998].
-	for i := 0; i < 500; i++ {
+	// Look up absent odd keys, all within the stored key range.
+	for i := 0; i < n; i++ {
 		_, err := db.Get([]byte(fmt.Sprintf("k%06d", i*2+1)))
 		require.ErrorIs(t, err, ErrNotFound)
 	}

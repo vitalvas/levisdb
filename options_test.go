@@ -143,6 +143,8 @@ func TestValidate(t *testing.T) {
 		{"unknown level codec", func(o *Options) { o.LevelCodecs = []string{CodecS2, "lz4"} }, "unknown LevelCodecs[1]"},
 		{"level codecs with empty gap ok", func(o *Options) { o.LevelCodecs = []string{CodecZstd, "", CodecNone} }, ""},
 		{"negative wal sync interval rejected", func(o *Options) { o.WALSyncInterval = -1 }, "WALSyncInterval must not be negative"},
+		{"non-positive wal segment bytes rejected", func(o *Options) { o.WALSegmentBytes = -1 }, "WALSegmentBytes must be positive"},
+		{"custom wal segment bytes ok", func(o *Options) { o.WALSegmentBytes = 16 << 20 }, ""},
 		{"negative wal sync interval rejected under nosync", func(o *Options) { o.NoSync = true; o.WALSyncInterval = -time.Second }, "WALSyncInterval must not be negative"},
 		{"positive wal sync interval under nosync ok", func(o *Options) { o.NoSync = true; o.WALSyncInterval = 10 * time.Millisecond }, ""},
 	}

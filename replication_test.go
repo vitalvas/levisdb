@@ -219,11 +219,8 @@ func TestGetUpdatesSinceReaperExpiresOldSegments(t *testing.T) {
 // be either gap-free from seq 1 or rejected with ErrRetentionExpired - never a
 // partial stream with a hole presented as complete.
 func TestGetUpdatesSinceNoSilentGapUnderReaping(t *testing.T) {
-	oldSeg := walSegmentBytes
-	walSegmentBytes = 4 << 10
-	t.Cleanup(func() { walSegmentBytes = oldSeg })
-
 	db := openTestDB(t, func(o *Options) {
+		o.WALSegmentBytes = 4 << 10
 		o.MemtableSize = 4 << 10
 		o.WALRetentionBytes = 8 << 10 // small horizon: the reaper actively deletes
 	})
