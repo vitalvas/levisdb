@@ -59,9 +59,10 @@ type WALObserver interface {
 const (
 	// DefaultMemtableSize is 8 MiB: double LevelDB's 4 MiB write_buffer_size, which
 	// shifts the memtable:FileSizeBase ratio from 2:1 to 4:1 so a flushed L0 table
-	// compresses nearer the 2 MiB FileSizeBase target and fewer, larger tables are
-	// produced on bulk loads. The cost mirrors LevelDB's note: up to two buffers
-	// live in memory and a larger buffer lengthens recovery replay.
+	// (unsized; one file per flush) compresses to roughly the 2 MiB FileSizeBase,
+	// aligning fresh files with the curve's base and producing fewer, larger tables
+	// on bulk loads. The cost mirrors LevelDB's note: up to two buffers live in
+	// memory and a larger buffer lengthens recovery replay.
 	DefaultMemtableSize = 8 << 20
 	DefaultTierRatio    = 4
 	// DefaultTombstoneCompactionRatio compacts a tier once half its entries are
@@ -169,7 +170,10 @@ type Options struct {
 	// merges. Zero uses the default (8).
 	MaxLevels uint8
 
-	// FileSizeBase is the fresh-tier target .sst size in bytes.
+	// FileSizeBase is the depth-0 base of the per-depth output size curve in bytes:
+	// target(d) = min(FileSizeBase * FileSizeMultiplier^d, FileSizeMax). A memtable
+	// flush (depth 0) is unsized (one file per flush), so the first target this
+	// governs is the depth-1 compaction output at FileSizeBase * FileSizeMultiplier.
 	FileSizeBase int64
 	// FileSizeMultiplier grows the target size per tier depth.
 	FileSizeMultiplier int

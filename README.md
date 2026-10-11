@@ -112,8 +112,8 @@ target a single slow spinning disk.
 | `MaxCompactionBytes` | `10 x FileSizeMax` | Input byte cap per non-bottom compaction; negative disables. |
 | `DisableOverlapSelection` | `false` | Merge the whole tier instead of only the largest key-overlapping group. |
 | `MaxLevels` | `8` | Tier count, 1..8; the deepest tier merges in place. Fewer levels bound read/recovery fan-out at the cost of larger bottom merges. |
-| `FileSizeBase` | `2 MiB` | Depth-1 compaction-output roll size, the base of the per-depth size curve (L0 flush is unsized). |
-| `FileSizeMultiplier` | `2` | Per-depth growth factor of the size curve. |
+| `FileSizeBase` | `2 MiB` | Depth-0 base of the per-depth output size curve. See [Compaction and backpressure](#compaction-and-backpressure). |
+| `FileSizeMultiplier` | `2` | Per-depth growth factor of the size curve. See [Compaction and backpressure](#compaction-and-backpressure). |
 | `FileSizeMax` | `128 MiB` | Ceiling on compacted-file size; the roll reserves trailer space so finished files stay at or under it. |
 | `FreshCodec` | `CodecS2` | Compression for fresh (upper) tiers (`none`/`s2`/`flate`/`zstd`). See [Compression](#compression). |
 | `BottomCodec` | `CodecS2` | Compression for the bottom (oldest) tier. See [Compression](#compression). |
@@ -319,7 +319,8 @@ it (unlike LevelDB, whose `max_file_size` bounds data bytes only and is exceeded
 on disk by the trailer, several MiB on a large table of small keys). `MemtableSize`
 defaults to 8 MiB (double LevelDB's `write_buffer_size`), so a full memtable
 flushes into a depth-0 file of roughly `8 MiB / compression ratio`, and
-`FileSizeBase` (2 MiB) governs the depth-1 target those L0 files merge up into.
+`FileSizeBase` (2 MiB) is the depth-0 base of the curve, so the depth-1 target
+those L0 files merge up into is `FileSizeBase * FileSizeMultiplier` = 4 MiB.
 `FileSizeMax` defaults to 128 MiB (`FileSizeBase << (maxTierDepth - 1)`), so the
 cap scales with the base and holds the deepest tier at the same size as the one
 above it. Raise `FileSizeMax` (or the multiplier) for larger bottom-tier files and
@@ -340,7 +341,14 @@ scheduler drains the tier. A negative value disables a threshold. Each throttled
 write is counted in `Stats.WriteStalls`.
 
 `CompactRange` forces full compaction on demand, which also runs any configured
-compaction filter without waiting for automatic tier selection.
+compaction filter without waiting for automatic tier selection. It compacts one
+tier at a time from the shallowest down, committing and freeing each tier's inputs
+before starting the next, rather than merging every tier in a single pass. That
+bounds the peak scratch space, merge-heap memory, and crash-recovery window to a
+single tier instead of the whole dataset, so a full compaction on a large (for
+example multi-terabyte) store cannot exhaust the machine. The compaction filter
+and tombstone drop run only on the final collapse into the deepest tier, so each
+surviving key is filtered exactly once.
 
 ## Compression
 
