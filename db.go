@@ -722,7 +722,7 @@ func (db *DB) maybeRotateManifest() {
 }
 
 // manifestRotateEdits is the edit threshold that triggers a manifest rotation.
-// It is a var so tests can lower it; production keeps the default.
+// It is a var only so tests can lower it; it is otherwise constant.
 var manifestRotateEdits = 4096
 
 // walSegmentBytes bounds a live WAL segment. Rotation checkpoints (flushes)

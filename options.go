@@ -54,8 +54,8 @@ type WALObserver interface {
 	Observe(batch []WALEntry)
 }
 
-// Default option values. All are tunable so the engine can be calibrated
-// against a real spindle.
+// Default option values. All are tunable so the engine can be calibrated to the
+// workload.
 const (
 	// DefaultMemtableSize is 8 MiB: double LevelDB's 4 MiB write_buffer_size, which
 	// shifts the memtable:FileSizeBase ratio from 2:1 to 4:1 so a flushed L0 table
@@ -121,7 +121,7 @@ const (
 // with the per-batch bound, mid-replay flushing on recovery, and MemtableSize <=
 // maxMemtableSize, a memtable arena stays well below 2^32. 1 GiB leaves generous
 // headroom while accommodating any realistic value. It is a var only so tests
-// can lower it without allocating a gigabyte; production never changes it.
+// can lower it without allocating a gigabyte; it is otherwise constant.
 var maxEntrySize = 1 << 30 // 1 GiB
 
 // Options configures a levisdb database. The zero value is not valid; use
@@ -182,8 +182,8 @@ type Options struct {
 
 	// MaxCompactionBytes caps the total input bytes merged in one non-bottom
 	// compaction, so a large tier is drained in bounded steps rather than one
-	// merge that ties up the single spindle. Bottom-tier compactions (which drop
-	// tombstones) always merge the whole tier for GC correctness. Zero uses the
+	// merge that ties up the serialized compactor. Bottom-tier compactions (which
+	// drop tombstones) always merge the whole tier for GC correctness. Zero uses the
 	// default; a negative value disables the cap.
 	MaxCompactionBytes int64
 

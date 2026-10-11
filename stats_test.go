@@ -121,7 +121,7 @@ func TestStatsCumulativeCounters(t *testing.T) {
 
 // TestReadAmpReflectsTableFanout checks that TableProbes rises with the number of
 // overlapping tables a lookup must consult -- the structural read fan-out that
-// governs per-lookup seek cost on a slow spindle. Keys that share a range across
+// governs per-lookup seek cost where random reads are expensive. Keys that share a range across
 // several on-disk tables are probed in more tables than a key isolated to one.
 func TestReadAmpReflectsTableFanout(t *testing.T) {
 	t.Parallel()

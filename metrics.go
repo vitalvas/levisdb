@@ -8,9 +8,8 @@ import (
 )
 
 // dbMetrics holds cumulative counters since open. Write amplification (bytes a
-// compaction rewrites per user byte) is the key health metric for one slow
-// spindle, so these are captured at the choke points where the byte counts are
-// already known, adding no I/O.
+// compaction rewrites per user byte) is a key health metric, so these are captured
+// at the choke points where the byte counts are already known, adding no I/O.
 type dbMetrics struct {
 	compactionCount        atomic.Int64
 	compactionBytesRead    atomic.Int64

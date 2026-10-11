@@ -351,7 +351,7 @@ type lookupResult struct {
 	deleted    bool
 	// bloomPassed reports that the bloom filter did not reject the key, so a block
 	// read happened. With found==false that read was wasted: a bloom false positive,
-	// the signal for whether cold read I/O is productive on a slow spindle.
+	// the signal for whether cold-cache read I/O is productive.
 	bloomPassed bool
 }
 

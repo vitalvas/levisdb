@@ -8,7 +8,7 @@
 // kind never picks up another.
 //
 // ponytail: uint32 file numbers cap at ~4.3B lifetime creations before wrap;
-// widen to uint64 (%016x) if a deployment ever approaches that.
+// widen to uint64 (%016x) if that limit is ever approached.
 
 package levisdb
 

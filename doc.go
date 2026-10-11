@@ -75,9 +75,9 @@
 // from the shallowest down, committing and freeing each tier's inputs before the
 // next, rather than merging every tier in a single pass. This bounds peak scratch
 // space, merge memory, and the crash-recovery window to a single tier instead of
-// the whole dataset, so a full compaction on a multi-terabyte store cannot exhaust
-// the machine. The compaction filter and tombstone drop run only on the final
-// collapse into the deepest tier, so each surviving key is filtered exactly once.
+// the whole dataset, so a full compaction's resource use stays bounded regardless
+// of total data size. The compaction filter and tombstone drop run only on the
+// final collapse into the deepest tier, so each surviving key is filtered once.
 //
 // # Open table descriptors
 //

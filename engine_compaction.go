@@ -56,8 +56,8 @@ type compactionConfigT struct {
 	// engine users, which do not have a DB WAL.
 	FilterThrough uint64
 	// MaxCompactionBytes caps the total input bytes merged in one non-bottom
-	// compaction so a single merge does not monopolize the spindle. Zero disables
-	// the cap (merge the whole tier).
+	// compaction so a single merge does not monopolize the serialized compactor.
+	// Zero disables the cap (merge the whole tier).
 	MaxCompactionBytes int64
 	// OverlapSelection narrows a non-bottom compaction to the largest group of
 	// key-overlapping tables in the tier (see overlapSets) instead of merging the
@@ -309,8 +309,8 @@ func (s *engineT) Compact(depth int, retainSeq uint64, cc compactionConfigT) err
 		}
 	}
 
-	// Byte-cap: a single compaction should not monopolize the one spindle merging
-	// an unbounded tier. Cap the input bytes and leave the rest for the next
+	// Byte-cap: a single compaction should not monopolize the serialized compactor
+	// merging an unbounded tier. Cap the input bytes and leave the rest for the next
 	// round. Applies only when NOT dropping tombstones (bottom-tier drops need the
 	// whole tier merged). Always keep >= 2 inputs so progress is guaranteed even
 	// when a single table exceeds the cap.
@@ -969,8 +969,8 @@ func (s *compactionSink) add(key, value []byte) error {
 // bytesWritten (flushed data blocks) plus estimatedTrailerBytes (the bloom
 // filter, index, and footer finish() still appends): rolling on data bytes alone
 // overshot the target by the trailer, which on a 128 MiB table of small keys is
-// several MiB, enough to push a file meant to fit an allocation budget over it,
-// a real cost on HDDs with huge datasets. bytesWritten counts only flushed
+// several MiB, enough to push a file meant to fit an allocation budget over it.
+// bytesWritten counts only flushed
 // blocks, so a table always holds at least one full block before it can roll (it
 // never produces an almost-empty SST); the current in-memory block adds at most
 // one blockSize of overshoot. Called at user-key boundaries, so a key's versions

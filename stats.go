@@ -24,7 +24,7 @@ type Stats struct {
 	TablesPerDepth map[int]int
 
 	// Cumulative write-path counters since open, for write-amplification and
-	// backlog health on a single spindle.
+	// compaction-backlog health.
 	CompactionCount        int64
 	CompactionBytesRead    int64
 	CompactionBytesWritten int64
@@ -37,13 +37,14 @@ type Stats struct {
 	// count of point lookups (Get and Has) since open, TableProbes the total number
 	// of tables whose bloom filter was consulted across them (after the key-range
 	// gate). TableProbes/PointReads is the average structural read fan-out, the main
-	// predictor of per-lookup seek cost on a slow (HDD) spindle. CacheMisses counts
-	// the block reads those probes caused (each a physical read on a cold cache).
+	// predictor of per-lookup seek cost where random reads are expensive. CacheMisses
+	// counts the block reads those probes caused (each a physical read on a cold
+	// cache).
 	PointReads  int64
 	TableProbes int64
 	// BloomFalsePositives counts probes where the bloom filter admitted the key but
 	// the table did not hold it, so the block read was wasted. A high rate relative
-	// to CacheMisses means cold read I/O is unproductive -- raise BloomBits.
+	// to CacheMisses means cold-cache read I/O is unproductive -- raise BloomBits.
 	BloomFalsePositives int64
 	// UserBytesWritten is the cumulative key+value bytes callers stored (post
 	// deduplication), the write-amplification denominator: (FlushBytesWritten +

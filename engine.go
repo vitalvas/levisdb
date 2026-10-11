@@ -158,8 +158,8 @@ type engineT struct {
 	// Read-amplification counters, cumulative since open. pointReads is the number
 	// of point lookups (Get and Has); tableProbes is the number of tables whose
 	// bloom filter was consulted across all those lookups (after the cheap key-range
-	// gate). Their ratio is the structural read fan-out, which predicts seek cost on
-	// a slow spindle independently of the device or cache state. bloomFalsePositives
+	// gate). Their ratio is the structural read fan-out, which predicts per-lookup
+	// seek cost independently of the device or cache state. bloomFalsePositives
 	// counts probes where the bloom admitted the key (so a block was read) but the
 	// table did not hold it -- wasted read I/O, the signal for bloom/cache tuning.
 	pointReads          atomic.Int64

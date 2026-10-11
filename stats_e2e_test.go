@@ -6,28 +6,29 @@ import (
 )
 
 // This file is an opt-in I/O-shape harness, run manually with -bench, never by the
-// gated test suite (benchmarks need -bench to execute). It measures device-
-// independent amplification metrics on this NVMe box and projects the cost onto a
-// slow (HDD) spindle from the seek counts, since prod runs on HDD and we cannot
-// benchmark there directly:
+// gated test suite (benchmarks need -bench to execute). It measures amplification
+// metrics that are independent of the underlying device, then projects a per-lookup
+// read cost by multiplying the measured block-read count by a configurable
+// per-seek service time, so the same run characterizes storage with any seek cost:
 //
 //	go test -run '^$' -bench 'BenchmarkIOShape' -benchtime 1x .
 //
 // Reported custom metrics (per b.ReportMetric, so they show in -bench output):
 //   - read-amp      : tables probed per point lookup (structural read fan-out)
-//   - blk-rd/read   : block reads (cache misses) per point lookup -- HDD seeks/read
+//   - blk-rd/read   : block reads (cache misses) per point lookup -- seeks per read
 //   - write-amp     : bytes written to disk (flush+compaction+WAL) / logical bytes
 //   - space-amp     : on-disk bytes / live logical bytes
-//   - hdd-ms/read   : projected per-lookup read latency on an HDD, from blk-rd and
-//                     a per-seek cost (a cold-cache lower bound; warm cache is less)
+//   - seek-ms/read  : projected per-lookup read latency, blk-rd/read x seekMillis
+//                     (a cold-cache upper bound; a warm cache reads fewer blocks)
 //
-// Interpretation: on NVMe a seek is ~10-100us, on a 7200rpm HDD ~8-10ms, so the
-// same block-read count costs ~100x more on HDD. read-amp and blk-rd/read are the
-// numbers to drive down for the HDD read path; write-amp drives compaction I/O.
+// read-amp and blk-rd/read are the numbers to drive down where random reads are
+// expensive; write-amp characterizes compaction I/O. Raise seekMillis to model
+// seek-bound storage, lower it for fast random-access storage.
 
-// hddSeekMillis is a representative random-read service time for a 7200rpm HDD
-// (~8.5ms seek+rotational). Used only to project, never measured here.
-const hddSeekMillis = 8.5
+// seekMillis is a representative random-read service time used only to project the
+// per-lookup cost; it is never measured here. The default models a seek-bound
+// device; adjust it to the target storage's random-read latency.
+const seekMillis = 8.5
 
 // ioShape loads n keys of valSize via opts, runs readOps random point lookups,
 // and reports the amplification metrics. logicalBytes is the live key+value total.
@@ -75,7 +76,7 @@ func ioShape(b *testing.B, name string, memtable int64, n, valSize, readOps int)
 			b.ReportMetric(bloomFP/reads, "bloomFP/read")
 			b.ReportMetric(diskWritten/userBytes, "write-amp")
 			b.ReportMetric(float64(onDisk)/float64(logical), "space-amp")
-			b.ReportMetric((blockReads/reads)*hddSeekMillis, "hdd-ms/read")
+			b.ReportMetric((blockReads/reads)*seekMillis, "seek-ms/read")
 			// Suppress the default ns/op: these runs are I/O-shape probes, not timing.
 			b.ReportMetric(0, "ns/op")
 
@@ -107,14 +108,15 @@ func dirBytes(b *testing.B, dir string) int64 {
 }
 
 // BenchmarkIOShape sweeps representative workloads. Scale n up (and -benchtime 1x)
-// for a prod-like picture; the defaults keep a manual run to a few seconds.
+// for a larger, more realistic picture; the defaults keep a manual run to a few
+// seconds.
 func BenchmarkIOShape(b *testing.B) {
 	const (
 		small = 1 << 20 // 1 MiB memtable: many tiers, higher read fan-out
 		large = 8 << 20 // default-ish memtable
 	)
-	// Read-heavy (the Fantom blockchain-node profile): lots of lookups over a large
-	// dataset; read-amp and blk-rd/read dominate the HDD cost.
+	// Read-heavy: lots of lookups over a large dataset; read-amp and blk-rd/read
+	// dominate the projected read cost.
 	ioShape(b, "read-heavy/small-memtable", small, 200_000, 100, 200_000)
 	ioShape(b, "read-heavy/large-memtable", large, 200_000, 100, 200_000)
 	// Write-heavy bulk load with modest reads: write-amp dominates.
@@ -123,10 +125,10 @@ func BenchmarkIOShape(b *testing.B) {
 	ioShape(b, "large-values", large, 50_000, 4096, 50_000)
 }
 
-// Example output row (NVMe), read like:
+// Example output row, read like:
 //
-//	BenchmarkIOShape/read-heavy/small-memtable-16  1  ... 3.2 read-amp  1.8 blk-rd/read  ... 15.3 hdd-ms/read
+//	BenchmarkIOShape/read-heavy/small-memtable-16  1  ... 3.2 read-amp  1.8 blk-rd/read  ... 15.3 seek-ms/read
 //
 // means ~3.2 tables probed and ~1.8 block reads per lookup -> ~15ms/read projected
-// on HDD; driving blk-rd/read toward 1.0 (bloom/cache) or read-amp down (fewer
-// overlapping tables) is the HDD read-path win.
+// at the configured per-seek cost; driving blk-rd/read toward 1.0 (bloom/cache) or
+// read-amp down (fewer overlapping tables) is the win where random reads are slow.

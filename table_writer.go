@@ -79,8 +79,8 @@ func (tw *tableWriter) bytesWritten() int64 { return int64(tw.offset) }
 // that ignored all this overshot the target by it; on a 128 MiB table of small
 // keys the bloom alone is several MiB. Rolling at
 // bytesWritten + estimatedTrailerBytes >= target keeps the finished file at or
-// under the target, which matters on HDDs where an oversized file straddles an
-// extra allocation. Every term over-estimates so the bound never under-reserves:
+// under the target, so an oversized file does not straddle an extra filesystem
+// allocation unit. Every term over-estimates so the bound never under-reserves:
 //   - pending data block: its uncompressed builder size plus a block trailer (the
 //     codec only shrinks it); finish() flushes it before writing the trailer.
 //   - its index entry: that flush adds one separator-key + handle entry to the
