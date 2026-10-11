@@ -32,6 +32,24 @@ type Stats struct {
 	FlushBytesWritten      int64
 	WALBytesWritten        int64
 	WriteStalls            int64 // times a write was throttled by backpressure
+
+	// PointReads and TableProbes measure read amplification: PointReads is the
+	// count of point lookups (Get and Has) since open, TableProbes the total number
+	// of tables whose bloom filter was consulted across them (after the key-range
+	// gate). TableProbes/PointReads is the average structural read fan-out, the main
+	// predictor of per-lookup seek cost on a slow (HDD) spindle. CacheMisses counts
+	// the block reads those probes caused (each a physical read on a cold cache).
+	PointReads  int64
+	TableProbes int64
+	// BloomFalsePositives counts probes where the bloom filter admitted the key but
+	// the table did not hold it, so the block read was wasted. A high rate relative
+	// to CacheMisses means cold read I/O is unproductive -- raise BloomBits.
+	BloomFalsePositives int64
+	// UserBytesWritten is the cumulative key+value bytes callers stored (post
+	// deduplication), the write-amplification denominator: (FlushBytesWritten +
+	// CompactionBytesWritten + WALBytesWritten) / UserBytesWritten. Space
+	// amplification is TablesSize over the caller's live logical volume.
+	UserBytesWritten int64
 }
 
 // Stats returns a snapshot of database state. It is safe to call concurrently.
@@ -61,6 +79,10 @@ func (db *DB) Stats() (Stats, error) {
 		FlushBytesWritten:      db.metrics.flushBytesWritten.Load(),
 		WALBytesWritten:        walBytes,
 		WriteStalls:            db.metrics.writeStalls.Load(),
+		PointReads:             db.eng.pointReads.Load(),
+		TableProbes:            db.eng.tableProbes.Load(),
+		BloomFalsePositives:    db.eng.bloomFalsePositives.Load(),
+		UserBytesWritten:       db.eng.userBytesWritten.Load(),
 	}
 	st.BackgroundError = db.backgroundError()
 	db.fds.mu.Lock()
@@ -122,6 +144,14 @@ func (db *DB) GetProperty(name string) (string, error) {
 		return strconv.FormatInt(st.WALBytesWritten, 10), nil
 	case "levisdb.write-stalls":
 		return strconv.FormatInt(st.WriteStalls, 10), nil
+	case "levisdb.point-reads":
+		return strconv.FormatInt(st.PointReads, 10), nil
+	case "levisdb.table-probes":
+		return strconv.FormatInt(st.TableProbes, 10), nil
+	case "levisdb.bloom-false-positives":
+		return strconv.FormatInt(st.BloomFalsePositives, 10), nil
+	case "levisdb.user-bytes-written":
+		return strconv.FormatInt(st.UserBytesWritten, 10), nil
 	case "levisdb.background-error":
 		if st.BackgroundError == nil {
 			return "", nil

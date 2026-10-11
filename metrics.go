@@ -98,6 +98,10 @@ func statsToMap(st Stats) map[string]any {
 		"flush-bytes-written":      st.FlushBytesWritten,
 		"wal-bytes-written":        st.WALBytesWritten,
 		"write-stalls":             st.WriteStalls,
+		"point-reads":              st.PointReads,
+		"table-probes":             st.TableProbes,
+		"bloom-false-positives":    st.BloomFalsePositives,
+		"user-bytes-written":       st.UserBytesWritten,
 	}
 	if st.BackgroundError != nil {
 		m["background-error"] = st.BackgroundError.Error()

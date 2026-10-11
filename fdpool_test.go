@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -124,23 +125,23 @@ func TestFDPoolReapIdle(t *testing.T) {
 	const timeout = int64(1000) // nanoseconds, in the injected clock's units
 
 	t.Run("closes idle, keeps recent", func(t *testing.T) {
-		var now int64
+		var now atomic.Int64
 		pool := newFDPool(10)
-		pool.now = func() int64 { return now }
+		pool.testNow = &now
 
 		data := []byte("v")
 		idle := pool.newHandle(writeTempFile(t, dir, "idle", data))
 		recent := pool.newHandle(writeTempFile(t, dir, "recent", data))
 
-		now = 100
+		now.Store(100)
 		_, err := idle.ReadAt(make([]byte, 1), 0) // last used at 100
 		require.NoError(t, err)
-		now = 1000
+		now.Store(1000)
 		_, err = recent.ReadAt(make([]byte, 1), 0) // last used at 1000
 		require.NoError(t, err)
 
 		// Advance so idle (100) is older than timeout but recent (1000) is not.
-		now = 1500
+		now.Store(1500)
 		closed := pool.reapIdle(timeout)
 		assert.Equal(t, 1, closed, "only the idle descriptor is reaped")
 
@@ -157,16 +158,16 @@ func TestFDPoolReapIdle(t *testing.T) {
 	})
 
 	t.Run("never reaps an in-flight handle", func(t *testing.T) {
-		var now int64
+		var now atomic.Int64
 		pool := newFDPool(10)
-		pool.now = func() int64 { return now }
+		pool.testNow = &now
 		h := pool.newHandle(writeTempFile(t, dir, "busy", []byte("v")))
 
-		now = 1
+		now.Store(1)
 		_, err := h.ReadAt(make([]byte, 1), 0)
 		require.NoError(t, err)
 		h.inflight.Add(1) // simulate a read in progress
-		now = 1_000_000
+		now.Store(1_000_000)
 		assert.Zero(t, pool.reapIdle(timeout), "an in-flight descriptor is never reaped")
 		h.inflight.Add(-1)
 	})

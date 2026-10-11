@@ -24,15 +24,25 @@ type fdPool struct {
 	ring  []*openFile // clock ring of open handles
 	hand  int         // clock hand position
 	open  int
-	// now returns the current Unix-nanosecond time, stamped on each access and read
-	// by the idle reaper. A field so tests can inject a deterministic clock.
-	now func() int64
+	// testNow, when non-nil, overrides the clock for deterministic tests. The access
+	// stamp and the idle reaper read it concurrently, so it is atomic. Production
+	// leaves it nil and uses the wall clock via now().
+	testNow *atomic.Int64
+}
+
+// now returns the current Unix-nanosecond time, stamped on each access and read by
+// the idle reaper. Tests inject a deterministic clock via testNow.
+func (p *fdPool) now() int64 {
+	if p.testNow != nil {
+		return p.testNow.Load()
+	}
+	return time.Now().UnixNano()
 }
 
 // newFDPool returns a pool allowing at most limit descriptors open at once. A
 // limit <= 0 disables bounding: descriptors are opened once and kept.
 func newFDPool(limit int) *fdPool {
-	return &fdPool{limit: limit, now: func() int64 { return time.Now().UnixNano() }}
+	return &fdPool{limit: limit}
 }
 
 func (p *fdPool) newHandle(path string) *openFile {

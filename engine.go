@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -153,6 +154,23 @@ type engineT struct {
 	// written under flushMu and read by the caller right after Compact returns on
 	// the same goroutine, so it needs no separate guard.
 	lastCompaction compactionResult
+
+	// Read-amplification counters, cumulative since open. pointReads is the number
+	// of point lookups (Get and Has); tableProbes is the number of tables whose
+	// bloom filter was consulted across all those lookups (after the cheap key-range
+	// gate). Their ratio is the structural read fan-out, which predicts seek cost on
+	// a slow spindle independently of the device or cache state. bloomFalsePositives
+	// counts probes where the bloom admitted the key (so a block was read) but the
+	// table did not hold it -- wasted read I/O, the signal for bloom/cache tuning.
+	pointReads          atomic.Int64
+	tableProbes         atomic.Int64
+	bloomFalsePositives atomic.Int64
+	// userBytesWritten is the cumulative key+value bytes applied by writes, the
+	// write-amplification denominator (disk bytes written / this). Space
+	// amplification is reported as on-disk table bytes (Stats.TablesSize) against the
+	// live logical volume the caller tracks, since the engine does not keep an exact
+	// running live-byte total across version-collapsing compactions.
+	userBytesWritten atomic.Int64
 }
 
 // engineSeed fixes the memtable skiplist RNG so memtable layout is
@@ -402,15 +420,20 @@ func (s *engineT) pickVersion(seq uint64, key []byte, now int64) (versionPick, e
 	// a new file after newer shallow-tier tables. Inspect every overlapping table
 	// and select the greatest visible sequence rather than returning the newest
 	// file's first match.
+	probes, bloomFP := int64(0), int64(0)
 	for _, table := range s.tables {
 		// Skip a table whose recorded key range cannot hold key, avoiding a bloom
 		// probe and a possible false-positive block seek on the target disk.
 		if !table.mayContain(key) {
 			continue
 		}
+		probes++
 		r, gerr := table.reader.lookupAtTime(key, seq, now, false)
 		if gerr != nil {
 			return versionPick{}, gerr
+		}
+		if r.bloomPassed && !r.found {
+			bloomFP++ // bloom admitted the key, the block read found nothing: wasted I/O
 		}
 		if !r.found {
 			continue
@@ -419,6 +442,9 @@ func (s *engineT) pickVersion(seq uint64, key []byte, now int64) (versionPick, e
 			return versionPick{}, err
 		}
 	}
+	s.pointReads.Add(1)
+	s.tableProbes.Add(probes)
+	s.bloomFalsePositives.Add(bloomFP)
 	return best, nil
 }
 
@@ -549,13 +575,18 @@ func (s *engineT) hasAtTime(seq uint64, key []byte, now int64) (found, deleted b
 			}
 		}
 	}
+	probes, bloomFP := int64(0), int64(0)
 	for _, table := range s.tables {
 		if !table.mayContain(key) {
 			continue
 		}
-		vseq, f, d, gerr := table.reader.hasVersionAtTime(key, seq, now)
+		probes++
+		vseq, f, d, bloomPassed, gerr := table.reader.hasVersionAtTime(key, seq, now)
 		if gerr != nil {
 			return false, false, gerr
+		}
+		if bloomPassed && !f {
+			bloomFP++
 		}
 		if !f {
 			continue
@@ -568,6 +599,9 @@ func (s *engineT) hasAtTime(seq uint64, key []byte, now int64) (found, deleted b
 			return false, false, fmt.Errorf("table: conflicting kinds for key at sequence %d", vseq)
 		}
 	}
+	s.pointReads.Add(1)
+	s.tableProbes.Add(probes)
+	s.bloomFalsePositives.Add(bloomFP)
 	// A range tombstone newer than the best point version deletes the key.
 	if bestFound && !bestDeleted {
 		rdSeq, rderr := s.maxCoveringRangeDelSeq(key, seq)

@@ -1129,7 +1129,7 @@ func (db *DB) writeBatch(b *Batch) error {
 	// The whole batch is applied to the memtable before any flush check, so bound
 	// the cumulative bytes as well as each entry. Both limits keep the skiplist
 	// arena (uint32 offsets) well below 2^32.
-	var total int64
+	var total, userBytes int64
 	for _, op := range b.ops {
 		if len(op.key) == 0 {
 			return ErrEmptyKey
@@ -1185,6 +1185,7 @@ func (db *DB) writeBatch(b *Batch) error {
 			Value:     op.value,
 			ExpiresAt: op.expiresAt,
 		})
+		userBytes += int64(len(op.key) + len(op.value))
 	}
 
 	if len(entries) == 0 {
@@ -1194,6 +1195,9 @@ func (db *DB) writeBatch(b *Batch) error {
 		db.setBackgroundError(err)
 		return err
 	}
+	// Logical bytes the caller actually stored (post-dedup), the write-amplification
+	// denominator: disk bytes written / this.
+	db.eng.userBytesWritten.Add(userBytes)
 	return nil
 }
 

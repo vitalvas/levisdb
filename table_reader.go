@@ -349,6 +349,10 @@ type lookupResult struct {
 	expiresAt  int64
 	found      bool
 	deleted    bool
+	// bloomPassed reports that the bloom filter did not reject the key, so a block
+	// read happened. With found==false that read was wasted: a bloom false positive,
+	// the signal for whether cold read I/O is productive on a slow spindle.
+	bloomPassed bool
 }
 
 // Get returns the value for userKey at the newest version with seq <= the query
@@ -372,7 +376,17 @@ func (tr *tableReader) lookupAtTime(userKey []byte, seq uint64, now int64, copyV
 	if !bloomMayContain(m.filter, bloomHash(userKey)) {
 		return lookupResult{}, nil
 	}
+	// Past the gate: a block read will happen. Record it on every result below so a
+	// found==false outcome can be attributed to a bloom false positive. Set via
+	// defer so each early return carries it without threading the flag through.
+	res, err := tr.lookupPastBloom(m, userKey, seq, now, copyValue)
+	res.bloomPassed = true
+	return res, err
+}
 
+// lookupPastBloom performs the block read and scan after the bloom gate has
+// admitted userKey. Split out so lookupAtTime can stamp bloomPassed on every path.
+func (tr *tableReader) lookupPastBloom(m *tableMetaBlocks, userKey []byte, seq uint64, now int64, copyValue bool) (lookupResult, error) {
 	// Build the lookup key in a stack buffer to avoid a heap allocation on the
 	// point-lookup hot path. Keys longer than the inline buffer fall back to a
 	// heap allocation inside ikeyLookupKey.
@@ -457,13 +471,13 @@ func (tr *tableReader) lookupAtTime(userKey []byte, seq uint64, now int64, copyV
 // has reports whether userKey exists at seq without copying its value, making
 // it cheaper than get for a pure membership check.
 func (tr *tableReader) has(userKey []byte, seq uint64) (found, deleted bool, err error) {
-	_, found, deleted, err = tr.hasVersionAtTime(userKey, seq, time.Now().Unix())
+	_, found, deleted, _, err = tr.hasVersionAtTime(userKey, seq, time.Now().Unix())
 	return found, deleted, err
 }
 
-func (tr *tableReader) hasVersionAtTime(userKey []byte, seq uint64, now int64) (versionSeq uint64, found, deleted bool, err error) {
+func (tr *tableReader) hasVersionAtTime(userKey []byte, seq uint64, now int64) (versionSeq uint64, found, deleted, bloomPassed bool, err error) {
 	r, err := tr.lookupAtTime(userKey, seq, now, false)
-	return r.versionSeq, r.found, r.deleted, err
+	return r.versionSeq, r.found, r.deleted, r.bloomPassed, err
 }
 
 // findBlock returns the index of the first block that may contain lookup.

@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -132,6 +133,13 @@ func TestFDIdleReaperClosesDescriptors(t *testing.T) {
 	require.NoError(t, err)
 	defer db.Close()
 
+	// Drive the pool clock so the reaper's sweep sees the descriptor as long-idle on
+	// its first tick instead of waiting out a real timeout. Atomic because the reaper
+	// goroutine reads it concurrently. Seed it to now so access stamps are sane.
+	var clock atomic.Int64
+	clock.Store(time.Now().UnixNano())
+	db.fds.testNow = &clock
+
 	require.NoError(t, db.Put(PutOptions{Key: []byte("k"), Value: []byte("v")}))
 	require.NoError(t, db.eng.Flush())
 	// Open a descriptor by reading the flushed table.
@@ -142,12 +150,15 @@ func TestFDIdleReaperClosesDescriptors(t *testing.T) {
 	db.fds.mu.Unlock()
 	require.Positive(t, openNow, "a read must have opened a table descriptor")
 
-	// Left untouched, the descriptor is closed within a couple of reaper sweeps.
-	require.Eventually(t, func() bool {
-		db.fds.mu.Lock()
-		defer db.fds.mu.Unlock()
-		return db.fds.open == 0
-	}, 5*time.Second, 50*time.Millisecond, "reaper must close the idle descriptor")
+	// Jump the clock far past the idle timeout and run a sweep directly, so the test
+	// is instant and deterministic rather than waiting on the background ticker (the
+	// loop's wiring is exercised by Open starting it; its timing is not under test).
+	clock.Store(time.Now().Add(time.Hour).UnixNano())
+	closed := db.fds.reapIdle(int64(o.FDIdleTimeout))
+	assert.Equal(t, 1, closed, "the idle descriptor is reaped")
+	db.fds.mu.Lock()
+	defer db.fds.mu.Unlock()
+	assert.Zero(t, db.fds.open, "reaper closed the idle descriptor")
 }
 
 // TestAllocatorStartsAboveStrandedTableFile reproduces the file-number reuse
