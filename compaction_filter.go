@@ -2,17 +2,16 @@ package levisdb
 
 import (
 	"fmt"
-	"time"
 )
 
 // CompactionFilterEntry is a non-deleted, unexpired value being rewritten by
-// compaction. TTL is the value's remaining lifetime at the compaction cutoff;
-// zero means the value has no expiration. Key and Value are copies owned by
-// the callback.
+// compaction. ExpiresAt is the value's absolute expiry as a Unix-second timestamp
+// (the same deadline a Put set via PutOptions.ExpiresAt); zero means the value has
+// no expiration. Key and Value are copies owned by the callback.
 type CompactionFilterEntry struct {
-	Key   []byte
-	Value []byte
-	TTL   time.Duration
+	Key       []byte
+	Value     []byte
+	ExpiresAt int64
 }
 
 // CompactionFilter decides whether a live value survives compaction. Returning

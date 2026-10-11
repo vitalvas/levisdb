@@ -112,7 +112,7 @@ func TestRecoverUnflushedWrites(t *testing.T) {
 	for i := 0; i < 100; i++ {
 		v, err := db2.Get([]byte(fmt.Sprintf("key%03d", i)))
 		require.NoError(t, err, i)
-		assert.Equal(t, []byte(fmt.Sprintf("v%d", i)), v)
+		assert.Equal(t, []byte(fmt.Sprintf("v%d", i)), v.Value)
 	}
 }
 
@@ -219,7 +219,7 @@ func TestRecoverMixedFlushedAndWAL(t *testing.T) {
 			miss++
 			continue
 		}
-		assert.Equal(t, []byte(fmt.Sprintf("v%d", i)), v)
+		assert.Equal(t, []byte(fmt.Sprintf("v%d", i)), v.Value)
 	}
 	assert.Zero(t, miss, "all committed writes must survive a crash")
 }
@@ -241,7 +241,7 @@ func TestRecoverDeletes(t *testing.T) {
 	assert.ErrorIs(t, err, ErrNotFound, "delete must survive recovery")
 	v, err := db2.Get([]byte("b"))
 	require.NoError(t, err)
-	assert.Equal(t, []byte("2"), v)
+	assert.Equal(t, []byte("2"), v.Value)
 }
 
 func TestRecoverDoubleClean(t *testing.T) {
@@ -256,7 +256,7 @@ func TestRecoverDoubleClean(t *testing.T) {
 	db2 := openAt(t, dir, 1<<20)
 	v, err := db2.Get([]byte("k"))
 	require.NoError(t, err)
-	assert.Equal(t, []byte("v"), v)
+	assert.Equal(t, []byte("v"), v.Value)
 	require.NoError(t, db2.Close())
 }
 
@@ -317,7 +317,7 @@ func TestRecoverSecondCrashPreservesRecovered(t *testing.T) {
 	for i := 0; i < 50; i++ {
 		v, err := db3.Get([]byte(fmt.Sprintf("k%02d", i)))
 		require.NoError(t, err, i)
-		assert.Equal(t, []byte("v"), v)
+		assert.Equal(t, []byte("v"), v.Value)
 	}
 }
 
@@ -433,7 +433,7 @@ func TestLenientRecoveryKeepsPrefixBeforeCorruption(t *testing.T) {
 	defer db2.Close()
 	v, err := db2.Get([]byte("good"))
 	require.NoError(t, err)
-	assert.Equal(t, []byte("v"), v)
+	assert.Equal(t, []byte("v"), v.Value)
 }
 
 func TestRecoverWALRejectsSequenceRegressionAcrossSegments(t *testing.T) {
@@ -637,7 +637,7 @@ func TestManifestRotationBoundsGrowth(t *testing.T) {
 	for i := 0; i < 120; i++ {
 		v, err := db2.Get([]byte(fmt.Sprintf("key%05d", i)))
 		require.NoError(t, err, i)
-		assert.Equal(t, []byte("v"), v)
+		assert.Equal(t, []byte("v"), v.Value)
 	}
 }
 
@@ -745,7 +745,7 @@ func TestManifestSyncFailurePreservesReferencedFlushOutput(t *testing.T) {
 	defer db.Close()
 	value, err := db.Get([]byte("key"))
 	require.NoError(t, err)
-	assert.Equal(t, []byte("value"), value)
+	assert.Equal(t, []byte("value"), value.Value)
 }
 
 func TestCloseRetainsWALWhenManifestCloseFails(t *testing.T) {
@@ -791,7 +791,7 @@ func TestNoSyncBackgroundWALSyncPersistsBeforeCrash(t *testing.T) {
 	for i := 0; i < 50; i++ {
 		v, err := db2.Get([]byte(fmt.Sprintf("k%03d", i)))
 		require.NoError(t, err, "key %d", i)
-		assert.Equal(t, []byte("v"), v)
+		assert.Equal(t, []byte("v"), v.Value)
 	}
 }
 
@@ -878,7 +878,7 @@ func TestLenientRecoveryStopsAtCorruptionAcrossSegments(t *testing.T) {
 	// "a" (before the corruption) is recovered.
 	v, err := db2.Get([]byte("a"))
 	require.NoError(t, err)
-	assert.Equal(t, []byte("v"), v)
+	assert.Equal(t, []byte("v"), v.Value)
 	// "b" (in a later segment, past the corruption) must NOT be recovered.
 	_, err = db2.Get([]byte("b"))
 	assert.ErrorIs(t, err, ErrNotFound, "records past a corruption must not be recovered")
@@ -913,7 +913,7 @@ func TestRecoveryFlushesMidReplay(t *testing.T) {
 	for i := 0; i < n; i++ {
 		v, err := db2.Get([]byte(fmt.Sprintf("key%04d", i)))
 		require.NoError(t, err, i)
-		assert.Equal(t, []byte("value-payload"), v)
+		assert.Equal(t, []byte("value-payload"), v.Value)
 	}
 	// Mid-replay flushing produced multiple on-disk tables (arena stayed bounded).
 	st, err := db2.Stats()
@@ -949,7 +949,7 @@ func TestCheckpointRecoveryBoundarySurvivesManifestRotation(t *testing.T) {
 			require.ErrorIs(t, err, ErrNotFound)
 			v, err := db.Get([]byte("live"))
 			require.NoError(t, err)
-			require.Equal(t, "new", string(v))
+			require.Equal(t, "new", string(v.Value))
 		})
 	}
 }
@@ -1009,7 +1009,7 @@ func TestCompactTieredCascadesAcrossTiers(t *testing.T) {
 	for _, k := range []string{"keep1", "keep2", "keep3"} {
 		v, err := db.Get([]byte(k))
 		require.NoError(t, err, k)
-		require.NotEmpty(t, v, k)
+		require.NotEmpty(t, v.Value, k)
 	}
 	_, err = db.Get([]byte("drop"))
 	require.ErrorIs(t, err, ErrNotFound, "filtered key and its tombstone are gone")
@@ -1051,7 +1051,7 @@ func TestCheckpointManifestFailurePreservesRecovery(t *testing.T) {
 	defer db.Close()
 	v, err := db.Get([]byte("k"))
 	require.NoError(t, err)
-	require.Equal(t, "v", string(v))
+	require.Equal(t, "v", string(v.Value))
 }
 
 func TestLegacyManifestStillReplaysUnflushedWAL(t *testing.T) {
@@ -1072,7 +1072,7 @@ func TestLegacyManifestStillReplaysUnflushedWAL(t *testing.T) {
 	defer db.Close()
 	v, err := db.Get([]byte("k"))
 	require.NoError(t, err)
-	require.Equal(t, "v", string(v))
+	require.Equal(t, "v", string(v.Value))
 }
 
 func TestRecoveryPreservesAllocatedSequence(t *testing.T) {
@@ -1117,7 +1117,7 @@ func TestRecoveryPreservesAllocatedSequence(t *testing.T) {
 			require.NoError(t, db.Put(PutOptions{Key: []byte("a"), Value: []byte("new")}))
 			v, err := db.Get([]byte("a"))
 			require.NoError(t, err, "a successful new write must not reuse an existing SST sequence")
-			require.Equal(t, "new", string(v))
+			require.Equal(t, "new", string(v.Value))
 			require.Equal(t, uint64(3), db.LatestSeq())
 		})
 	}

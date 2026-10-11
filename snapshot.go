@@ -183,8 +183,9 @@ func (s *Snapshot) Release() {
 	}
 }
 
-// Get returns the value for key as of the snapshot, or ErrNotFound.
-func (s *Snapshot) Get(key []byte) ([]byte, error) {
+// Get returns the value for key, with its stored expiry, as of the snapshot, or
+// ErrNotFound.
+func (s *Snapshot) Get(key []byte) (GetResult, error) {
 	return s.db.getAt(s.seq, key)
 }
 

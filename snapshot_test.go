@@ -23,12 +23,12 @@ func TestSnapshotIsolation(t *testing.T) {
 	// Live read sees the new value.
 	v, err := db.Get([]byte("k"))
 	require.NoError(t, err)
-	assert.Equal(t, []byte("v2"), v)
+	assert.Equal(t, []byte("v2"), v.Value)
 
 	// Snapshot still sees the old value.
 	sv, err := snap.Get([]byte("k"))
 	require.NoError(t, err)
-	assert.Equal(t, []byte("v1"), sv)
+	assert.Equal(t, []byte("v1"), sv.Value)
 }
 
 func TestSnapshotSurvivesCompaction(t *testing.T) {
@@ -56,7 +56,7 @@ func TestSnapshotSurvivesCompaction(t *testing.T) {
 	// compaction because the snapshot pinned its sequence.
 	sv, err := snap.Get([]byte("k"))
 	require.NoError(t, err)
-	assert.Equal(t, []byte("original"), sv)
+	assert.Equal(t, []byte("original"), sv.Value)
 }
 
 func TestSnapshotIterator(t *testing.T) {
@@ -134,7 +134,7 @@ func TestBatchAtomicAllOrNothing(t *testing.T) {
 	for i := 0; i < 50; i++ {
 		v, err := db.Get([]byte(fmt.Sprintf("k%02d", i)))
 		require.NoError(t, err, i)
-		assert.Equal(t, []byte(fmt.Sprintf("v%d", i)), v)
+		assert.Equal(t, []byte(fmt.Sprintf("v%d", i)), v.Value)
 	}
 }
 

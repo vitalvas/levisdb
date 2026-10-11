@@ -136,7 +136,7 @@ func TestIncompressibleValuesRoundTrip(t *testing.T) {
 	for i := 0; i < n; i++ {
 		got, err := db.Get([]byte(fmt.Sprintf("k%05d", i)))
 		require.NoError(t, err, "i=%d", i)
-		assert.Equal(t, mkVal(i), got, "i=%d round-trips", i)
+		assert.Equal(t, mkVal(i), got.Value, "i=%d round-trips", i)
 	}
 }
 
@@ -205,7 +205,7 @@ func TestFlateCodecEndToEnd(t *testing.T) {
 	for i := 0; i < n; i++ {
 		got, err := db.Get([]byte(fmt.Sprintf("k%05d", i)))
 		require.NoError(t, err, "i=%d", i)
-		assert.Equal(t, val, got, "i=%d round-trips through flate on disk", i)
+		assert.Equal(t, val, got.Value, "i=%d round-trips through flate on disk", i)
 	}
 }
 

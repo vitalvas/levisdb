@@ -27,7 +27,7 @@ not supported.
 - non-mutating read-only opens, including in-memory replay of a crash WAL
 - optional ordered WAL observation for replication or change-data capture
 - per-value absolute-expiry TTL persisted across WAL recovery and compaction
-- optional compaction filtering with key, value, and remaining TTL context
+- optional compaction filtering with key, value, and absolute-expiry context
 - optional write deduplication of unchanged key/value/expiry puts
 - monitoring through `Stats`, LevelDB-style `GetProperty`, and a process `expvar`
 
@@ -56,11 +56,11 @@ func main() {
 	}); err != nil {
 		log.Fatal(err)
 	}
-	value, err := db.Get([]byte("key"))
+	r, err := db.Get([]byte("key"))
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Printf("%s", value)
+	log.Printf("%s (expires_at=%d)", r.Value, r.ExpiresAt)
 	if err := db.Close(); err != nil {
 		log.Fatal(err)
 	}
@@ -177,7 +177,7 @@ if err != nil {
 }
 defer snap.Release()
 
-v, err := snap.Get([]byte("a")) // the value as of the snapshot
+r, err := snap.Get([]byte("a")) // r.Value / r.ExpiresAt as of the snapshot
 ```
 
 Monitoring. `Stats` for a whole snapshot, `GetProperty` for one value.
@@ -220,7 +220,7 @@ Package-level:
 | `Put(PutOptions) error` | Set a key, optionally with an absolute `ExpiresAt`. |
 | `Delete(key []byte) error` | Remove a key. |
 | `DeleteRange(start, end []byte) error` | Remove every key in `[start, end)` in one record. |
-| `Get(key []byte) ([]byte, error)` | Read the latest value or `ErrNotFound`. |
+| `Get(key []byte) (GetResult, error)` | Read the latest value and its `ExpiresAt`, or `ErrNotFound`. |
 | `Has(key []byte) (bool, error)` | Existence check without copying the value. |
 | `Write(*Batch) error` | Commit a batch atomically. |
 | `NewIterator() (Iterator, error)` | Ordered scan over all keys. |
@@ -617,8 +617,8 @@ survives when compaction rewrites it:
 ```go
 opts := levisdb.DefaultOptions("./data")
 opts.CompactionFilter = func(entry levisdb.CompactionFilterEntry) bool {
-	// Remove short-lived values instead of rewriting them again.
-	if entry.TTL > 0 && entry.TTL < 5*time.Minute {
+	// Remove values that expire within five minutes instead of rewriting them.
+	if entry.ExpiresAt > 0 && entry.ExpiresAt < time.Now().Add(5*time.Minute).Unix() {
 		return false
 	}
 	return true
@@ -633,8 +633,9 @@ fields have these meanings:
 
 - `Key`: the user key.
 - `Value`: the user value, without internal TTL metadata.
-- `TTL`: remaining lifetime at the compaction cutoff, or zero for a value
-  without expiration.
+- `ExpiresAt`: the value's absolute expiry as a Unix-second timestamp (the same
+  deadline a put set via `PutOptions.ExpiresAt`), or zero for a value without
+  expiration.
 
 Expired values and existing tombstones are not passed to the callback. `Key`
 and `Value` are copies owned by the callback, so it may retain or modify them.

@@ -8,6 +8,33 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestGetReturnsExpiresAt(t *testing.T) {
+	t.Parallel()
+	db := openTestDB(t, func(o *Options) { o.MemtableSize = 1 << 30 })
+
+	// A TTL put: Get returns the exact stored absolute deadline.
+	expiresAt := time.Now().Add(time.Hour).Unix()
+	require.NoError(t, db.Put(PutOptions{Key: []byte("ttl"), Value: []byte("v"), ExpiresAt: expiresAt}))
+	got, err := db.Get([]byte("ttl"))
+	require.NoError(t, err)
+	assert.Equal(t, []byte("v"), got.Value)
+	assert.Equal(t, expiresAt, got.ExpiresAt, "Get must surface the stored ExpiresAt")
+
+	// A non-TTL put: ExpiresAt is zero.
+	require.NoError(t, db.Put(PutOptions{Key: []byte("plain"), Value: []byte("v")}))
+	got, err = db.Get([]byte("plain"))
+	require.NoError(t, err)
+	assert.Zero(t, got.ExpiresAt, "a value without TTL reports ExpiresAt 0")
+
+	// Same through a snapshot.
+	snap, err := db.Snapshot()
+	require.NoError(t, err)
+	defer snap.Release()
+	got, err = snap.Get([]byte("ttl"))
+	require.NoError(t, err)
+	assert.Equal(t, expiresAt, got.ExpiresAt, "Snapshot.Get must surface ExpiresAt too")
+}
+
 func TestPutTTLExpiresAndShadowsOlderValue(t *testing.T) {
 	t.Parallel()
 	db := openTestDB(t, func(o *Options) {
@@ -19,9 +46,9 @@ func TestPutTTLExpiresAndShadowsOlderValue(t *testing.T) {
 	require.NoError(t, db.Put(PutOptions{Key: []byte("key"), Value: []byte("temporary"), ExpiresAt: expiresAt}))
 
 	// Live before the deadline via the public read path.
-	value, err := db.Get([]byte("key"))
+	got, err := db.Get([]byte("key"))
 	require.NoError(t, err)
-	assert.Equal(t, []byte("temporary"), value)
+	assert.Equal(t, []byte("temporary"), got.Value)
 
 	// After the deadline the newest value is gone and, crucially, the older shadowed
 	// table value is not revealed. Checked at an explicit clock past the deadline

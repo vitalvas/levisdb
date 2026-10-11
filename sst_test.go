@@ -72,7 +72,7 @@ func TestSstIngestRoundTrip(t *testing.T) {
 	for _, kv := range [][2]string{{"a", "1"}, {"b", "2"}, {"c", "3"}} {
 		got, err := db.Get([]byte(kv[0]))
 		require.NoError(t, err, kv[0])
-		assert.Equal(t, []byte(kv[1]), got)
+		assert.Equal(t, []byte(kv[1]), got.Value)
 	}
 	// The ingest advanced the sequence past the file's assigned one.
 	assert.NotZero(t, db.LatestSeq())
@@ -93,7 +93,7 @@ func TestSstIngestNewestWins(t *testing.T) {
 
 	got, err := db.Get([]byte("k"))
 	require.NoError(t, err)
-	assert.Equal(t, []byte("new"), got, "ingested value is the newest version")
+	assert.Equal(t, []byte("new"), got.Value, "ingested value is the newest version")
 }
 
 func TestSstIngestTTLAndDelete(t *testing.T) {
@@ -111,11 +111,11 @@ func TestSstIngestTTLAndDelete(t *testing.T) {
 
 	v, err := db.Get([]byte("keep"))
 	require.NoError(t, err)
-	assert.Equal(t, []byte("v"), v)
+	assert.Equal(t, []byte("v"), v.Value)
 
 	v, err = db.Get([]byte("live"))
 	require.NoError(t, err, "unexpired TTL value is readable")
-	assert.Equal(t, []byte("v"), v)
+	assert.Equal(t, []byte("v"), v.Value)
 
 	_, err = db.Get([]byte("zzz"))
 	assert.ErrorIs(t, err, ErrNotFound, "ingested tombstone hides the key")
@@ -136,7 +136,7 @@ func TestSstIngestRejectsMemtableOverlap(t *testing.T) {
 	// The rejected ingest changed nothing: "b" still reads its memtable value.
 	got, err := db.Get([]byte("b"))
 	require.NoError(t, err)
-	assert.Equal(t, []byte("mem"), got)
+	assert.Equal(t, []byte("mem"), got.Value)
 }
 
 func TestSstWriterRejectsUnorderedKeys(t *testing.T) {
@@ -179,7 +179,7 @@ func TestSstIngestReopenPersists(t *testing.T) {
 	for _, kv := range [][2]string{{"x", "1"}, {"y", "2"}} {
 		got, err := db2.Get([]byte(kv[0]))
 		require.NoError(t, err, kv[0])
-		assert.Equal(t, []byte(kv[1]), got)
+		assert.Equal(t, []byte(kv[1]), got.Value)
 	}
 }
 
@@ -243,7 +243,7 @@ func TestRegressionIngestTombstoneGC(t *testing.T) {
 	require.NoError(t, db.backgroundError())
 	v, err := db.Get([]byte("k"))
 	if !errors.Is(err, ErrNotFound) {
-		t.Fatalf("ingested deletion lost during bottom compaction: value=%q err=%v", v, err)
+		t.Fatalf("ingested deletion lost during bottom compaction: value=%q err=%v", v.Value, err)
 	}
 }
 
@@ -326,7 +326,7 @@ func TestIngestedDeletionCompactionPreservesSnapshot(t *testing.T) {
 	require.NoError(t, db.eng.Compact(maxTierDepth, snapshot.Seq(), db.compactionConfig()))
 	v, err := snapshot.Get([]byte("k"))
 	require.NoError(t, err)
-	require.Equal(t, "old", string(v))
+	require.Equal(t, "old", string(v.Value))
 	_, err = db.Get([]byte("k"))
 	require.ErrorIs(t, err, ErrNotFound)
 	snapshot.Release()

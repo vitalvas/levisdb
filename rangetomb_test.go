@@ -20,7 +20,7 @@ func mustGetEq(t *testing.T, db *DB, key, want string) {
 	t.Helper()
 	got, err := db.Get([]byte(key))
 	require.NoErrorf(t, err, "key %q", key)
-	assert.Equalf(t, want, string(got), "key %q", key)
+	assert.Equalf(t, want, string(got.Value), "key %q", key)
 }
 
 func TestDeleteRangeBasic(t *testing.T) {
@@ -66,7 +66,7 @@ func TestDeleteRangeSnapshotUnaffected(t *testing.T) {
 
 	got, err := snap.Get([]byte("k"))
 	require.NoError(t, err, "snapshot taken before the range delete still sees the key")
-	assert.Equal(t, []byte("v"), got)
+	assert.Equal(t, []byte("v"), got.Value)
 }
 
 func TestDeleteRangeSurvivesFlush(t *testing.T) {
@@ -278,7 +278,7 @@ func TestDeleteRangeBottomReclaimRespectsSnapshot(t *testing.T) {
 
 	got, err := snap.Get([]byte("k"))
 	require.NoError(t, err, "snapshot below the range delete still sees the pre-delete value after compaction")
-	assert.Equal(t, []byte("v"), got)
+	assert.Equal(t, []byte("v"), got.Value)
 	mustNotFound(t, db, "k") // latest view: deleted
 }
 

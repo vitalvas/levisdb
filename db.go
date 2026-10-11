@@ -922,17 +922,26 @@ func (db *DB) DeleteRange(start, end []byte) error {
 	return db.Write(&b)
 }
 
-// Get returns the value for key at the latest committed sequence, or
-// ErrNotFound.
-func (db *DB) Get(key []byte) ([]byte, error) {
+// GetResult is the result of a read. Value is the user value; ExpiresAt is the
+// stored absolute expiry as a Unix-second timestamp, or 0 when the value has no
+// TTL (the same deadline a Put set via PutOptions.ExpiresAt). It is a struct so a
+// read can surface per-value metadata without widening the method signature.
+type GetResult struct {
+	Value     []byte
+	ExpiresAt int64
+}
+
+// Get returns the value for key, with its stored expiry, at the latest committed
+// sequence, or ErrNotFound when the key is absent, deleted, or expired.
+func (db *DB) Get(key []byte) (GetResult, error) {
 	db.mu.RLock()
 	if db.closed {
 		db.mu.RUnlock()
-		return nil, ErrClosed
+		return GetResult{}, ErrClosed
 	}
 	if len(key) == 0 {
 		db.mu.RUnlock()
-		return nil, ErrEmptyKey
+		return GetResult{}, ErrEmptyKey
 	}
 	// Keep the captured version alive until the lookup has acquired its read
 	// lock. Otherwise a concurrent write and compaction can reclaim this version
@@ -944,23 +953,23 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 }
 
 // getAt resolves key at a specific snapshot sequence.
-func (db *DB) getAt(seq uint64, key []byte) ([]byte, error) {
+func (db *DB) getAt(seq uint64, key []byte) (GetResult, error) {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 	if db.closed {
-		return nil, ErrClosed
+		return GetResult{}, ErrClosed
 	}
 	if len(key) == 0 {
-		return nil, ErrEmptyKey
+		return GetResult{}, ErrEmptyKey
 	}
-	v, found, deleted, err := db.eng.get(seq, key)
+	v, expiresAt, found, err := db.eng.getWithExpiry(seq, key)
 	if err != nil {
-		return nil, err
+		return GetResult{}, err
 	}
-	if !found || deleted {
-		return nil, ErrNotFound
+	if !found {
+		return GetResult{}, ErrNotFound
 	}
-	return v, nil
+	return GetResult{Value: v, ExpiresAt: expiresAt}, nil
 }
 
 // Has reports whether key exists at the latest committed sequence. It is

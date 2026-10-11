@@ -57,7 +57,7 @@ func TestBatchWriteThenCallerMayMutate(t *testing.T) {
 	value[0] = 'X' // mutate after Write; stored value must be unaffected
 	got, err := db.Get(key)
 	require.NoError(t, err)
-	assert.Equal(t, []byte("value"), got)
+	assert.Equal(t, []byte("value"), got.Value)
 }
 
 func TestBatchRetainsPutTTL(t *testing.T) {

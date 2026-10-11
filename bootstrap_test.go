@@ -46,7 +46,7 @@ func TestSnapshotWriteTo(t *testing.T) {
 		for i := 0; i < n; i++ {
 			got, gerr := follower.Get([]byte(fmt.Sprintf("k%05d", i)))
 			require.NoError(t, gerr, "i=%d", i)
-			assert.Equal(t, []byte(fmt.Sprintf("value-%05d", i)), got, "i=%d", i)
+			assert.Equal(t, []byte(fmt.Sprintf("value-%05d", i)), got.Value, "i=%d", i)
 		}
 	})
 
@@ -94,7 +94,7 @@ func TestSnapshotWriteTo(t *testing.T) {
 		// The plain key round-trips as a non-expiring value.
 		got, gerr := follower.Get([]byte("plain"))
 		require.NoError(t, gerr)
-		assert.Equal(t, []byte("v"), got)
+		assert.Equal(t, []byte("v"), got.Value)
 	})
 
 	t.Run("TailConsistency", func(t *testing.T) {
@@ -222,7 +222,7 @@ func TestSnapshotWriteToDir(t *testing.T) {
 		for i := 0; i < n; i++ {
 			got, gerr := follower.Get([]byte(fmt.Sprintf("k%05d", i)))
 			require.NoError(t, gerr, "i=%d", i)
-			assert.Equal(t, mkVal(i), got, "i=%d", i)
+			assert.Equal(t, mkVal(i), got.Value, "i=%d", i)
 		}
 	})
 

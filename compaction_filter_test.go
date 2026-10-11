@@ -18,9 +18,9 @@ func TestCompactionFilterKeepsAndDiscardsValues(t *testing.T) {
 		o.MemtableSize = 1 << 30
 		o.CompactionFilter = func(entry CompactionFilterEntry) bool {
 			seen = append(seen, CompactionFilterEntry{
-				Key:   append([]byte(nil), entry.Key...),
-				Value: append([]byte(nil), entry.Value...),
-				TTL:   entry.TTL,
+				Key:       append([]byte(nil), entry.Key...),
+				Value:     append([]byte(nil), entry.Value...),
+				ExpiresAt: entry.ExpiresAt,
 			})
 			keep := string(entry.Key) != "drop"
 			// Callback input is isolated from the merge buffers.
@@ -35,29 +35,29 @@ func TestCompactionFilterKeepsAndDiscardsValues(t *testing.T) {
 	require.NoError(t, db.eng.Flush())
 	require.NoError(t, db.Put(PutOptions{Key: []byte("drop"), Value: []byte("new")}))
 	require.NoError(t, db.Put(PutOptions{Key: []byte("keep"), Value: []byte("value")}))
-	require.NoError(t, db.Put(PutOptions{Key: []byte("ttl"), Value: []byte("temporary"), ExpiresAt: time.Now().Add(time.Hour).Unix()}))
+	ttlAt := time.Now().Add(time.Hour).Unix()
+	require.NoError(t, db.Put(PutOptions{Key: []byte("ttl"), Value: []byte("temporary"), ExpiresAt: ttlAt}))
 
 	require.NoError(t, db.CompactRange(nil, nil))
 	_, err := db.Get([]byte("drop"))
 	assert.ErrorIs(t, err, ErrNotFound)
 	value, err := db.Get([]byte("keep"))
 	require.NoError(t, err)
-	assert.Equal(t, []byte("value"), value)
+	assert.Equal(t, []byte("value"), value.Value)
 	value, err = db.Get([]byte("ttl"))
 	require.NoError(t, err)
-	assert.Equal(t, []byte("temporary"), value)
+	assert.Equal(t, []byte("temporary"), value.Value)
 
 	require.Len(t, seen, 3, "only the version selected for rewrite is filtered")
 	assert.Equal(t, []byte("drop"), seen[0].Key)
 	assert.Equal(t, []byte("new"), seen[0].Value)
-	assert.Zero(t, seen[0].TTL)
+	assert.Zero(t, seen[0].ExpiresAt)
 	assert.Equal(t, []byte("keep"), seen[1].Key)
 	assert.Equal(t, []byte("value"), seen[1].Value)
-	assert.Zero(t, seen[1].TTL)
+	assert.Zero(t, seen[1].ExpiresAt)
 	assert.Equal(t, []byte("ttl"), seen[2].Key)
 	assert.Equal(t, []byte("temporary"), seen[2].Value)
-	assert.Positive(t, seen[2].TTL)
-	assert.LessOrEqual(t, seen[2].TTL, time.Hour)
+	assert.Equal(t, ttlAt, seen[2].ExpiresAt, "filter sees the exact stored deadline")
 }
 
 func TestCompactionFilterTTLAtCompactionCutoff(t *testing.T) {
@@ -78,7 +78,7 @@ func TestCompactionFilterTTLAtCompactionCutoff(t *testing.T) {
 		require.NoError(t, s.CompactAll(maxIKeySeq, cc))
 		assert.Equal(t, []byte("key"), got.Key)
 		assert.Equal(t, []byte("value"), got.Value)
-		assert.Equal(t, 100*time.Second, got.TTL, "remaining lifetime is (expiresAt-cutoff) seconds")
+		assert.Equal(t, expiresAt, got.ExpiresAt, "filter sees the stored absolute deadline")
 
 		value, found, deleted, err := s.getAtTime(1, []byte("key"), expiresAt-1)
 		require.NoError(t, err)
@@ -245,10 +245,10 @@ func TestCompactionFilterDefersForSnapshot(t *testing.T) {
 	assert.Zero(t, calls.Load())
 	value, err := snapshot.Get([]byte("key"))
 	require.NoError(t, err)
-	assert.Equal(t, []byte("value"), value)
+	assert.Equal(t, []byte("value"), value.Value)
 	value, err = db.Get([]byte("key"))
 	require.NoError(t, err)
-	assert.Equal(t, []byte("value"), value)
+	assert.Equal(t, []byte("value"), value.Value)
 
 	snapshot.Release()
 	require.NoError(t, db.CompactRange(nil, nil))
@@ -358,7 +358,7 @@ func TestRegressionRetainedWALFilterCrash(t *testing.T) {
 	defer db.Close()
 	v, err := db.Get([]byte("k"))
 	if !errors.Is(err, ErrNotFound) {
-		t.Fatalf("filtered key resurrected after crash: value=%q err=%v", v, err)
+		t.Fatalf("filtered key resurrected after crash: value=%q err=%v", v.Value, err)
 	}
 }
 
@@ -396,7 +396,7 @@ func TestRegressionFilterCutoffIncludesLiveWAL(t *testing.T) {
 	defer db.Close()
 	v, err := db.Get([]byte("k"))
 	if !errors.Is(err, ErrNotFound) {
-		t.Fatalf("filtered key replayed from live WAL with retention disabled: value=%q err=%v", v, err)
+		t.Fatalf("filtered key replayed from live WAL with retention disabled: value=%q err=%v", v.Value, err)
 	}
 }
 

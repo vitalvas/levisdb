@@ -32,8 +32,8 @@ func TestPointReadPinsCapturedSequenceAgainstCompaction(t *testing.T) {
 			name: "Get",
 			read: func(db *DB) error {
 				value, err := db.Get([]byte("key"))
-				if err == nil && !bytes.Equal(value, []byte("old")) {
-					return fmt.Errorf("Get returned %q", value)
+				if err == nil && !bytes.Equal(value.Value, []byte("old")) {
+					return fmt.Errorf("Get returned %q", value.Value)
 				}
 				return err
 			},
@@ -123,8 +123,8 @@ func TestRecoverWALAcrossJournalFlushBoundary(t *testing.T) {
 	require.NoError(t, err)
 	gotB, err := db.Get([]byte("b"))
 	require.NoError(t, err)
-	assert.Equal(t, wantA, gotA)
-	assert.Equal(t, wantB, gotB)
+	assert.Equal(t, wantA, gotA.Value)
+	assert.Equal(t, wantB, gotB.Value)
 }
 
 // TestConcurrentWritersSurviveCrash guards against silent data loss when many
@@ -171,7 +171,7 @@ func TestConcurrentWritersSurviveCrash(t *testing.T) {
 			key := []byte(fmt.Sprintf("w%02d-k%05d", w, i))
 			got, gerr := db.Get(key)
 			require.NoErrorf(t, gerr, "lost key %s after crash+recovery", key)
-			assert.Equal(t, key, got)
+			assert.Equal(t, key, got.Value)
 		}
 	}
 }
@@ -313,7 +313,7 @@ func TestReadOnlyOpenDoesNotMutateRecoveryState(t *testing.T) {
 	require.NoError(t, err)
 	v, err := ro.Get([]byte("wal-only"))
 	require.NoError(t, err)
-	assert.Equal(t, []byte("value"), v)
+	assert.Equal(t, []byte("value"), v.Value)
 	require.NoError(t, ro.Close())
 
 	assert.Equal(t, before, fingerprintTree(t, dir))
@@ -352,11 +352,11 @@ func TestReadOnlyLargeWALReplayStaysInMemory(t *testing.T) {
 	for i := 0; i < 200; i++ {
 		value, err := ro.Get([]byte(fmt.Sprintf("key-%04d", i)))
 		require.NoError(t, err, i)
-		assert.Equal(t, []byte("value-payload"), value)
+		assert.Equal(t, []byte("value-payload"), value.Value)
 	}
 	value, err := ro.Get([]byte("changing"))
 	require.NoError(t, err)
-	assert.Equal(t, []byte("new"), value)
+	assert.Equal(t, []byte("new"), value.Value)
 	has, err := ro.Has([]byte("changing"))
 	require.NoError(t, err)
 	assert.True(t, has)
@@ -407,7 +407,7 @@ func TestWALCheckpointBoundsSegmentsAndSurvivesCrash(t *testing.T) {
 	for i := 0; i < 20; i++ {
 		got, err := db.Get([]byte(fmt.Sprintf("key-%02d", i)))
 		require.NoError(t, err)
-		assert.Equal(t, value, got)
+		assert.Equal(t, value, got.Value)
 	}
 }
 
@@ -924,8 +924,8 @@ func TestFailedRecoveryRemovesUnmanifestedTables(t *testing.T) {
 	require.NoError(t, err)
 	right, err := db.Get([]byte{0xff})
 	require.NoError(t, err)
-	assert.Equal(t, []byte("left"), left)
-	assert.Equal(t, []byte("right"), right)
+	assert.Equal(t, []byte("left"), left.Value)
+	assert.Equal(t, []byte("right"), right.Value)
 }
 
 func TestGetResultCannotMutateMemtable(t *testing.T) {
@@ -934,11 +934,11 @@ func TestGetResultCannotMutateMemtable(t *testing.T) {
 	require.NoError(t, db.Put(PutOptions{Key: []byte("key"), Value: []byte("value")}))
 	got, err := db.Get([]byte("key"))
 	require.NoError(t, err)
-	got[0] = 'X'
+	got.Value[0] = 'X'
 
 	again, err := db.Get([]byte("key"))
 	require.NoError(t, err)
-	assert.Equal(t, []byte("value"), again)
+	assert.Equal(t, []byte("value"), again.Value)
 }
 
 func TestReadOnlyLocksAreSharedAndExcludeWriter(t *testing.T) {
@@ -987,7 +987,7 @@ func TestWritableOpenRemovesOnlyOrphanCanonicalTables(t *testing.T) {
 	require.NoError(t, err)
 	value, err := db.Get([]byte("live"))
 	require.NoError(t, err)
-	assert.Equal(t, []byte("value"), value)
+	assert.Equal(t, []byte("value"), value.Value)
 	assert.NoFileExists(t, orphan)
 	assert.FileExists(t, nonCanonical)
 	assert.FileExists(t, unrelated)

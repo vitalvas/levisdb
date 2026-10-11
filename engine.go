@@ -423,11 +423,9 @@ func (s *engineT) pickVersion(seq uint64, key []byte, now int64) (versionPick, e
 }
 
 // getWithExpiry resolves key at seq and also reports the stored absolute TTL
-// deadline (0 for a non-TTL value), which Deduplication compares. A range
-// tombstone newer than the point version is not consulted here: a put whose key is
-// covered by a range delete is never treated as a duplicate (found stays false for
-// a shadowed value only when the point version itself is deleted/expired), so the
-// put proceeds, which is the safe direction.
+// deadline (0 for a non-TTL value). It backs Get (which surfaces ExpiresAt) and
+// Deduplication. A range tombstone newer than the point version shadows the key,
+// exactly as getAtTime does, so a range-deleted key reads as absent.
 func (s *engineT) getWithExpiry(seq uint64, key []byte) (value []byte, expiresAt int64, found bool, err error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -438,7 +436,18 @@ func (s *engineT) getWithExpiry(seq uint64, key []byte) (value []byte, expiresAt
 	if !best.found || best.deleted {
 		return nil, 0, false, nil
 	}
-	return best.value, best.expiresAt, true, nil
+	// A range tombstone visible at seq and newer than the point version deletes the
+	// key even when the point version itself is live.
+	rdSeq, rderr := s.maxCoveringRangeDelSeq(key, seq)
+	if rderr != nil {
+		return nil, 0, false, rderr
+	}
+	if rdSeq > best.seq {
+		return nil, 0, false, nil
+	}
+	// Copy out: best.value may alias a cached block or memtable buffer the caller
+	// must not retain or mutate.
+	return append([]byte(nil), best.value...), best.expiresAt, true, nil
 }
 
 func (s *engineT) getAtTime(seq uint64, key []byte, now int64) (value []byte, found, deleted bool, err error) {

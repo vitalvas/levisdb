@@ -150,7 +150,7 @@ func TestLoggingNilIsSafe(t *testing.T) {
 	require.NoError(t, db.Put(PutOptions{Key: []byte("k"), Value: []byte("v")}))
 	v, err := db.Get([]byte("k"))
 	require.NoError(t, err)
-	assert.Equal(t, []byte("v"), v)
+	assert.Equal(t, []byte("v"), v.Value)
 	require.NoError(t, db.Close())
 }
 

@@ -848,26 +848,24 @@ type mergeEntry struct {
 func resolveCompactionEntry(cc compactionConfigT, e mergeEntry, now int64) (writeKey, outValue []byte, outKind ikeyKind, err error) {
 	writeKey = e.ik
 	filterValue := e.value
-	var ttl time.Duration
+	var expiresAt int64
 	if e.kind == ikeyKindSetTTL {
-		decoded, expiresAt, derr := decodeExpiringValue(e.value)
+		decoded, exp, derr := decodeExpiringValue(e.value)
 		if derr != nil {
 			return nil, nil, 0, fmt.Errorf("compaction: %w", derr)
 		}
-		if expiresAt <= now {
+		if exp <= now {
 			return ikeyEncode(nil, e.user, e.seq, ikeyKindDelete), nil, ikeyKindDelete, nil
 		}
 		filterValue = decoded
-		// expiresAt and now are Unix seconds; the filter reports remaining lifetime
-		// as a duration.
-		ttl = time.Duration(expiresAt-now) * time.Second
+		expiresAt = exp
 	}
 	filterSafe := cc.FilterThrough == 0 || e.seq <= cc.FilterThrough
 	if e.kind != ikeyKindDelete && cc.Filter != nil && filterSafe {
 		keep, ferr := callCompactionFilter(cc.Filter, CompactionFilterEntry{
-			Key:   bytes.Clone(e.user),
-			Value: bytes.Clone(filterValue),
-			TTL:   ttl,
+			Key:       bytes.Clone(e.user),
+			Value:     bytes.Clone(filterValue),
+			ExpiresAt: expiresAt,
 		})
 		if ferr != nil {
 			return nil, nil, 0, ferr

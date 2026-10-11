@@ -38,7 +38,7 @@ func TestPutGetDelete(t *testing.T) {
 	require.NoError(t, db.Put(PutOptions{Key: []byte("hello"), Value: []byte("world")}))
 	v, err := db.Get([]byte("hello"))
 	require.NoError(t, err)
-	assert.Equal(t, []byte("world"), v)
+	assert.Equal(t, []byte("world"), v.Value)
 
 	require.NoError(t, db.Delete([]byte("hello")))
 	_, err = db.Get([]byte("hello"))
@@ -80,7 +80,7 @@ func TestDeduplicationSkipsUnchangedPuts(t *testing.T) {
 		assert.Equal(t, seq, db.LatestSeq(), "repeated identical puts add no WAL record")
 		v, err := db.Get([]byte("k"))
 		require.NoError(t, err)
-		assert.Equal(t, []byte("v"), v)
+		assert.Equal(t, []byte("v"), v.Value)
 	})
 
 	t.Run("a changed field writes", func(t *testing.T) {
@@ -109,7 +109,7 @@ func TestDeduplicationSkipsUnchangedPuts(t *testing.T) {
 		assert.Greater(t, db.LatestSeq(), seq)
 		v, err := db.Get([]byte("k"))
 		require.NoError(t, err)
-		assert.Equal(t, []byte("v"), v)
+		assert.Equal(t, []byte("v"), v.Value)
 	})
 }
 
@@ -120,7 +120,7 @@ func TestOverwrite(t *testing.T) {
 	require.NoError(t, db.Put(PutOptions{Key: []byte("k"), Value: []byte("v2")}))
 	v, err := db.Get([]byte("k"))
 	require.NoError(t, err)
-	assert.Equal(t, []byte("v2"), v)
+	assert.Equal(t, []byte("v2"), v.Value)
 }
 
 func TestManyKeysAndFlush(t *testing.T) {
@@ -136,7 +136,7 @@ func TestManyKeysAndFlush(t *testing.T) {
 		k := []byte(fmt.Sprintf("key%05d", i))
 		v, err := db.Get(k)
 		require.NoError(t, err, i)
-		assert.Equal(t, []byte(fmt.Sprintf("v%d", i)), v)
+		assert.Equal(t, []byte(fmt.Sprintf("v%d", i)), v.Value)
 	}
 }
 
@@ -153,7 +153,7 @@ func TestBatchAtomicApply(t *testing.T) {
 	assert.ErrorIs(t, err, ErrNotFound)
 	v, err := db.Get([]byte("b"))
 	require.NoError(t, err)
-	assert.Equal(t, []byte("2"), v)
+	assert.Equal(t, []byte("2"), v.Value)
 }
 
 func TestIteratorSorted(t *testing.T) {
@@ -235,7 +235,7 @@ func TestReadOnlyRejectsWrites(t *testing.T) {
 	// Reads still work.
 	v, err := rodb.Get([]byte("k"))
 	require.NoError(t, err)
-	assert.Equal(t, []byte("v"), v)
+	assert.Equal(t, []byte("v"), v.Value)
 }
 
 func TestReopenRestoresData(t *testing.T) {
@@ -264,7 +264,7 @@ func TestReopenRestoresData(t *testing.T) {
 	for i := 0; i < 100; i++ {
 		v, err := db2.Get([]byte(fmt.Sprintf("key%03d", i)))
 		require.NoError(t, err, i)
-		assert.Equal(t, []byte(fmt.Sprintf("v%d", i)), v)
+		assert.Equal(t, []byte(fmt.Sprintf("v%d", i)), v.Value)
 	}
 }
 
@@ -287,7 +287,7 @@ func TestNoSyncStillReadsBack(t *testing.T) {
 	for i := 0; i < 40; i++ {
 		v, err := db.Get([]byte(fmt.Sprintf("k%02d", i)))
 		require.NoError(t, err, i)
-		assert.Equal(t, []byte("v"), v)
+		assert.Equal(t, []byte("v"), v.Value)
 	}
 }
 
@@ -343,7 +343,7 @@ func TestConcurrentWrites(t *testing.T) {
 		for i := 0; i < 30; i++ {
 			v, err := db.Get([]byte(fmt.Sprintf("g%d-k%d", g, i)))
 			require.NoError(t, err)
-			assert.Equal(t, []byte("v"), v)
+			assert.Equal(t, []byte("v"), v.Value)
 		}
 	}
 }
@@ -663,7 +663,7 @@ func TestCompactRange(t *testing.T) {
 	for i := 15; i < 30; i++ {
 		v, err := db.Get([]byte(fmt.Sprintf("k%03d", i)))
 		require.NoError(t, err, i)
-		assert.Equal(t, []byte("v1"), v)
+		assert.Equal(t, []byte("v1"), v.Value)
 	}
 	for i := 0; i < 15; i++ {
 		_, err := db.Get([]byte(fmt.Sprintf("k%03d", i)))
@@ -732,7 +732,7 @@ func TestDBWithSmallFDLimit(t *testing.T) {
 	for i := 0; i < n; i++ {
 		v, err := db.Get([]byte(fmt.Sprintf("key%05d", i)))
 		require.NoError(t, err, i)
-		assert.Equal(t, []byte(fmt.Sprintf("v%d", i)), v)
+		assert.Equal(t, []byte(fmt.Sprintf("v%d", i)), v.Value)
 	}
 
 	db.fds.mu.Lock()
@@ -810,7 +810,7 @@ func TestWriteBackpressureHardStopReleasesAfterDrain(t *testing.T) {
 	assert.Positive(t, db.metrics.writeStalls.Load(), "hard stop recorded a stall")
 	v, err := db.Get([]byte("late"))
 	require.NoError(t, err)
-	assert.Equal(t, []byte("v"), v)
+	assert.Equal(t, []byte("v"), v.Value)
 }
 
 // TestWriteBackpressureFailsFastOnBackgroundError is a regression test: when a
@@ -886,7 +886,7 @@ func TestTombstoneTriggerNoLivelockWithHeldSnapshot(t *testing.T) {
 	// Sanity: the snapshot still reads the pre-delete values (retention worked).
 	v, err := snap.Get([]byte("k000"))
 	require.NoError(t, err)
-	assert.Equal(t, []byte("value-payload"), v)
+	assert.Equal(t, []byte("value-payload"), v.Value)
 	// And the live view sees the deletes.
 	_, err = db.Get([]byte("k000"))
 	assert.ErrorIs(t, err, ErrNotFound)
@@ -923,7 +923,7 @@ func TestEntryTooLargeRejected(t *testing.T) {
 	require.NoError(t, db.Put(PutOptions{Key: []byte("small"), Value: []byte("v")}))
 	v, err := db.Get([]byte("small"))
 	require.NoError(t, err)
-	assert.Equal(t, []byte("v"), v)
+	assert.Equal(t, []byte("v"), v.Value)
 }
 
 func TestBatchTooLargeRejected(t *testing.T) {
@@ -954,5 +954,5 @@ func TestBatchTooLargeRejected(t *testing.T) {
 	require.NoError(t, db.Write(&ok))
 	v, err := db.Get([]byte("a"))
 	require.NoError(t, err)
-	assert.Equal(t, []byte("v"), v)
+	assert.Equal(t, []byte("v"), v.Value)
 }

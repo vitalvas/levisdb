@@ -19,7 +19,7 @@
 //	if err := db.Put(levisdb.PutOptions{Key: []byte("k"), Value: []byte("v")}); err != nil {
 //		return err
 //	}
-//	v, err := db.Get([]byte("k")) // ErrNotFound if absent
+//	r, err := db.Get([]byte("k")) // ErrNotFound if absent; r.Value, r.ExpiresAt
 //
 // Always check the error from Close: it flushes committed writes and retires the
 // live WAL. If a background flush or compaction fails, subsequent writes fail and
@@ -150,8 +150,8 @@
 // iterator or snapshot captures one time at creation and holds it for the whole
 // scan, so a scan cannot have a key expire out from under it midway. Compaction
 // reclaims an expired value only once no live iterator's captured time still sees
-// it live. CompactionFilterEntry.TTL reports the remaining lifetime (a duration)
-// at the compaction cutoff, distinct from the absolute ExpiresAt a put takes.
+// it live. CompactionFilterEntry.ExpiresAt carries the value's absolute deadline
+// (the same Unix-second value a put set), 0 for a non-TTL value.
 //
 // # Deduplication
 //

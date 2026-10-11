@@ -121,7 +121,7 @@ func TestAsyncFlushPersists(t *testing.T) {
 	for i := 0; i < entries; i++ {
 		v, err := db.Get([]byte{byte(i), byte(i >> 8)})
 		require.NoError(t, err, i)
-		assert.Equal(t, []byte("v"), v)
+		assert.Equal(t, []byte("v"), v.Value)
 	}
 }
 
