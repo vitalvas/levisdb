@@ -41,12 +41,12 @@ sequenceDiagram
     participant SCHED as Scheduler
     C->>DB: Write(batch)
     DB->>DB: throttle if L0 backlog high
-    DB->>WAL: append + group-commit fsync (unless NoSync)
+    DB->>WAL: append, group-commit fsync (unless NoSync)
     WAL->>MEM: apply entries, publish readSeq
     DB-->>C: return (durable, or bounded by WALSyncInterval)
-    Note over MEM,SCHED: memtable full -> seal immutable -> signal
+    Note over MEM,SCHED: memtable full, seal immutable, signal
     SCHED->>MEM: flush immutable to an L0 table
-    SCHED->>SCHED: compact ready tiers; checkpoint + retire WAL
+    SCHED->>SCHED: compact ready tiers, checkpoint, retire WAL
 ```
 
 ### Read path
@@ -595,7 +595,7 @@ already-flushed tables is fine.
 stateDiagram-v2
     [*] --> Live: open / rotate
     Live --> Live: append (group commit)
-    Live --> Retiring: size >= WALSegmentBytes or a flush
+    Live --> Retiring: reaches WALSegmentBytes or a flush
     Retiring --> Retired: flush captures records, manifest records boundary
     Retired --> Deleted: retention off
     Retired --> Reaped: retention on, past age/size horizon
