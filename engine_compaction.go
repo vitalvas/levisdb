@@ -972,9 +972,12 @@ func (s *compactionSink) add(key, value []byte) error {
 // several MiB, enough to push a file meant to fit an allocation budget over it.
 // bytesWritten counts only flushed
 // blocks, so a table always holds at least one full block before it can roll (it
-// never produces an almost-empty SST); the current in-memory block adds at most
-// one blockSize of overshoot. Called at user-key boundaries, so a key's versions
-// never split across tables.
+// never produces an almost-empty SST). The not-yet-flushed current block adds some
+// overshoot past the target: at most one blockSize when every value fits in a
+// block, but up to one whole value when a value exceeds blockSize (a value is never
+// split across blocks or files), so a large-value table can finish moderately over
+// target. Called at user-key boundaries, so a key's versions never split across
+// tables.
 func (s *compactionSink) rollIfNeeded() error {
 	if s.out != nil && s.out.w.bytesWritten()+s.out.w.estimatedTrailerBytes() >= s.target {
 		return s.finish()
