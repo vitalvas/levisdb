@@ -357,6 +357,14 @@ trigger bounds read amplification when a few large tables would otherwise sit be
 the count threshold uncompacted; it needs at least two tables in the tier, so a
 lone table is never merged alone. A negative `TierByteTrigger` disables it.
 
+Below L0 both triggers additionally require real key overlap in the tier (unless
+`DisableOverlapSelection` is set). Merging disjoint tables, each already the sole
+table for its key range, reclaims nothing and only rewrites the data one tier
+deeper, so a tier of disjoint tables is left alone. This matters for append-only
+monotonic keys (such as block or index data), where every flush lands a disjoint
+range: without the overlap gate they would cascade through every tier for no
+benefit. L0 always drains regardless of overlap, to bound read amplification.
+
 A non-bottom compaction merges only the largest group of key-overlapping tables in
 the tier (overlap-scoped selection), not the whole tier, so unrelated key ranges
 are not rewritten and a lookup touches at most one output table per non-overlapping

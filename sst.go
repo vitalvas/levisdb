@@ -255,7 +255,7 @@ func (db *DB) IngestExternalFile(path string) error {
 
 	install := func() {
 		db.eng.mu.Lock()
-		db.eng.tables = append(db.eng.tables, meta)
+		db.eng.setTables(append(db.eng.tables, meta))
 		db.eng.mu.Unlock()
 	}
 	if err := db.commitTableChange(nil, []*tableMeta{meta}, install); err != nil {

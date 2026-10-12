@@ -145,7 +145,11 @@ type engineT struct {
 	// recovery SSTables into a database that promised not to mutate.
 	recoveryMems []*memtableT
 	tables       []*tableMeta // file-creation order; compaction means this is not version order
-	seed         int64
+	// index is a per-level sorted view of tables for O(log n) point-lookup candidate
+	// selection; rebuilt from tables under mu at every mutation. Never nil after the
+	// first setTables; guarded by mu like tables.
+	index *levelIndex
+	seed  int64
 
 	// flushMu serializes Flush and Compact so at most one runs at a time; the
 	// finer mu guards the fields those operations read and swap.
@@ -190,7 +194,25 @@ func newEngine(cfg engineConfigT, alloc fileAllocator, tablePath func(uint32) (s
 		tablePath: tablePath,
 		mem:       newMemtable(engineSeed),
 		seed:      engineSeed,
+		// Non-nil so a read before the first setTables (empty DB) has a valid, empty
+		// index to visit rather than a nil deref.
+		index: buildLevelIndex(nil),
 	}
+}
+
+// setTables replaces the live table set and rebuilds the level index in lockstep.
+// The caller must hold s.mu for writing. Every mutation of s.tables goes through
+// here so the index never drifts from the authoritative slice.
+func (s *engineT) setTables(tables []*tableMeta) {
+	s.tables = tables
+	s.index = buildLevelIndex(tables)
+}
+
+// rebuildIndex rebuilds the level index from the current tables. restoreTables
+// appends many tables raw (to avoid an O(n^2) rebuild per table) and calls this
+// once at the end. The caller must hold s.mu for writing.
+func (s *engineT) rebuildIndex() {
+	s.index = buildLevelIndex(s.tables)
 }
 
 // Put buffers a set into the active memtable at seq.
@@ -420,31 +442,38 @@ func (s *engineT) pickVersion(seq uint64, key []byte, now int64) (versionPick, e
 	// a new file after newer shallow-tier tables. Inspect every overlapping table
 	// and select the greatest visible sequence rather than returning the newest
 	// file's first match.
+	// The level index yields only the tables whose recorded key range can contain
+	// key (all of L0, plus the single disjoint candidate per sorted level), so this
+	// is O(log n) per level rather than a scan of every table.
 	probes, bloomFP := int64(0), int64(0)
-	for _, table := range s.tables {
-		// Skip a table whose recorded key range cannot hold key, avoiding a bloom
-		// probe and a possible false-positive block seek on the target disk.
-		if !table.mayContain(key) {
-			continue
-		}
+	var mergeErr error
+	visitErr := s.index.candidates(key, func(table *tableMeta) error {
 		probes++
 		r, gerr := table.reader.lookupAtTime(key, seq, now, false)
 		if gerr != nil {
-			return versionPick{}, gerr
+			return gerr
 		}
 		if r.bloomPassed && !r.found {
 			bloomFP++ // bloom admitted the key, the block read found nothing: wasted I/O
 		}
 		if !r.found {
-			continue
+			return nil
 		}
 		if err := best.merge(r.value, r.versionSeq, r.deleted, r.expiresAt, "table"); err != nil {
-			return versionPick{}, err
+			mergeErr = err
+			return err
 		}
-	}
+		return nil
+	})
 	s.pointReads.Add(1)
 	s.tableProbes.Add(probes)
 	s.bloomFalsePositives.Add(bloomFP)
+	if mergeErr != nil {
+		return versionPick{}, mergeErr
+	}
+	if visitErr != nil {
+		return versionPick{}, visitErr
+	}
 	return best, nil
 }
 
@@ -575,33 +604,40 @@ func (s *engineT) hasAtTime(seq uint64, key []byte, now int64) (found, deleted b
 			}
 		}
 	}
+	// Only the tables whose key range can contain key, via the level index.
 	probes, bloomFP := int64(0), int64(0)
-	for _, table := range s.tables {
-		if !table.mayContain(key) {
-			continue
-		}
+	var conflictErr error
+	visitErr := s.index.candidates(key, func(table *tableMeta) error {
 		probes++
 		vseq, f, d, bloomPassed, gerr := table.reader.hasVersionAtTime(key, seq, now)
 		if gerr != nil {
-			return false, false, gerr
+			return gerr
 		}
 		if bloomPassed && !f {
 			bloomFP++
 		}
 		if !f {
-			continue
+			return nil
 		}
 		if !bestFound || vseq > bestSeq {
 			bestSeq, bestFound, bestDeleted = vseq, true, d
-			continue
+			return nil
 		}
 		if vseq == bestSeq && d != bestDeleted {
-			return false, false, fmt.Errorf("table: conflicting kinds for key at sequence %d", vseq)
+			conflictErr = fmt.Errorf("table: conflicting kinds for key at sequence %d", vseq)
+			return conflictErr
 		}
-	}
+		return nil
+	})
 	s.pointReads.Add(1)
 	s.tableProbes.Add(probes)
 	s.bloomFalsePositives.Add(bloomFP)
+	if conflictErr != nil {
+		return false, false, conflictErr
+	}
+	if visitErr != nil {
+		return false, false, visitErr
+	}
 	// A range tombstone newer than the best point version deletes the key.
 	if bestFound && !bestDeleted {
 		rdSeq, rderr := s.maxCoveringRangeDelSeq(key, seq)
@@ -701,7 +737,7 @@ func (s *engineT) Flush() error {
 
 	install := func() {
 		s.mu.Lock()
-		s.tables = append(s.tables, meta)
+		s.setTables(append(s.tables, meta))
 		s.imm = nil
 		s.mu.Unlock()
 	}
@@ -871,6 +907,6 @@ func (s *engineT) Close() error {
 			firstErr = err
 		}
 	}
-	s.tables = nil
+	s.setTables(nil)
 	return firstErr
 }

@@ -1600,7 +1600,7 @@ func (db *DB) compactOnce(s *engineT) bool {
 	if db.snaps.oldest(db.readSeq.Load()) < db.readSeq.Load() {
 		tombstoneRatio = 0
 	}
-	depth := s.pickCompaction(db.opts.TierRatio, db.opts.TierByteTrigger, tombstoneRatio)
+	depth := s.pickCompaction(db.opts.TierRatio, db.opts.TierByteTrigger, tombstoneRatio, !db.opts.DisableOverlapSelection)
 	if depth < 0 {
 		return false
 	}

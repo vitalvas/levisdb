@@ -85,31 +85,43 @@ type compactionConfigT struct {
 // count threshold), OR (when tombstoneRatio > 0) when it holds >= 2 tables and
 // its tombstone fraction meets tombstoneRatio (reclaim delete-heavy tiers early).
 // The shallowest ready tier is chosen so fresh data is merged first.
-func (s *engineT) pickCompaction(ratio int, byteTrigger int64, tombstoneRatio float64) int {
+//
+// Below L0, the count and byte triggers additionally require real key overlap in
+// the tier: merging disjoint tables (each already the sole table for its key
+// range) reclaims nothing and only rewrites data one tier deeper. Append-only
+// monotonic keys produce exactly such disjoint tables, so without this a flush of
+// unrelated ranges would cascade through every tier for zero reclaim. L0 is
+// exempt (its tables always count, since fresh flushes routinely overlap and must
+// be drained), and the tombstone trigger is exempt (it reclaims deletes, not
+// overlap). Overlap gating is off when OverlapSelection is disabled.
+func (s *engineT) pickCompaction(ratio int, byteTrigger int64, tombstoneRatio float64, overlapGate bool) int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	counts := map[int]int{}
-	bytes := map[int]int64{}
+	byDepth := map[int][]*tableMeta{}
 	entries := map[int]int{}
 	tombstones := map[int]int{}
 	for _, t := range s.tables {
-		counts[t.depth]++
-		bytes[t.depth] += t.size
+		byDepth[t.depth] = append(byDepth[t.depth], t)
 		entries[t.depth] += t.entries
 		tombstones[t.depth] += t.tombstones
 	}
 	best := -1
 	capDepth := resolveMaxDepth(s.cfg.MaxLevels)
-	for depth, c := range counts {
+	for depth, tbls := range byDepth {
+		c := len(tbls)
+		var bytes int64
+		for _, t := range tbls {
+			bytes += t.size
+		}
 		// The cap tier (capDepth) is terminal: there is no deeper tier to push to,
 		// and re-merging its distinct data by count or bytes reclaims nothing and
 		// would loop forever. Only a tombstone/overwrite-heavy cap tier is worth
 		// compacting there, because that genuinely shrinks it.
 		ready := false
-		if depth < capDepth {
+		if depth < capDepth && tierHasOverlapToResolve(depth, tbls, overlapGate) {
 			ready = c >= ratio
 			if !ready && byteTrigger > 0 && c >= 2 {
-				ready = bytes[depth] >= byteTrigger
+				ready = bytes >= byteTrigger
 			}
 		}
 		if !ready && tombstoneRatio > 0 && c >= 2 && entries[depth] > 0 {
@@ -120,6 +132,27 @@ func (s *engineT) pickCompaction(ratio int, byteTrigger int64, tombstoneRatio fl
 		}
 	}
 	return best
+}
+
+// tierHasOverlapToResolve reports whether compacting this tier by count/bytes
+// would actually resolve key overlap. L0 always qualifies (fresh flushes overlap
+// and must drain). Below L0, with overlap selection on, a tier qualifies only
+// when some key range is covered by two or more tables -- i.e. at least one
+// overlap group holds >= 2 tables. A tier of fully disjoint tables is already
+// optimal (one table per range) and merging it reclaims nothing, so it is left
+// alone, which is what stops disjoint append-only data from cascading down every
+// tier. gate is false when overlap selection is disabled, which restores the
+// unconditional count/byte triggers.
+func tierHasOverlapToResolve(depth int, tbls []*tableMeta, gate bool) bool {
+	if depth == 0 || !gate {
+		return true
+	}
+	for _, group := range overlapSets(tbls) {
+		if len(group) >= 2 {
+			return true
+		}
+	}
+	return false
 }
 
 // compactionResult reports what the most recent compaction did, for logging.
@@ -591,7 +624,7 @@ func (s *engineT) commitCompaction(inputs, metas []*tableMeta) error {
 			}
 		}
 		kept = append(kept, metas...)
-		s.tables = kept
+		s.setTables(kept)
 		s.mu.Unlock()
 	}
 	if s.cfg.Commit != nil {

@@ -42,6 +42,14 @@
 // table is never merged alone. A negative TierByteTrigger or
 // TombstoneCompactionRatio disables that trigger, leaving the others.
 //
+// Below L0 the count and density triggers additionally require real key overlap in
+// the tier (unless DisableOverlapSelection is set): merging disjoint tables, each
+// already the sole table for its key range, reclaims nothing and only rewrites the
+// data one tier deeper. Append-only monotonic keys produce exactly such disjoint
+// tables, so this stops a flush of unrelated ranges from cascading through every
+// tier for no benefit. L0 always drains regardless of overlap (to bound read
+// amplification), and the tombstone trigger is unaffected (it reclaims deletes).
+//
 // Target file size grows with tier depth,
 //
 //	target(d) = min(FileSizeBase * FileSizeMultiplier^d, FileSizeMax)

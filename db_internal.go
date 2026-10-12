@@ -194,7 +194,7 @@ func (db *DB) restoreTables(state *manifestState) error {
 		if info.Size() != t.Size {
 			return fmt.Errorf("manifest: table %d size mismatch: recorded %d, actual %d", t.Num, t.Size, info.Size())
 		}
-		if err := db.eng.openTable(tableSpec{
+		if err := db.eng.openTableDeferred(tableSpec{
 			num:        t.Num,
 			depth:      t.Depth,
 			path:       path,
@@ -207,6 +207,10 @@ func (db *DB) restoreTables(state *manifestState) error {
 			return err
 		}
 	}
+	// openTable appended each table raw; build the level index once now.
+	db.eng.mu.Lock()
+	db.eng.rebuildIndex()
+	db.eng.mu.Unlock()
 	return nil
 }
 

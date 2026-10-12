@@ -38,8 +38,21 @@ func (s *engineT) Tables() []tableSnapshotT {
 // used to restore state from the manifest on open. Tables are installed in
 // ascending file-number order for deterministic snapshots; reads compare the
 // visible sequence because compaction file order is not data recency. A zero
-// spec.size is resolved by stat.
+// spec.size is resolved by stat. The level index is rebuilt so reads work
+// immediately; bulk restore uses openTableDeferred to amortize the rebuild.
 func (s *engineT) openTable(spec tableSpec) error {
+	return s.openTableInto(spec, true)
+}
+
+// openTableDeferred installs a table without rebuilding the level index, for bulk
+// restore that appends many tables and calls rebuildIndex once at the end,
+// avoiding an O(n^2 log n) rebuild per table. Reads must not run until the caller
+// rebuilds the index.
+func (s *engineT) openTableDeferred(spec tableSpec) error {
+	return s.openTableInto(spec, false)
+}
+
+func (s *engineT) openTableInto(spec tableSpec, rebuild bool) error {
 	if spec.size == 0 {
 		info, serr := os.Stat(spec.path)
 		if serr != nil {
@@ -53,6 +66,9 @@ func (s *engineT) openTable(spec tableSpec) error {
 	}
 	s.mu.Lock()
 	s.tables = append(s.tables, meta)
+	if rebuild {
+		s.rebuildIndex()
+	}
 	s.mu.Unlock()
 	return nil
 }

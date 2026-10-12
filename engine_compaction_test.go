@@ -29,7 +29,7 @@ func TestPickCompactionCapTierIsTerminal(t *testing.T) {
 	}
 	s.mu.Unlock()
 	t.Cleanup(func() { s.mu.Lock(); s.tables = nil; s.mu.Unlock() })
-	assert.Equal(t, -1, s.pickCompaction(4, 1<<10, 0),
+	assert.Equal(t, -1, s.pickCompaction(4, 1<<10, 0, true),
 		"cap tier must not be picked by count or bytes (terminal, would loop)")
 
 	// A cap tier that is tombstone-heavy IS worth compacting (it shrinks).
@@ -38,7 +38,7 @@ func TestPickCompactionCapTierIsTerminal(t *testing.T) {
 		tb.tombstones = tb.entries // all deletes
 	}
 	s.mu.Unlock()
-	assert.Equal(t, maxTierDepth, s.pickCompaction(4, 0, 0.5),
+	assert.Equal(t, maxTierDepth, s.pickCompaction(4, 0, 0.5, true),
 		"tombstone-heavy cap tier is still reclaimed")
 
 	// A tier BELOW the cap with >= ratio tables is picked by count as usual.
@@ -49,7 +49,7 @@ func TestPickCompactionCapTierIsTerminal(t *testing.T) {
 	}
 	s2.mu.Unlock()
 	t.Cleanup(func() { s2.mu.Lock(); s2.tables = nil; s2.mu.Unlock() })
-	assert.Equal(t, maxTierDepth-1, s2.pickCompaction(4, 0, 0),
+	assert.Equal(t, maxTierDepth-1, s2.pickCompaction(4, 0, 0, true),
 		"a non-cap tier at the count ratio is still picked")
 }
 
@@ -300,14 +300,14 @@ func TestPickCompaction(t *testing.T) {
 	s := newTestEngine(t, 1<<20)
 
 	t.Run("nothing ready", func(t *testing.T) {
-		assert.Equal(t, -1, s.pickCompaction(2, 0, 0))
+		assert.Equal(t, -1, s.pickCompaction(2, 0, 0, true))
 	})
 
 	t.Run("ready at ratio", func(t *testing.T) {
 		flushSingle(t, s, 1, "a", "1")
-		assert.Equal(t, -1, s.pickCompaction(2, 0, 0), "one table below ratio")
+		assert.Equal(t, -1, s.pickCompaction(2, 0, 0, true), "one table below ratio")
 		flushSingle(t, s, 2, "b", "2")
-		assert.Equal(t, 0, s.pickCompaction(2, 0, 0), "two L0 tables meet ratio 2")
+		assert.Equal(t, 0, s.pickCompaction(2, 0, 0, true), "two L0 tables meet ratio 2")
 	})
 }
 
@@ -351,7 +351,7 @@ func TestPickCompactionLargeTableStall(t *testing.T) {
 
 	require.Equal(t, tables, depth0, "each Flush produced one L0 table")
 	assert.Greater(t, bytes, int64(1<<20), "the tier holds well over a MiB")
-	assert.Equal(t, -1, s.pickCompaction(4, 0, 0),
+	assert.Equal(t, -1, s.pickCompaction(4, 0, 0, true),
 		"count-based picker stalls: a few large tables never reach the ratio")
 }
 
@@ -376,8 +376,8 @@ func TestPickCompactionDensityTrigger(t *testing.T) {
 		s.mu.RUnlock()
 
 		// Count trigger alone still stalls; the density trigger fires.
-		assert.Equal(t, -1, s.pickCompaction(4, 0, 0), "count trigger stalls")
-		assert.Equal(t, 0, s.pickCompaction(4, bytes, 0),
+		assert.Equal(t, -1, s.pickCompaction(4, 0, 0, true), "count trigger stalls")
+		assert.Equal(t, 0, s.pickCompaction(4, bytes, 0, true),
 			"density trigger picks the tier once its bytes reach the threshold")
 	})
 
@@ -385,7 +385,7 @@ func TestPickCompactionDensityTrigger(t *testing.T) {
 		s := newTestEngine(t, 1<<30)
 		flushSingle(t, s, 1, "a", "1")
 		flushSingle(t, s, 2, "b", "2") // two tiny tables, well under any real trigger
-		assert.Equal(t, -1, s.pickCompaction(4, 1<<30, 0),
+		assert.Equal(t, -1, s.pickCompaction(4, 1<<30, 0, true),
 			"a couple of tiny tables are below the byte trigger")
 	})
 
@@ -395,7 +395,7 @@ func TestPickCompactionDensityTrigger(t *testing.T) {
 		s.mu.RLock()
 		bytes := s.tables[0].size
 		s.mu.RUnlock()
-		assert.Equal(t, -1, s.pickCompaction(4, bytes, 0),
+		assert.Equal(t, -1, s.pickCompaction(4, bytes, 0, true),
 			"byte trigger requires >= 2 tables, so a lone table is left")
 	})
 }
@@ -876,7 +876,7 @@ func BenchmarkPickCompaction(b *testing.B) {
 	}
 	b.ResetTimer()
 	for n := 0; n < b.N; n++ {
-		_ = s.pickCompaction(4, 128<<20, 0.5)
+		_ = s.pickCompaction(4, 128<<20, 0.5, true)
 	}
 }
 
@@ -1130,16 +1130,16 @@ func TestTombstoneRatioTriggersCompaction(t *testing.T) {
 
 	// 4 tombstones / 6 entries ~= 0.67. Below the count threshold, only the
 	// tombstone trigger can mark this tier ready.
-	assert.Equal(t, -1, s.pickCompaction(1000, 0, 0), "no trigger without tombstone ratio")
-	assert.Equal(t, -1, s.pickCompaction(1000, 0, 0.9), "ratio too high to trigger")
-	assert.Equal(t, 0, s.pickCompaction(1000, 0, 0.5), "delete-heavy tier triggers at 0.5")
+	assert.Equal(t, -1, s.pickCompaction(1000, 0, 0, true), "no trigger without tombstone ratio")
+	assert.Equal(t, -1, s.pickCompaction(1000, 0, 0.9, true), "ratio too high to trigger")
+	assert.Equal(t, 0, s.pickCompaction(1000, 0, 0.5, true), "delete-heavy tier triggers at 0.5")
 
 	// A single table cannot compact alone even if delete-heavy (needs >= 2).
 	s2 := newTestEngine(t, 1<<20)
 	defer s2.Close()
 	s2.del(1, []byte("x"))
 	require.NoError(t, s2.Flush())
-	assert.Equal(t, -1, s2.pickCompaction(1000, 0, 0.1), "single table not compacted alone")
+	assert.Equal(t, -1, s2.pickCompaction(1000, 0, 0.1, true), "single table not compacted alone")
 }
 
 func TestTombstoneCompactionReclaimsDeletedSpace(t *testing.T) {
@@ -1164,7 +1164,7 @@ func TestTombstoneCompactionReclaimsDeletedSpace(t *testing.T) {
 
 	// Count trigger off (high ratio), tombstone trigger on: the picker must select
 	// the delete-heavy depth-0 tier.
-	depth := s.pickCompaction(1000, 0, 0.5)
+	depth := s.pickCompaction(1000, 0, 0.5, true)
 	require.Equal(t, 0, depth, "tombstone trigger must select the delete-heavy tier")
 
 	// Compact it to the bottom (retainSeq high so tombstones are reclaimable).
