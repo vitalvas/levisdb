@@ -318,8 +318,9 @@ maxFileBytes int64) ([]string, uint64, error)` (same, rolled into bounded files
 for a large database), `Seq() uint64`, `Release()`.
 
 `Iterator` (interface): `Next() bool`, `Key() []byte`, `Value() []byte`,
-`Error() error`, `Close() error`. Key and value slices are valid only until the
-next `Next`; copy to retain.
+`ExpiresAt() int64`, `Error() error`, `Close() error`. Key and value slices are
+valid only until the next `Next`; copy to retain. `ExpiresAt` is the current
+entry's absolute deadline (Unix seconds), or 0 when it has no TTL.
 
 Codec constants `CodecNone`, `CodecS2`, `CodecZstd`, and `CodecFlate` name the
 built-in compression codecs in `Options`.

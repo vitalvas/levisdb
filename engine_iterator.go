@@ -157,7 +157,7 @@ func (it *engineIterator) Next() bool {
 		// Return the merge iterator's buffers directly rather than copying: they are
 		// stable until this iterator advances again (it.merge.Next in the loop
 		// above), which is exactly the "valid until the next Next" contract Key and
-		// Value promise. The dbIterator wraps this and copies out before it
+		// Value promise. The DBIterator wraps this and copies out before it
 		// advances, so the public value the caller sees is still stable.
 		it.key = user
 		it.value = value

@@ -86,6 +86,28 @@ func TestDBIteratorReflectsDeletes(t *testing.T) {
 	assert.Equal(t, []string{"a", "c", "d"}, keys, "deleted key absent from scan")
 }
 
+func TestDBIteratorExposesExpiresAt(t *testing.T) {
+	t.Parallel()
+	db := openIterDB(t)
+
+	const future = 1 << 40 // far enough ahead to never expire during the test
+	require.NoError(t, db.Put(PutOptions{Key: []byte("plain"), Value: []byte("v")}))
+	require.NoError(t, db.Put(PutOptions{Key: []byte("ttl"), Value: []byte("v"), ExpiresAt: future}))
+
+	it, err := db.NewIterator()
+	require.NoError(t, err)
+	t.Cleanup(func() { it.Close() })
+
+	got := map[string]int64{}
+	for it.Next() {
+		got[string(it.Key())] = it.ExpiresAt()
+	}
+	require.NoError(t, it.Error())
+
+	assert.Equal(t, int64(0), got["plain"], "a non-TTL entry reports 0")
+	assert.Equal(t, int64(future), got["ttl"], "a TTL entry reports its exact stored deadline")
+}
+
 func TestDBRangeIteratorBoundsDistinguishNilAndEmpty(t *testing.T) {
 	t.Parallel()
 	db := openIterDB(t)

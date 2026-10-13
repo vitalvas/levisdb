@@ -15,7 +15,7 @@ import (
 // openImageScan pins the snapshot's read view (both the sequence and the
 // wall-clock TTL view) and returns an engine iterator over the whole keyspace at
 // that view, plus a release func the caller must defer. It mirrors the ritual
-// Snapshot.NewRangeIterator + dbIterator perform; because WriteTo bypasses the
+// Snapshot.NewRangeIterator + DBIterator perform; because WriteTo bypasses the
 // public iterator to read ValueExpiresAt, it must acquire and release those pins
 // itself. Returns ErrClosed if the database is closed.
 func (s *Snapshot) openImageScan() (*engineIterator, func(), error) {

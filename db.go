@@ -181,6 +181,10 @@ type Iterator interface {
 	// Value returns the current value. The slice is valid only until the next call
 	// to Next or Close; copy it to retain.
 	Value() []byte
+	// ExpiresAt returns the absolute expiration (Unix seconds) of the current entry,
+	// or 0 when it has no TTL. Mirrors GetResult.ExpiresAt and WALEntry.ExpiresAt so
+	// a scan preserves the exact deadline, not a value re-derived from the wall clock.
+	ExpiresAt() int64
 	// Error returns any error accumulated during iteration.
 	Error() error
 	// Close releases the iterator.
