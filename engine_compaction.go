@@ -643,6 +643,16 @@ func capCompactionInputs(inputs []*tableMeta, maxBytes int64) []*tableMeta {
 // commitCompaction records the replacement durably before installing it in
 // memory and removing the source files. A crash therefore sees either the old
 // manifest and all old inputs, or the new manifest and the complete output.
+// ponytail: live-blob GC deferred. Compaction can drop the last table that
+// referenced a blob (an overwritten or deleted large value), leaving that blob's
+// bytes unreclaimed until the next whole-database rebuild. Crash-safety and orphan
+// reclaim of never-committed blobs are handled (commitBlobAdd / cleanupBlobs); what
+// is missing is reclaiming a blob that is manifest-live but no longer pointed to.
+// For a write-once value-separation workload (the common case) almost no blob ever
+// dies, so this is acceptable for v1. Upgrade path: track per-blob live-reference
+// counts (decrement as referencing tables are dropped in commitCompaction) and emit
+// a blob-delete manifest record plus removeFileDurable when a count reaches zero,
+// mirroring the table releaseOwner(true)-after-commit ordering.
 func (s *engineT) commitCompaction(inputs, metas []*tableMeta) error {
 	install := func() {
 		s.mu.Lock()
@@ -879,7 +889,7 @@ func (s *engineT) writeMerged(mw mergeWrite) ([]*tableMeta, mergeStats, error) {
 			sink.dropped++
 			continue
 		}
-		writeKey, value, kind, err := resolveCompactionEntry(mw.cc, mergeEntry{
+		writeKey, value, kind, err := resolveCompactionEntry(s, mw.cc, mergeEntry{
 			ik:    ik,
 			user:  user,
 			value: value,
@@ -946,7 +956,8 @@ type sameSeqEntry struct {
 // Any other kind or value mismatch is a corruption and returns an error.
 func checkSameSeqDuplicate(e sameSeqEntry) error {
 	if e.kind != e.lastKind {
-		_, expiredValue, expiredKind, expiryErr := resolveCompactionEntry(compactionConfigT{}, mergeEntry{
+		// Empty config: no filter, so no blob resolution is needed here (nil engine).
+		_, expiredValue, expiredKind, expiryErr := resolveCompactionEntry(nil, compactionConfigT{}, mergeEntry{
 			ik:    e.ik,
 			user:  e.user,
 			value: e.lastValue,
@@ -976,10 +987,32 @@ type mergeEntry struct {
 // resolveCompactionEntry applies TTL expiry and the optional compaction filter
 // to one entry, returning the key/value/kind to write. An expired TTL value or a
 // value the filter rejects becomes a tombstone. now is the expiry cutoff.
-func resolveCompactionEntry(cc compactionConfigT, e mergeEntry, now int64) (writeKey, outValue []byte, outKind ikeyKind, err error) {
+func resolveCompactionEntry(eng *engineT, cc compactionConfigT, e mergeEntry, now int64) (writeKey, outValue []byte, outKind ikeyKind, err error) {
 	writeKey = e.ik
 	filterValue := e.value
 	var expiresAt int64
+	blob := e.kind == ikeyKindBlobRef
+	if blob {
+		// The value is a blob pointer, not inline bytes. Check TTL expiry from the
+		// pointer (no blob read needed); an expired entry becomes a tombstone and its
+		// blob is reclaimed by GC. When a filter runs, resolve the blob to real bytes
+		// so the filter sees the value, not the pointer.
+		ptr, derr := decodeBlobPointer(e.value)
+		if derr != nil {
+			return nil, nil, 0, fmt.Errorf("compaction: %w", derr)
+		}
+		if ptr.expiresAt != 0 && ptr.expiresAt <= now {
+			return ikeyEncode(nil, e.user, e.seq, ikeyKindDelete), nil, ikeyKindDelete, nil
+		}
+		expiresAt = ptr.expiresAt
+		if cc.Filter != nil && (cc.FilterThrough == 0 || e.seq <= cc.FilterThrough) {
+			resolved, rerr := eng.resolveBlob(ptr)
+			if rerr != nil {
+				return nil, nil, 0, rerr
+			}
+			filterValue = resolved
+		}
+	}
 	if e.kind == ikeyKindSetTTL {
 		decoded, exp, derr := decodeExpiringValue(e.value)
 		if derr != nil {
@@ -1002,6 +1035,7 @@ func resolveCompactionEntry(cc compactionConfigT, e mergeEntry, now int64) (writ
 			return nil, nil, 0, ferr
 		}
 		if !keep {
+			// A dropped blob entry leaves its blob value unreferenced; GC reclaims it.
 			return ikeyEncode(nil, e.user, e.seq, ikeyKindDelete), nil, ikeyKindDelete, nil
 		}
 	}

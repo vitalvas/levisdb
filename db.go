@@ -112,8 +112,15 @@ type DB struct {
 	closeMu      sync.Mutex // serializes Close/crash teardown
 	manMu        sync.Mutex // guards manifest appends from concurrent scheduler workers
 	checkpointMu sync.Mutex
-	bgMu         sync.Mutex
-	bgErr        error
+
+	// blobMu guards the live blob registry (num -> size), the source of truth for
+	// which value-separation blob files the manifest references. It feeds the
+	// manifest baseline (re-emitting live blobs on rotation) and blob GC. Empty when
+	// value separation is off.
+	blobMu    sync.Mutex
+	liveBlobs map[uint32]int64
+	bgMu      sync.Mutex
+	bgErr     error
 
 	// seqMu orders sequence assignment with WAL enqueue: a batch reserves its
 	// contiguous seq range and enqueues it while holding this, so records are
@@ -397,6 +404,13 @@ func (db *DB) load() error {
 	if terr != nil {
 		return terr
 	}
+	// Blob files draw from the same never-reused number space; a blob written and
+	// synced before its manifest edit committed can exceed every manifested number,
+	// so the on-disk blob listing bounds the allocator too (mirrors tables).
+	blobs, berr := db.store.listBlobs()
+	if berr != nil {
+		return berr
+	}
 	start := db.highestFileNum(state)
 	for _, n := range logs {
 		if n > start {
@@ -404,6 +418,11 @@ func (db *DB) load() error {
 		}
 	}
 	for _, n := range tables {
+		if n > start {
+			start = n
+		}
+	}
+	for _, n := range blobs {
 		if n > start {
 			start = n
 		}
@@ -461,6 +480,7 @@ func (db *DB) load() error {
 	// fresh baseline. Read-only opens return above and never perform this.
 	db.cleanupManifests()
 	db.cleanupTables()
+	db.cleanupBlobs()
 
 	db.sched = newScheduler(db.flushEngine)
 	return nil
@@ -527,6 +547,34 @@ func (db *DB) cleanupTables() {
 	}
 }
 
+// cleanupBlobs removes .blob files absent from the live blob set the replayed
+// manifest selected: a blob written and synced before its manifest edit committed
+// (then lost to a crash) is an orphan. Best-effort, same contract as cleanupTables.
+// A blob still referenced by a live table is always in liveBlobs, so this never
+// deletes a reachable value.
+func (db *DB) cleanupBlobs() {
+	db.blobMu.Lock()
+	live := make(map[uint32]bool, len(db.liveBlobs))
+	for num := range db.liveBlobs {
+		live[num] = true
+	}
+	db.blobMu.Unlock()
+
+	nums, err := db.store.listBlobs()
+	if err != nil {
+		return
+	}
+	for _, num := range nums {
+		if live[num] {
+			continue
+		}
+		path, err := db.store.blobPath(num)
+		if err == nil {
+			_ = removeFileDurable(path)
+		}
+	}
+}
+
 func (db *DB) engineConfig() engineConfigT {
 	return engineConfigT{
 		MemtableSize:   db.opts.MemtableSize,
@@ -539,6 +587,17 @@ func (db *DB) engineConfig() engineConfigT {
 		FDs:            db.fds,
 		Commit: func(inputs, outputs []*tableMeta, install func()) error {
 			return db.commitTableChange(inputs, outputs, install)
+		},
+		ValueThreshold: db.opts.ValueThreshold,
+		BlobFileSize:   db.opts.BlobFileSize,
+		blobPath: func() func(uint32) (string, error) {
+			if db.opts.ValueThreshold <= 0 {
+				return nil // feature off: no blob path, valueSeparationOn() stays false
+			}
+			return func(num uint32) (string, error) { return db.store.blobPath(num) }
+		}(),
+		CommitBlobs: func(added []blobFileMeta) error {
+			return db.commitBlobAdd(added)
 		},
 	}
 }
@@ -678,6 +737,13 @@ func (db *DB) newManifestWithBaseline() (*manifestWriter, uint32, error) {
 	for _, t := range db.eng.Tables() {
 		edit.Added = append(edit.Added, manifestTableInfo(t))
 	}
+	// Re-emit every live blob file so the fresh baseline carries them forward;
+	// otherwise rotation would drop their records and orphan referenced blobs.
+	db.blobMu.Lock()
+	for num, size := range db.liveBlobs {
+		edit.AddedBlobs = append(edit.AddedBlobs, manifestBlobInfo{Num: num, Size: size})
+	}
+	db.blobMu.Unlock()
 	if err := w.append(&edit); err != nil {
 		_ = w.Close()
 		_ = db.store.removeManifest(num)

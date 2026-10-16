@@ -89,8 +89,22 @@ const (
 	DefaultBloomBits          = 10
 	DefaultBlockSize          = 4 << 10   // 4 KiB
 	DefaultBlockCacheSize     = 256 << 20 // 256 MiB
-	DefaultMaxOpenFiles       = 1000      // bounded open table descriptors, matching LevelDB
-	DefaultFreshCodec         = CodecS2
+	// DefaultValueThreshold is the value size at or above which a value is written to
+	// a separate blob file instead of inline in the SSTable, WHEN value separation is
+	// enabled. It is only a default for the threshold's magnitude; value separation
+	// itself is off unless Options.ValueThreshold is set non-zero. 1 KiB keeps small
+	// values inline (one seek on read) while separating larger ones so compaction
+	// moves a pointer rather than the value bytes.
+	DefaultValueThreshold = 1 << 10 // 1 KiB
+	// DefaultBlobFileSize is the size at which an append-only blob file rolls to a new
+	// one. The blob file is the unit of value-separation garbage collection, so this
+	// trades file count against reclaim granularity: smaller means more files but
+	// finer reclaim, larger means fewer files but coarser. 256 MiB keeps the file
+	// count manageable at hundreds of terabytes while still reclaiming in reasonable
+	// chunks.
+	DefaultBlobFileSize = 256 << 20 // 256 MiB
+	DefaultMaxOpenFiles = 1000      // bounded open table descriptors, matching LevelDB
+	DefaultFreshCodec   = CodecS2
 	// DefaultBottomCodec is S2 too: zstd's slow encode dominated compaction on
 	// large, compressible values (bottom-tier merges stalled). S2 keeps compaction
 	// fast; zstd stays selectable and decodable for existing data.
@@ -217,6 +231,23 @@ type Options struct {
 	// most one output table per non-overlapping group. Set true to merge the whole
 	// tier every time (the pre-overlap behavior).
 	DisableOverlapSelection bool
+
+	// ValueThreshold is the feature flag and size cutoff for value separation. When
+	// zero (the default) value separation is OFF: every value is stored inline in its
+	// SSTable exactly as before, and no blob files exist. When set to a positive byte
+	// count, a value whose length is at least ValueThreshold is written to a separate
+	// append-only blob file and the SSTable stores only a small pointer to it, so a
+	// compaction moves the pointer rather than rewriting the value bytes. This cuts
+	// write amplification for large values; small values stay inline so a read of them
+	// needs no second seek. Setting it enables the feature; a value below 2 is raised
+	// to 2 (a 1-byte value is never worth a blob). A negative value is rejected.
+	ValueThreshold int64
+
+	// BlobFileSize is the size at which an append-only blob file rolls to a new one.
+	// It is the unit of value-separation GC: a blob file is reclaimed once all the
+	// values it holds are dead. It applies only when ValueThreshold enables value
+	// separation. Zero uses the default; a negative value is rejected.
+	BlobFileSize int64
 
 	// BloomBits is the bloom filter bits per key.
 	BloomBits int
@@ -401,6 +432,17 @@ func (o *Options) fillDefaults() {
 	case o.TierByteTrigger < 0:
 		o.TierByteTrigger = 0 // caller disabled the density trigger
 	}
+	// Value separation: ValueThreshold 0 leaves the feature off, so no default is
+	// applied to it. A positive-but-tiny threshold is raised to 2 (a 1-byte value is
+	// never worth a blob). BlobFileSize gets its default only when the feature is on.
+	if o.ValueThreshold > 0 {
+		if o.ValueThreshold < 2 {
+			o.ValueThreshold = 2
+		}
+		if o.BlobFileSize == 0 {
+			o.BlobFileSize = DefaultBlobFileSize
+		}
+	}
 	// A negative retention bound disables that horizon (treated as 0); both zero
 	// disables WAL retention entirely.
 	if o.WALRetention < 0 {
@@ -480,6 +522,14 @@ func (o *Options) validate() error {
 	}
 	if o.BlockCacheSize < 0 {
 		return fmt.Errorf("levisdb: BlockCacheSize must be non-negative, got %d", o.BlockCacheSize)
+	}
+	// Value separation: both knobs are non-negative. Zero ValueThreshold means the
+	// feature is off; zero BlobFileSize means "use the default" (see fillDefaults).
+	if o.ValueThreshold < 0 {
+		return fmt.Errorf("levisdb: ValueThreshold must be non-negative, got %d", o.ValueThreshold)
+	}
+	if o.BlobFileSize < 0 {
+		return fmt.Errorf("levisdb: BlobFileSize must be non-negative, got %d", o.BlobFileSize)
 	}
 	// WALSyncInterval is never negative. Under NoSync it is the levisdb-owned
 	// blocking fsync window that bounds durability (never left to OS page-cache

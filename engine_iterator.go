@@ -11,6 +11,7 @@ import (
 // flushing memtable, and all tables, keeps the newest version at or below seq
 // for each user key, and skips tombstones.
 type engineIterator struct {
+	eng       *engineT // for resolving out-of-line (blob) values; nil-safe for inline-only
 	merge     *mergeIter
 	seq       uint64
 	readTime  int64
@@ -78,6 +79,7 @@ func (s *engineT) newRangeIteratorAt(seq uint64, start, end []byte, readTime int
 	// bound stays non-nil (an exclusive upper bound of "" matching nothing),
 	// whereas append([]byte(nil), end...) would collapse it to nil (unbounded).
 	it := &engineIterator{
+		eng:      s,
 		merge:    newMergeIter(sources...),
 		seq:      seq,
 		readTime: readTime,
@@ -140,7 +142,26 @@ func (it *engineIterator) Next() bool {
 		}
 		value := it.merge.Value()
 		var entryExpiry int64
-		if kind == ikeyKindSetTTL {
+		switch kind {
+		case ikeyKindBlobRef:
+			ptr, derr := decodeBlobPointer(value)
+			if derr != nil {
+				it.err = fmt.Errorf("iterator: %w", derr)
+				_ = it.Close()
+				return false
+			}
+			if ptr.expiresAt != 0 && ptr.expiresAt <= it.readTime {
+				continue
+			}
+			resolved, rerr := it.eng.resolveBlob(ptr)
+			if rerr != nil {
+				it.err = fmt.Errorf("iterator: %w", rerr)
+				_ = it.Close()
+				return false
+			}
+			value = resolved
+			entryExpiry = ptr.expiresAt
+		case ikeyKindSetTTL:
 			var expiresAt int64
 			var err error
 			value, expiresAt, err = decodeExpiringValue(value)

@@ -38,10 +38,29 @@ type manifestEdit struct {
 
 	Added   []manifestTableInfo
 	Deleted []manifestTableRef // num identifies a table to remove
+
+	// AddedBlobs and DeletedBlobs track value-separation blob files. They are only
+	// ever non-empty when value separation is enabled, so a database that never uses
+	// the feature writes no blob records.
+	AddedBlobs   []manifestBlobInfo
+	DeletedBlobs []manifestBlobRef
 }
 
 // TableRef identifies a table for deletion.
 type manifestTableRef struct {
+	Num uint32
+}
+
+// manifestBlobInfo describes one live value-separation blob file. Size is the
+// file's byte length; the manifest tracks which blob files exist so orphan cleanup
+// and GC can tell a referenced blob from a leftover one.
+type manifestBlobInfo struct {
+	Num  uint32
+	Size int64
+}
+
+// manifestBlobRef identifies a blob file for deletion.
+type manifestBlobRef struct {
 	Num uint32
 }
 
@@ -52,14 +71,23 @@ const (
 	tagDelete    = 3
 	tagLastSeq   = 4
 	tagReplayLog = 5
+	tagAddBlob   = 6
+	tagDelBlob   = 7
 	tagEnd       = 0
 )
+
+// manifestVersion is the current on-disk manifest format version, written once in
+// the identity edit. Readers reject a newer version. There are no releases, so
+// version 1 is the baseline; a decoder that finds no version tag treats the file as
+// pre-versioned and rejects it rather than guessing.
+const manifestVersion = 1
 
 // encode serializes an edit into a self-describing record.
 func (e *manifestEdit) encode() []byte {
 	var b []byte
 	if e.HasIdentity {
 		b = append(b, tagIdentity)
+		b = binary.AppendUvarint(b, manifestVersion)
 	}
 	if e.HasLastSeq {
 		b = append(b, tagLastSeq)
@@ -83,6 +111,15 @@ func (e *manifestEdit) encode() []byte {
 		b = append(b, tagDelete)
 		b = binary.AppendUvarint(b, uint64(d.Num))
 	}
+	for _, bl := range e.AddedBlobs {
+		b = append(b, tagAddBlob)
+		b = binary.AppendUvarint(b, uint64(bl.Num))
+		b = binary.AppendUvarint(b, uint64(bl.Size))
+	}
+	for _, bl := range e.DeletedBlobs {
+		b = append(b, tagDelBlob)
+		b = binary.AppendUvarint(b, uint64(bl.Num))
+	}
 	b = append(b, tagEnd)
 	return b
 }
@@ -102,7 +139,15 @@ func decodeEdit(rec []byte) (manifestEdit, error) {
 			if e.HasIdentity {
 				return e, fmt.Errorf("manifest: duplicate identity tag")
 			}
+			ver, n := binary.Uvarint(rec)
+			if n <= 0 {
+				return e, fmt.Errorf("manifest: bad version")
+			}
+			if ver != manifestVersion {
+				return e, fmt.Errorf("manifest: unsupported version %d (want %d)", ver, manifestVersion)
+			}
 			e.HasIdentity = true
+			rec = rec[n:]
 		case tagLastSeq:
 			if e.HasLastSeq {
 				return e, fmt.Errorf("manifest: duplicate last-sequence tag")
@@ -141,11 +186,38 @@ func decodeEdit(rec []byte) (manifestEdit, error) {
 			}
 			e.Deleted = append(e.Deleted, manifestTableRef{Num: uint32(num)})
 			rec = rec[n:]
+		case tagAddBlob, tagDelBlob:
+			r, err := readBlobTag(&e, tag, rec)
+			if err != nil {
+				return e, err
+			}
+			rec = r
 		default:
 			return e, fmt.Errorf("manifest: unknown tag %d", tag)
 		}
 	}
 	return e, fmt.Errorf("manifest: missing end tag")
+}
+
+// readBlobTag decodes a blob add (num+size) or blob delete (num) record into e and
+// returns the remaining bytes. Split out of decodeEdit to keep its complexity bound.
+func readBlobTag(e *manifestEdit, tag byte, rec []byte) ([]byte, error) {
+	num, n := binary.Uvarint(rec)
+	if n <= 0 || num == 0 || num > math.MaxUint32 {
+		return nil, fmt.Errorf("manifest: bad blob record")
+	}
+	rec = rec[n:]
+	if tag == tagDelBlob {
+		e.DeletedBlobs = append(e.DeletedBlobs, manifestBlobRef{Num: uint32(num)})
+		return rec, nil
+	}
+	size, n := binary.Uvarint(rec)
+	if n <= 0 || size > math.MaxInt64 {
+		return nil, fmt.Errorf("manifest: bad blob size")
+	}
+	rec = rec[n:]
+	e.AddedBlobs = append(e.AddedBlobs, manifestBlobInfo{Num: uint32(num), Size: int64(size)})
+	return rec, nil
 }
 
 func readTable(rec []byte) (manifestTableInfo, []byte, error) {
@@ -300,6 +372,7 @@ type manifestState struct {
 	ReplayLogNum uint32              // first WAL segment required by this table set
 	LastSeq      uint64              // highest sequence allocation watermark recorded
 	Tables       []manifestTableInfo // the live table set
+	Blobs        []manifestBlobInfo  // the live value-separation blob files
 }
 
 // Replay reads a manifest file and reconstructs the live table set. It applies
@@ -307,10 +380,12 @@ type manifestState struct {
 func replayManifestFile(r io.Reader) (*manifestState, error) {
 	st := &manifestState{}
 	live := map[manifestTableRef]manifestTableInfo{}
+	liveBlobs := map[manifestBlobRef]manifestBlobInfo{}
 	// File numbers come from one global, never-reused allocator. Tracking every
 	// table number seen (not just the live set) catches a corrupt manifest that
 	// reuses a number, which would collide two tables on one block-cache identity.
 	seenTableNums := map[uint32]bool{}
+	seenBlobNums := map[uint32]bool{}
 
 	jr := newJournalReader(r)
 	haveIdentity := false
@@ -360,6 +435,19 @@ func replayManifestFile(r io.Reader) (*manifestState, error) {
 			}
 			delete(live, d)
 		}
+		for _, bl := range edit.AddedBlobs {
+			if seenBlobNums[bl.Num] {
+				return nil, fmt.Errorf("manifest: blob file number %d reused", bl.Num)
+			}
+			seenBlobNums[bl.Num] = true
+			liveBlobs[manifestBlobRef{Num: bl.Num}] = bl
+		}
+		for _, bd := range edit.DeletedBlobs {
+			if _, exists := liveBlobs[bd]; !exists {
+				return nil, fmt.Errorf("manifest: delete of unknown blob %d", bd.Num)
+			}
+			delete(liveBlobs, bd)
+		}
 	}
 
 	if !haveIdentity {
@@ -367,6 +455,9 @@ func replayManifestFile(r io.Reader) (*manifestState, error) {
 	}
 	for _, t := range live {
 		st.Tables = append(st.Tables, t)
+	}
+	for _, bl := range liveBlobs {
+		st.Blobs = append(st.Blobs, bl)
 	}
 	return st, nil
 }

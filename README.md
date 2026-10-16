@@ -91,6 +91,7 @@ not supported.
 - non-mutating read-only opens, including in-memory replay of a crash WAL
 - optional ordered WAL observation for replication or change-data capture
 - per-value absolute-expiry TTL persisted across WAL recovery and compaction
+- optional value separation that stores large values in blob files so compaction moves a pointer, not the bytes
 - optional compaction filtering with key, value, and absolute-expiry context
 - optional write deduplication of unchanged key/value/expiry puts
 - monitoring through `Stats`, LevelDB-style `GetProperty`, and a process `expvar`
@@ -175,6 +176,8 @@ target a single slow spinning disk.
 | `L0SlowdownTables` | `16` | Fresh-tier table count that slows writers. |
 | `L0StopTables` | `24` | Fresh-tier table count that stops writers. A positive value must be at least `TierRatio` and `L0SlowdownTables`. |
 | `MaxCompactionBytes` | `10 x FileSizeMax` | Input byte cap per non-bottom compaction; negative disables. |
+| `ValueThreshold` | `0` (off) | Feature flag for value separation. Set a positive byte count to write values at least that large to separate blob files (compaction moves a pointer, not the value), cutting write amplification for large values. Below 2 is raised to 2. |
+| `BlobFileSize` | `256 MiB` | Blob file roll size when value separation is enabled; the unit of blob garbage collection. |
 | `DisableOverlapSelection` | `false` | Merge the whole tier instead of only the largest key-overlapping group. |
 | `MaxLevels` | `8` | Tier count, 1..8; the deepest tier merges in place. Fewer levels bound read/recovery fan-out at the cost of larger bottom merges. |
 | `FileSizeBase` | `2 MiB` | Depth-0 base of the per-depth output size curve. See [Compaction and backpressure](#compaction-and-backpressure). |
@@ -454,6 +457,37 @@ example multi-terabyte) store cannot exhaust the machine. The compaction filter
 and tombstone drop run only on the final collapse into the deepest tier, so each
 surviving key is filtered exactly once.
 
+## Value separation
+
+Large values dominate compaction cost: a value stored inline in an SSTable is
+rewritten every time its table is merged down a tier, so a multi-megabyte value can
+be copied many times over its lifetime even though its bytes never change. Value
+separation stores such values out of line so compaction moves a small pointer
+instead.
+
+Set `ValueThreshold` to a positive byte count to enable it (it is **off by
+default**, so a database that never sets it is byte-for-byte unchanged). A flushed
+value whose length is at least `ValueThreshold` is appended to a **blob file** and
+the SSTable stores a fixed-width pointer `(file, offset, length, deadline)` under a
+dedicated internal kind; smaller values stay inline so reading them needs no second
+seek. A point read or scan resolves the pointer with one read into the blob file;
+the TTL deadline rides in the pointer, so expiry and `ExpiresAt` work without
+fetching the value. Compaction copies pointers through the tiers untouched, so a
+separated value is written once no matter how deep it later sinks — its compaction
+write amplification is ~1x.
+
+Blob files roll at `BlobFileSize` (default 256 MiB) and are tracked in the manifest.
+Creation is crash-safe: a blob file is fsynced and its records committed to the
+manifest before the table that points into it, so recovery never sees a pointer to a
+missing value, and a blob written but never committed (lost to a crash) is reclaimed
+as an orphan on the next writable open.
+
+Current limitation: a blob whose last referencing table is dropped by compaction (an
+overwritten or deleted large value) is not yet reclaimed while the database runs;
+its space is recovered only by a full rebuild. For a write-once value workload — the
+case value separation targets — values are rarely overwritten, so this is a minor
+space cost. Online blob garbage collection is a planned follow-up.
+
 ## Compression
 
 Compression is a split by depth, with two knobs:
@@ -685,13 +719,15 @@ Under `Dir`, all files sit directly in the directory: a write-ahead log in
 segmented, checksummed journal blocks named `<num>.log` (see
 [Write-ahead log](#write-ahead-log)); an append-only manifest recording every
 flush and compaction, with a `CURRENT` file naming the live manifest; a `LOCK`
-file for the single-process lock; and `<num>.sst` tables. Tables use
-LevelDB-style prefix-compressed data blocks with restart points, a flat index,
-an embedded bloom filter, and per-block CRC32C.
+file for the single-process lock; `<num>.sst` tables; and, when value separation
+is enabled, `<num>.blob` files holding out-of-line values (see
+[Value separation](#value-separation)). Tables use LevelDB-style
+prefix-compressed data blocks with restart points, a flat index, an embedded
+bloom filter, and per-block CRC32C.
 
-The manifest now records a WAL recovery boundary. This version reads older
-manifests, but opening a database for writing upgrades its manifest: older
-binaries that do not recognize the recovery-boundary field cannot reopen it.
+The manifest carries a format version in its identity record and records a WAL
+recovery boundary plus (when value separation is used) the live blob files. A
+binary only opens a manifest whose version it recognizes.
 
 ## TTL
 

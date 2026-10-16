@@ -211,6 +211,18 @@ func (db *DB) restoreTables(state *manifestState) error {
 	db.eng.mu.Lock()
 	db.eng.rebuildIndex()
 	db.eng.mu.Unlock()
+	// Populate the live blob registry from the replayed manifest so rotation re-emits
+	// them and GC/orphan-cleanup see the authoritative live set.
+	if len(state.Blobs) > 0 {
+		db.blobMu.Lock()
+		if db.liveBlobs == nil {
+			db.liveBlobs = map[uint32]int64{}
+		}
+		for _, b := range state.Blobs {
+			db.liveBlobs[b.Num] = b.Size
+		}
+		db.blobMu.Unlock()
+	}
 	return nil
 }
 
@@ -259,6 +271,40 @@ func publicKind(k walKindType) EntryKind {
 	default:
 		return EntryPut
 	}
+}
+
+// commitBlobAdd durably records newly written blob files in the manifest and adds
+// them to the live blob registry. It runs BEFORE the table edit that references the
+// blobs is committed (see Flush), so a crash never leaves a committed table pointing
+// at an unrecorded blob. During recovery (db.man == nil) it only updates the
+// registry; the post-replay baseline captures the blobs.
+func (db *DB) commitBlobAdd(added []blobFileMeta) error {
+	if len(added) == 0 {
+		return nil
+	}
+	db.blobMu.Lock()
+	if db.liveBlobs == nil {
+		db.liveBlobs = map[uint32]int64{}
+	}
+	for _, b := range added {
+		db.liveBlobs[b.Num] = b.Size
+	}
+	db.blobMu.Unlock()
+	if db.man == nil {
+		return nil
+	}
+	edit := manifestEdit{}
+	for _, b := range added {
+		edit.AddedBlobs = append(edit.AddedBlobs, manifestBlobInfo(b))
+	}
+	db.manMu.Lock()
+	defer db.manMu.Unlock()
+	if err := db.man.append(&edit); err != nil {
+		db.setBackgroundError(err)
+		return err
+	}
+	db.maybeRotateManifest()
+	return nil
 }
 
 // commitTableChange durably records a table replacement and then installs it

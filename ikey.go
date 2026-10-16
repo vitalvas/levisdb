@@ -23,13 +23,24 @@ const (
 	ikeyKindDelete ikeyKind = iota
 	// KindSet marks a live value.
 	ikeyKindSet
+	// ikeyKindBlobRef marks a live value stored out-of-line in a blob file; the
+	// table holds an encoded blob pointer (see blob.go) instead of the value bytes.
+	// It is placed below ikeyKindSetTTL so maxPersistedKind stays ikeyKindSetTTL and
+	// seek-key construction (ikeyLookupKey) is unaffected.
+	ikeyKindBlobRef
 	// ikeyKindSetTTL marks a live value whose stored bytes begin with an
-	// absolute expiration timestamp.
+	// absolute expiration timestamp. It is the maximum persisted kind.
 	ikeyKindSetTTL
 )
 
+// maxPersistedKind is the largest kind value written to a table trailer. A seek
+// key uses it so the seek lands at or before the newest version at a sequence
+// (ikeyLookupKey). It must be updated if a kind with a higher value is added.
+const maxPersistedKind = ikeyKindSetTTL
+
 func validIKeyKind(kind ikeyKind) bool {
-	return kind == ikeyKindDelete || kind == ikeyKindSet || kind == ikeyKindSetTTL
+	return kind == ikeyKindDelete || kind == ikeyKindSet ||
+		kind == ikeyKindBlobRef || kind == ikeyKindSetTTL
 }
 
 // trailerLen is the size of the packed seq+kind trailer.
@@ -90,5 +101,5 @@ func ikeyCompare(a, b []byte) int {
 // LookupKey builds an internal key for seeking: userKey at seq with the maximum
 // persisted kind, so it lands at or before the newest version at or under seq.
 func ikeyLookupKey(dst, userKey []byte, seq uint64) []byte {
-	return ikeyEncode(dst, userKey, seq, ikeyKindSetTTL)
+	return ikeyEncode(dst, userKey, seq, maxPersistedKind)
 }

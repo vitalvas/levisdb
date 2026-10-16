@@ -33,6 +33,11 @@ const (
 	// logSuffix is the on-disk extension for WAL segments, same fixed width as
 	// tableSuffix so the "%08x" + suffix name stays 12 chars.
 	logSuffix = ".log"
+	// blobSuffix is the on-disk extension for value-separation blob files. Its
+	// 5-byte width makes the "%08x" + suffix name 13 chars, distinct from the
+	// 12-char .sst/.log names, so the table and WAL listers (which filter on a
+	// 12-char length) never pick up a blob and blob discovery stays layout-free.
+	blobSuffix = ".blob"
 )
 
 // Storage owns a database directory and its exclusive lock.
@@ -105,6 +110,11 @@ func (s *storageT) tablePath(num uint32) (string, error) {
 	return filepath.Join(s.dir, tableName(num)), nil
 }
 
+// blobPath returns the path to a value-separation blob file.
+func (s *storageT) blobPath(num uint32) (string, error) {
+	return filepath.Join(s.dir, blobName(num)), nil
+}
+
 // hexStem writes num as 8 fixed-width lowercase hex digits into dst and returns
 // the extended slice, the stem shared by every on-disk file name. Done by hand
 // (not fmt) so the renderers below are real formatters, not stdlib wrappers.
@@ -129,6 +139,7 @@ func fileName(num uint32, suffix string) string {
 // name (8 hex digits + .sst / .log).
 func tableName(num uint32) string { return fileName(num, tableSuffix) }
 func walName(num uint32) string   { return fileName(num, logSuffix) }
+func blobName(num uint32) string  { return fileName(num, blobSuffix) }
 
 // tableNames renders a list of table numbers as their on-disk file names for
 // logging a compaction's inputs or outputs.
@@ -151,6 +162,20 @@ func manifestFileName(num uint32) string {
 // directory. The strict %08x.sst name filter skips LOCK, CURRENT, MANIFEST-*,
 // and WAL segments, so discovery and orphan cleanup stay layout-free.
 func (s *storageT) listTables() ([]uint32, error) {
+	return s.listNumbered(tableSuffix)
+}
+
+// listBlobs returns the blob file numbers present in the database directory,
+// ascending (mirrors listTables for the .blob suffix).
+func (s *storageT) listBlobs() ([]uint32, error) {
+	return s.listNumbered(blobSuffix)
+}
+
+// listNumbered returns, ascending, the file numbers of directory entries named
+// %08x+suffix. The strict stem round-trip plus the exact name length (8 hex digits
+// plus the suffix) skips LOCK, CURRENT, MANIFEST-*, and every other file kind, so
+// discovery, allocator seeding, and orphan cleanup stay layout-free.
+func (s *storageT) listNumbered(suffix string) ([]uint32, error) {
 	entries, err := os.ReadDir(s.dir)
 	if os.IsNotExist(err) {
 		return nil, nil
@@ -158,12 +183,13 @@ func (s *storageT) listTables() ([]uint32, error) {
 	if err != nil {
 		return nil, err
 	}
+	wantLen := 8 + len(suffix)
 	var nums []uint32
 	for _, e := range entries {
-		if e.IsDir() || len(e.Name()) != 12 || !strings.HasSuffix(e.Name(), tableSuffix) {
+		if e.IsDir() || len(e.Name()) != wantLen || !strings.HasSuffix(e.Name(), suffix) {
 			continue
 		}
-		stem := strings.TrimSuffix(e.Name(), tableSuffix)
+		stem := strings.TrimSuffix(e.Name(), suffix)
 		v, perr := strconv.ParseUint(stem, 16, 32)
 		if perr != nil || fmt.Sprintf("%08x", v) != stem {
 			continue

@@ -110,6 +110,47 @@ func TestFillDefaultsMinCompactionTables(t *testing.T) {
 	})
 }
 
+func TestFillDefaultsValueSeparation(t *testing.T) {
+	t.Parallel()
+
+	t.Run("off by default", func(t *testing.T) {
+		o := Options{Dir: "/d"}
+		o.fillDefaults()
+		assert.Zero(t, o.ValueThreshold, "value separation is off unless explicitly enabled")
+		assert.Zero(t, o.BlobFileSize, "no blob file size default while the feature is off")
+		require.NoError(t, o.validate())
+	})
+
+	t.Run("enabling applies the blob file size default", func(t *testing.T) {
+		o := Options{Dir: "/d", ValueThreshold: 4 << 10}
+		o.fillDefaults()
+		assert.Equal(t, int64(4<<10), o.ValueThreshold, "explicit threshold preserved")
+		assert.Equal(t, int64(DefaultBlobFileSize), o.BlobFileSize, "blob size defaults once enabled")
+	})
+
+	t.Run("tiny threshold is raised to two", func(t *testing.T) {
+		o := Options{Dir: "/d", ValueThreshold: 1}
+		o.fillDefaults()
+		assert.Equal(t, int64(2), o.ValueThreshold, "a 1-byte value is never worth a blob")
+	})
+
+	t.Run("explicit blob size preserved", func(t *testing.T) {
+		o := Options{Dir: "/d", ValueThreshold: 1 << 10, BlobFileSize: 64 << 20}
+		o.fillDefaults()
+		assert.Equal(t, int64(64<<20), o.BlobFileSize)
+	})
+
+	t.Run("negative values are rejected", func(t *testing.T) {
+		o := Options{Dir: "/d", ValueThreshold: -1}
+		o.fillDefaults()
+		require.ErrorContains(t, o.validate(), "ValueThreshold must be non-negative")
+
+		o = Options{Dir: "/d", BlobFileSize: -1}
+		o.fillDefaults()
+		require.ErrorContains(t, o.validate(), "BlobFileSize must be non-negative")
+	})
+}
+
 func TestFillDefaultsMaxLevels(t *testing.T) {
 	t.Parallel()
 

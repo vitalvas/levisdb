@@ -125,6 +125,26 @@ type engineConfigT struct {
 	// manifest transaction is serialized, and returns only after the edit is
 	// durable. Tests and recovery leave it nil and install directly.
 	Commit func(inputs, outputs []*tableMeta, install func()) error
+
+	// ValueThreshold enables value separation when > 0: a flushed value at least this
+	// many bytes is written to a blob file and the table stores a pointer. Zero (the
+	// default) keeps every value inline, so the whole blob machinery stays dormant.
+	ValueThreshold int64
+	// BlobFileSize is the blob-file roll size; only used when ValueThreshold > 0.
+	BlobFileSize int64
+	// blobPath returns the on-disk path for a blob file number. Nil when value
+	// separation is disabled.
+	blobPath func(num uint32) (string, error)
+	// CommitBlobs durably records newly written blob files in the manifest before a
+	// flush/compaction install makes the referencing tables visible. Nil during
+	// recovery and for direct engine users, which install without a manifest.
+	CommitBlobs func(added []blobFileMeta) error
+}
+
+// valueSeparationOn reports whether this engine separates large values into blob
+// files. All blob code paths gate on this so a zero ValueThreshold is fully inert.
+func (s *engineT) valueSeparationOn() bool {
+	return s.cfg.ValueThreshold > 0 && s.cfg.blobPath != nil
 }
 
 // Engine is the storage core. Writes go to the active memtable; when it fills
@@ -150,6 +170,12 @@ type engineT struct {
 	// first setTables; guarded by mu like tables.
 	index *levelIndex
 	seed  int64
+
+	// blobHandles caches an open fd-pool handle per blob file number for the read
+	// path, so resolving a blob pointer does not reopen the file each time. Guarded by
+	// blobMu. Empty and unused when value separation is off.
+	blobMu      sync.Mutex
+	blobHandles map[uint32]*blobReader
 
 	// flushMu serializes Flush and Compact so at most one runs at a time; the
 	// finer mu guards the fields those operations read and swap.
@@ -395,11 +421,20 @@ type versionPick struct {
 	// a non-TTL value. Carried so Deduplication can compare it exactly without a
 	// second lookup.
 	expiresAt int64
+	// blobPtr is non-nil when the winning version's value lives in a blob file; value
+	// is then nil until the caller resolves the pointer. Only table candidates set it
+	// (memtable values are always inline).
+	blobPtr *blobPointer
 }
 
 // set records the first version found (no prior best to compare against).
 func (p *versionPick) set(v []byte, seq uint64, deleted bool, expiresAt int64) {
-	p.value, p.seq, p.found, p.deleted, p.expiresAt = v, seq, true, deleted, expiresAt
+	p.value, p.seq, p.found, p.deleted, p.expiresAt, p.blobPtr = v, seq, true, deleted, expiresAt, nil
+}
+
+// setBlob records a first version whose value is out-of-line in a blob file.
+func (p *versionPick) setBlob(ptr *blobPointer, seq uint64, expiresAt int64) {
+	p.value, p.seq, p.found, p.deleted, p.expiresAt, p.blobPtr = nil, seq, true, false, expiresAt, ptr
 }
 
 // merge folds one candidate version into the best. A higher sequence wins; the
@@ -414,6 +449,15 @@ func (p *versionPick) merge(v []byte, seq uint64, deleted bool, expiresAt int64,
 		return fmt.Errorf("%s: conflicting versions for key at sequence %d", source, seq)
 	}
 	return nil
+}
+
+// mergeBlob folds a table candidate whose value is out-of-line. A higher sequence
+// wins and records the pointer. Unique sequences mean a blob version never ties a
+// same-seq inline version, so no value comparison is needed.
+func (p *versionPick) mergeBlob(ptr *blobPointer, seq uint64, expiresAt int64) {
+	if !p.found || seq > p.seq {
+		p.setBlob(ptr, seq, expiresAt)
+	}
 }
 
 // pickVersion scans the memtable, flushing memtable, recovery memtables, and
@@ -459,6 +503,10 @@ func (s *engineT) pickVersion(seq uint64, key []byte, now int64) (versionPick, e
 		if !r.found {
 			return nil
 		}
+		if r.blobPtr != nil {
+			best.mergeBlob(r.blobPtr, r.versionSeq, r.expiresAt)
+			return nil
+		}
 		if err := best.merge(r.value, r.versionSeq, r.deleted, r.expiresAt, "table"); err != nil {
 			mergeErr = err
 			return err
@@ -500,6 +548,15 @@ func (s *engineT) getWithExpiry(seq uint64, key []byte) (value []byte, expiresAt
 	if rdSeq > best.seq {
 		return nil, 0, false, nil
 	}
+	// An out-of-line value is fetched from its blob file now that it is the chosen
+	// version; the returned bytes are a fresh owned copy.
+	if best.blobPtr != nil {
+		v, berr := s.resolveBlob(*best.blobPtr)
+		if berr != nil {
+			return nil, 0, false, berr
+		}
+		return v, best.expiresAt, true, nil
+	}
 	// Copy out: best.value may alias a cached block or memtable buffer the caller
 	// must not retain or mutate.
 	return append([]byte(nil), best.value...), best.expiresAt, true, nil
@@ -531,6 +588,15 @@ func (s *engineT) getAtTime(seq uint64, key []byte, now int64) (value []byte, fo
 		}
 	}
 	if bestFound {
+		// Resolve an out-of-line value from its blob file once chosen and not shadowed
+		// by a range tombstone. A deleted result has no value to fetch.
+		if !bestDeleted && best.blobPtr != nil {
+			v, berr := s.resolveBlob(*best.blobPtr)
+			if berr != nil {
+				return nil, false, false, berr
+			}
+			return v, true, false, nil
+		}
 		return append([]byte(nil), bestValue...), true, bestDeleted, nil
 	}
 	return nil, false, false, nil
@@ -730,9 +796,43 @@ func (s *engineT) Flush() error {
 	if err != nil {
 		return err
 	}
-	meta, err := s.writeTable(num, 0, path, imm.newIterator(), imm.rangeTombstones())
+	// When value separation is on, large values in this flush are diverted to blob
+	// files via bw; smaller values stay inline. bw is nil when the feature is off.
+	var bw *blobWriter
+	if s.valueSeparationOn() {
+		bw = newBlobWriter(s.alloc, s.cfg.blobPath, s.cfg.BlobFileSize)
+	}
+	meta, err := s.writeTable(tableWriteJob{
+		num:  num,
+		path: path,
+		it:   imm.newIterator(),
+		rts:  imm.rangeTombstones(),
+		bw:   bw,
+	})
 	if err != nil {
+		if bw != nil {
+			bw.abandon()
+		}
 		return err
+	}
+	// Seal the blob files this flush produced and record them durably in the manifest
+	// BEFORE the table that points into them is committed, so a crash never leaves a
+	// table pointer to an unrecorded or non-durable blob.
+	var blobs []blobFileMeta
+	if bw != nil {
+		blobs, err = bw.close()
+		if err != nil {
+			_ = meta.releaseOwner(false)
+			return err
+		}
+		if len(blobs) > 0 && s.cfg.CommitBlobs != nil {
+			if err := s.cfg.CommitBlobs(blobs); err != nil {
+				// Blob files are synced; leave them for orphan cleanup rather than
+				// deleting, so recovery never races a half-removed referenced blob.
+				_ = meta.releaseOwner(false)
+				return err
+			}
+		}
 	}
 
 	install := func() {
@@ -756,10 +856,60 @@ func (s *engineT) Flush() error {
 	return nil
 }
 
+// maybeSeparateValue diverts a large value to a blob file, returning the internal
+// key and value to actually write into the table. When value separation is off (bw
+// nil) or the value is too small or not a plain/TTL set, it returns the inputs
+// unchanged. Otherwise it appends the raw value to the blob file and returns a
+// rewritten internal key of kind ikeyKindBlobRef whose value is the encoded pointer.
+// A TTL value's raw bytes (expiry prefix stripped) go to the blob; the deadline is
+// carried in the pointer, so a read reports it without fetching the blob.
+func (s *engineT) maybeSeparateValue(bw *blobWriter, ik, value []byte) ([]byte, []byte, error) {
+	if bw == nil {
+		return ik, value, nil
+	}
+	seq, kind := ikeySeqKind(ik)
+	var raw []byte
+	var expiresAt int64
+	switch kind {
+	case ikeyKindSet:
+		raw = value
+	case ikeyKindSetTTL:
+		decoded, exp, err := decodeExpiringValue(value)
+		if err != nil {
+			return nil, nil, err
+		}
+		raw, expiresAt = decoded, exp
+	default:
+		return ik, value, nil // tombstone or already-separated: never diverted
+	}
+	if int64(len(raw)) < s.cfg.ValueThreshold {
+		return ik, value, nil // small value stays inline
+	}
+	ptr, err := bw.append(raw, expiresAt)
+	if err != nil {
+		return nil, nil, err
+	}
+	user := ikeyUserKey(ik)
+	newIK := ikeyEncode(nil, user, seq, ikeyKindBlobRef)
+	return newIK, encodeBlobPointer(nil, ptr), nil
+}
+
+// tableWriteJob bundles the inputs for writeTable (keeps its signature within the
+// parameter limit). bw is nil unless value separation is on.
+type tableWriteJob struct {
+	num   uint32
+	depth int
+	path  string
+	it    *memtableIterator
+	rts   []rangeTombstone
+	bw    *blobWriter
+}
+
 // writeTable writes all entries from a memtable iterator into a new table file
 // at the given tier depth, persists any range tombstones, and opens it for
 // reading.
-func (s *engineT) writeTable(num uint32, depth int, path string, it *memtableIterator, rts []rangeTombstone) (*tableMeta, error) {
+func (s *engineT) writeTable(j tableWriteJob) (*tableMeta, error) {
+	num, depth, path, it, rts, bw := j.num, j.depth, j.path, j.it, j.rts, j.bw
 	// O_EXCL: the number came from the allocator, so this file must not pre-exist.
 	// If it does, a reused file number is about to overwrite live data; fail loudly
 	// instead of silently truncating it.
@@ -788,7 +938,11 @@ func (s *engineT) writeTable(num uint32, depth int, path string, it *memtableIte
 	})
 	w.setRangeTombstones(rts)
 	for it.Next() {
-		if err := w.Add(it.internalKey(), it.Value()); err != nil {
+		ik, value, aerr := s.maybeSeparateValue(bw, it.internalKey(), it.Value())
+		if aerr != nil {
+			return nil, aerr
+		}
+		if err := w.Add(ik, value); err != nil {
 			return nil, err
 		}
 	}
@@ -895,6 +1049,28 @@ func (s *engineT) openTableMeta(spec tableSpec) (*tableMeta, error) {
 		tombstones: spec.tombstones,
 		refs:       1,
 	}, nil
+}
+
+// resolveBlob reads the value a blob pointer addresses, caching one fd-pool handle
+// per blob file number. For a TTL value the blob holds the raw user bytes; callers
+// read the deadline from the pointer's expiresAt, so no TTL re-decoding is needed.
+func (s *engineT) resolveBlob(p blobPointer) ([]byte, error) {
+	s.blobMu.Lock()
+	if s.blobHandles == nil {
+		s.blobHandles = map[uint32]*blobReader{}
+	}
+	br := s.blobHandles[p.num]
+	if br == nil {
+		path, err := s.cfg.blobPath(p.num)
+		if err != nil {
+			s.blobMu.Unlock()
+			return nil, err
+		}
+		br = newBlobReader(s.cfg.FDs.newHandle(path))
+		s.blobHandles[p.num] = br
+	}
+	s.blobMu.Unlock()
+	return br.read(p)
 }
 
 // Close releases all open table files.

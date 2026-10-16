@@ -349,6 +349,11 @@ type lookupResult struct {
 	expiresAt  int64
 	found      bool
 	deleted    bool
+	// blobPtr is set (non-nil) when the value is stored out-of-line in a blob file:
+	// value is then nil and the caller must resolve the pointer to the real bytes.
+	// expiresAt is still populated from the pointer so a TTL deadline is known
+	// without fetching the blob.
+	blobPtr *blobPointer
 	// bloomPassed reports that the bloom filter did not reject the key, so a block
 	// read happened. With found==false that read was wasted: a bloom false positive,
 	// the signal for whether cold-cache read I/O is productive.
@@ -446,6 +451,19 @@ func (tr *tableReader) lookupPastBloom(m *tableMetaBlocks, userKey []byte, seq u
 		}
 		value := it.value
 		var exp int64
+		if kind == ikeyKindBlobRef {
+			// Out-of-line value: decode the pointer (not the value bytes). The
+			// deadline is in the pointer, so TTL expiry is decided here without
+			// fetching the blob; the caller resolves the pointer to bytes later.
+			ptr, perr := decodeBlobPointer(value)
+			if perr != nil {
+				return lookupResult{}, fmt.Errorf("table: %w", perr)
+			}
+			if ptr.expiresAt != 0 && ptr.expiresAt <= now {
+				return lookupResult{versionSeq: kseq, found: true, deleted: true}, nil
+			}
+			return lookupResult{versionSeq: kseq, expiresAt: ptr.expiresAt, found: true, blobPtr: &ptr}, nil
+		}
 		if kind == ikeyKindSetTTL {
 			value, exp, err = decodeExpiringValue(value)
 			if err != nil {

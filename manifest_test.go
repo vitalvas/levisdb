@@ -53,6 +53,13 @@ func TestManifestEditEncodeDecode(t *testing.T) {
 				Num: 2,
 			}},
 		}},
+		{"blobs", manifestEdit{
+			AddedBlobs: []manifestBlobInfo{
+				{Num: 11, Size: 1 << 20},
+				{Num: 12, Size: 0},
+			},
+			DeletedBlobs: []manifestBlobRef{{Num: 9}},
+		}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -64,6 +71,8 @@ func TestManifestEditEncodeDecode(t *testing.T) {
 			assert.Equal(t, tc.edit.ReplayLogNum, got.ReplayLogNum)
 			assert.Equal(t, tc.edit.Added, got.Added)
 			assert.Equal(t, tc.edit.Deleted, got.Deleted)
+			assert.Equal(t, tc.edit.AddedBlobs, got.AddedBlobs)
+			assert.Equal(t, tc.edit.DeletedBlobs, got.DeletedBlobs)
 		})
 	}
 }
@@ -119,7 +128,9 @@ func TestDecodeEditErrors(t *testing.T) {
 		// tagDelete with no following uvarints.
 		{"bad-delete", []byte{tagDelete}},
 		{"missing-end-tag", []byte{tagLastSeq, 1}},
-		{"duplicate-identity", []byte{tagIdentity, tagIdentity, tagEnd}},
+		{"duplicate-identity", []byte{tagIdentity, manifestVersion, tagIdentity, manifestVersion, tagEnd}},
+		{"missing-version", []byte{tagIdentity}},
+		{"bad-version", []byte{tagIdentity, manifestVersion + 1, tagEnd}},
 		{"duplicate-last-seq", []byte{tagLastSeq, 1, tagLastSeq, 2, tagEnd}},
 		{"bad-recovery-log", []byte{tagReplayLog}},
 		{"zero-recovery-log", []byte{tagReplayLog, 0, tagEnd}},
