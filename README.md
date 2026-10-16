@@ -366,14 +366,19 @@ monotonic keys (such as block or index data), where every flush lands a disjoint
 range: without the overlap gate they would cascade through every tier for no
 benefit. L0 always drains regardless of overlap, to bound read amplification.
 
-A non-bottom compaction merges only the largest group of key-overlapping tables in
-the tier (overlap-scoped selection), not the whole tier, so unrelated key ranges
-are not rewritten and a lookup touches at most one output table per non-overlapping
-group. Bottom-tier merges include the complete tier and any overlapping shallower
-tables, so removing ingested tombstones cannot reveal older values elsewhere.
-Set `DisableOverlapSelection` to always merge the whole tier instead.
-`MaxCompactionBytes` then caps the input merged in one non-bottom pass so a large
-group drains in bounded steps rather than one merge that pins the disk.
+A compaction merges only the largest group of key-overlapping tables in the tier
+(overlap-scoped selection), not the whole tier, so unrelated key ranges are not
+rewritten and a lookup touches at most one output table per non-overlapping group.
+`MaxCompactionBytes` then caps the input merged in one pass so a large group drains
+in bounded steps rather than one merge that pins the disk. Both the overlap scope
+and the byte cap apply even when a compaction relocates into a new, deeper,
+still-empty tier (a growth hop): such a hop still reclaims a tombstone whose key no
+left-behind table holds, but it is bounded, so a fast-growing store never merges its
+entire accumulated tier in one pass. Only the in-place merge at the deepest
+populated tier merges the complete tier and every overlapping shallower table at
+once, which bottom tombstone GC requires so removing a tombstone cannot reveal an
+older value elsewhere. Set `DisableOverlapSelection` to always merge the whole tier
+instead.
 
 Target `.sst` size grows with tier depth, so deep (cold) tiers hold fewer, larger
 files and shallow (hot) tiers hold small ones that flush and merge cheaply. As

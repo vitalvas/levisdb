@@ -933,11 +933,21 @@ func TestCompactionByteCapDrainsTierOverRounds(t *testing.T) {
 	cc.MaxCompactionBytes = oneSize*2 + 1 // ~2 tables per non-bottom compaction
 
 	// Repeatedly compact depth 0 until it drains; each round is byte-capped.
+	// This is a GROWTH HOP (depth 0 -> empty depth 1): the byte cap must still apply.
+	// Before the cap was extended to growth hops, the whole tier merged in one
+	// uncapped pass (because relocating into a new deeper tier set dropTombstones,
+	// which skipped the cap), stalling the serialized compactor on a large tier.
 	rounds := 0
 	for s.depth0Count() >= 2 && rounds < 20 {
 		require.NoError(t, s.Compact(0, ^uint64(0), cc))
+		res := s.takeLastCompaction()
+		if res.Done {
+			assert.LessOrEqual(t, res.InputTables, 3,
+				"a byte-capped growth hop merges only a couple of tables, not the whole tier")
+		}
 		rounds++
 	}
+	assert.Greater(t, rounds, 1, "a capped tier of 6 tables drains over several rounds, not one")
 
 	// All keys remain readable after the capped multi-round compaction.
 	for tbl := 0; tbl < tables; tbl++ {

@@ -67,12 +67,14 @@
 //
 // MaxLevels (1..8, default 8) bounds the ladder: the deepest tier merges in place
 // so it never grows deeper, trading larger bottom merges for tighter read and
-// recovery fan-out. A non-bottom compaction merges only the largest group of
-// key-overlapping tables (overlap-scoped selection) so unrelated key ranges are
-// not rewritten; set DisableOverlapSelection to always merge the whole tier.
-// MaxCompactionBytes caps the input merged in one non-bottom pass (negative
-// disables the cap); bottom merges always include the whole tier and overlapping
-// shallower tables so tombstone GC stays correct after ingestion.
+// recovery fan-out. A compaction merges only the largest group of key-overlapping
+// tables (overlap-scoped selection) so unrelated key ranges are not rewritten; set
+// DisableOverlapSelection to always merge the whole tier. MaxCompactionBytes caps
+// the input merged in one pass (negative disables the cap). Both apply even to a
+// growth hop that relocates into a new, deeper, still-empty tier, so a fast-growing
+// store never merges its whole accumulated tier at once; only the in-place merge at
+// the deepest populated tier merges the complete tier and overlapping shallower
+// tables, which bottom tombstone GC requires to stay correct after ingestion.
 //
 // Writes are throttled by fresh-tier table count so a burst cannot outrun the
 // serialized compactor: at L0SlowdownTables (default 16) writes are delayed, and
