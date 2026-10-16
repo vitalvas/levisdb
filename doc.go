@@ -75,11 +75,14 @@
 // store never merges its whole accumulated tier at once; only the in-place merge at
 // the deepest populated tier merges the complete tier and overlapping shallower
 // tables, which bottom tombstone GC requires to stay correct after ingestion.
-// MinCompactionTables (default 4) defers a non-bottom merge of fewer tables, and a
-// merge of mutually disjoint tables with nothing to reclaim is skipped entirely:
-// relocating such tables a tier deeper reclaims nothing, so the tier waits until it
-// has enough overlapping tables to be worth the rewrite. L0 (which must always
-// drain), bottom GC merges, and a manual full compaction are exempt.
+// MinCompactionTables (default 4) is the fewest tables a non-L0 tier must hold
+// before the picker selects it, so a tier is merged in substantial batches rather
+// than many tiny shuffles. A disjoint tier (no key overlap, nothing to reclaim by
+// merging in place) is otherwise left alone, but once it grows past twice the
+// fan-out ratio it is still compacted so its tables descend into the next, larger
+// tier, which halves their count and bounds read amplification for workloads of
+// disjoint keys. L0 always drains regardless, and a manual full compaction bypasses
+// the floor to fully collapse the ladder.
 //
 // Writes are throttled by fresh-tier table count so a burst cannot outrun the
 // serialized compactor: at L0SlowdownTables (default 16) writes are delayed, and

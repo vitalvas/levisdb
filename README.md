@@ -169,7 +169,7 @@ target a single slow spinning disk.
 | `Dir` | (required) | Data directory. |
 | `MemtableSize` | `8 MiB` | Memtable flush threshold in bytes. |
 | `TierRatio` | `4` | Size-tiered compaction fan-out (tables per tier before merge). |
-| `MinCompactionTables` | `4` | Fewest tables a non-bottom merge runs with after scoping; a smaller or zero-reclaim disjoint merge is deferred. Below 2 is raised to 2. L0 and bottom merges are exempt. |
+| `MinCompactionTables` | `4` | Fewest tables a non-L0 tier must hold before the picker compacts it. A crowded disjoint tier descends anyway to bound table count. Below 2 is raised to 2. L0 and manual full compaction are exempt. |
 | `TierByteTrigger` | `8 x FileSizeMax` | Tier bytes that trigger compaction below the count ratio; negative disables. |
 | `TombstoneCompactionRatio` | `0.5` | Delete fraction that triggers early compaction; negative disables. |
 | `L0SlowdownTables` | `16` | Fresh-tier table count that slows writers. |
@@ -381,14 +381,16 @@ once, which bottom tombstone GC requires so removing a tombstone cannot reveal a
 older value elsewhere. Set `DisableOverlapSelection` to always merge the whole tier
 instead.
 
-After scoping, a non-bottom merge runs only if it is worth the read and rewrite. A
-merge of fewer than `MinCompactionTables` tables, or one whose tables are mutually
-disjoint with nothing to reclaim (no filter, no tombstones, no overlap with the
-destination tier), is deferred: relocating such tables a tier deeper reclaims
-nothing. The tier is re-picked once it accumulates enough overlapping tables to
-amortize the work. L0 is exempt (fresh flushes always drain to bound read
-amplification), as are bottom-tier GC merges and a manual full compaction (which
-must fully collapse the ladder).
+The picker selects a non-L0 tier only once it holds at least `MinCompactionTables`
+tables, so each merge drains a substantial batch rather than shuffling a couple of
+tables a tier deeper. A disjoint tier (no key overlap, so merging in place reclaims
+nothing) is otherwise left alone — but once it grows past twice the fan-out ratio it
+is compacted anyway, moving its tables into the next, larger tier; that halves their
+count and keeps read amplification bounded for workloads of disjoint keys (such as
+random content hashes). L0 always drains regardless of the floor, and a manual full
+compaction bypasses it to fully collapse the ladder. Placing this decision in the
+picker (not the merge step) keeps the two in agreement, so the compactor never
+declines a tier the picker keeps selecting.
 
 Target `.sst` size grows with tier depth, so deep (cold) tiers hold fewer, larger
 files and shallow (hot) tiers hold small ones that flush and merge cheaply. As

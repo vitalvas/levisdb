@@ -110,11 +110,11 @@ func TestPickCompactionOverlapGate(t *testing.T) {
 		s.mu.Unlock()
 		t.Cleanup(func() { s.mu.Lock(); s.setTables(nil); s.mu.Unlock() })
 
-		assert.Equal(t, -1, s.pickCompaction(4, 0, 0, true),
+		assert.Equal(t, -1, s.pickCompaction(4, 0, 0, true, 0),
 			"disjoint tables at count ratio are left alone with the gate on")
-		assert.Equal(t, -1, s.pickCompaction(4, 1<<10, 0, true),
+		assert.Equal(t, -1, s.pickCompaction(4, 1<<10, 0, true, 0),
 			"byte trigger is also gated on overlap")
-		assert.Equal(t, 1, s.pickCompaction(4, 0, 0, false),
+		assert.Equal(t, 1, s.pickCompaction(4, 0, 0, false, 0),
 			"disabling the gate restores the unconditional count trigger")
 	})
 
@@ -131,7 +131,7 @@ func TestPickCompactionOverlapGate(t *testing.T) {
 		s.mu.Unlock()
 		t.Cleanup(func() { s.mu.Lock(); s.setTables(nil); s.mu.Unlock() })
 
-		assert.Equal(t, 1, s.pickCompaction(4, 0, 0, true),
+		assert.Equal(t, 1, s.pickCompaction(4, 0, 0, true, 0),
 			"a tier with overlapping tables still triggers by count")
 	})
 }

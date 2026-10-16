@@ -52,6 +52,28 @@ func TestGetMissing(t *testing.T) {
 	assert.ErrorIs(t, err, ErrNotFound)
 }
 
+// TestCompactOnceStopsWhenNoWork guards the scheduler-spin regression: compactOnce
+// must return false once the picker has nothing ready, so the background loop (which
+// runs while flushOnce or compactOnce reports progress) parks instead of re-picking
+// the same tier forever. Before the fix compactOnce always returned true, and a tier
+// the picker kept selecting but the compactor kept declining span millions of
+// no-op rounds.
+func TestCompactOnceStopsWhenNoWork(t *testing.T) {
+	t.Parallel()
+	db := openTestDB(t, func(o *Options) { o.MemtableSize = 1 << 30 })
+
+	// Write a little data and flush it to a single L0 table; nothing is ready to
+	// compact (one table, no overlap, below every trigger).
+	require.NoError(t, db.Put(PutOptions{Key: []byte("a"), Value: []byte("1")}))
+	require.NoError(t, db.eng.Flush())
+
+	// Drive compactOnce directly; it must report "no work" rather than spinning.
+	for i := 0; i < 5; i++ {
+		assert.False(t, db.compactOnce(db.eng),
+			"compactOnce must return false when the picker has no ready tier")
+	}
+}
+
 func TestDeduplicationSkipsUnchangedPuts(t *testing.T) {
 	t.Parallel()
 	// LatestSeq advances only when a write lands in the WAL, so an unchanged seq

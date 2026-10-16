@@ -29,7 +29,7 @@ func TestPickCompactionCapTierIsTerminal(t *testing.T) {
 	}
 	s.mu.Unlock()
 	t.Cleanup(func() { s.mu.Lock(); s.tables = nil; s.mu.Unlock() })
-	assert.Equal(t, -1, s.pickCompaction(4, 1<<10, 0, true),
+	assert.Equal(t, -1, s.pickCompaction(4, 1<<10, 0, true, 0),
 		"cap tier must not be picked by count or bytes (terminal, would loop)")
 
 	// A cap tier that is tombstone-heavy IS worth compacting (it shrinks).
@@ -38,7 +38,7 @@ func TestPickCompactionCapTierIsTerminal(t *testing.T) {
 		tb.tombstones = tb.entries // all deletes
 	}
 	s.mu.Unlock()
-	assert.Equal(t, maxTierDepth, s.pickCompaction(4, 0, 0.5, true),
+	assert.Equal(t, maxTierDepth, s.pickCompaction(4, 0, 0.5, true, 0),
 		"tombstone-heavy cap tier is still reclaimed")
 
 	// A tier BELOW the cap with >= ratio tables is picked by count as usual.
@@ -49,7 +49,7 @@ func TestPickCompactionCapTierIsTerminal(t *testing.T) {
 	}
 	s2.mu.Unlock()
 	t.Cleanup(func() { s2.mu.Lock(); s2.tables = nil; s2.mu.Unlock() })
-	assert.Equal(t, maxTierDepth-1, s2.pickCompaction(4, 0, 0, true),
+	assert.Equal(t, maxTierDepth-1, s2.pickCompaction(4, 0, 0, true, 0),
 		"a non-cap tier at the count ratio is still picked")
 }
 
@@ -300,14 +300,14 @@ func TestPickCompaction(t *testing.T) {
 	s := newTestEngine(t, 1<<20)
 
 	t.Run("nothing ready", func(t *testing.T) {
-		assert.Equal(t, -1, s.pickCompaction(2, 0, 0, true))
+		assert.Equal(t, -1, s.pickCompaction(2, 0, 0, true, 0))
 	})
 
 	t.Run("ready at ratio", func(t *testing.T) {
 		flushSingle(t, s, 1, "a", "1")
-		assert.Equal(t, -1, s.pickCompaction(2, 0, 0, true), "one table below ratio")
+		assert.Equal(t, -1, s.pickCompaction(2, 0, 0, true, 0), "one table below ratio")
 		flushSingle(t, s, 2, "b", "2")
-		assert.Equal(t, 0, s.pickCompaction(2, 0, 0, true), "two L0 tables meet ratio 2")
+		assert.Equal(t, 0, s.pickCompaction(2, 0, 0, true, 0), "two L0 tables meet ratio 2")
 	})
 }
 
@@ -351,7 +351,7 @@ func TestPickCompactionLargeTableStall(t *testing.T) {
 
 	require.Equal(t, tables, depth0, "each Flush produced one L0 table")
 	assert.Greater(t, bytes, int64(1<<20), "the tier holds well over a MiB")
-	assert.Equal(t, -1, s.pickCompaction(4, 0, 0, true),
+	assert.Equal(t, -1, s.pickCompaction(4, 0, 0, true, 0),
 		"count-based picker stalls: a few large tables never reach the ratio")
 }
 
@@ -376,8 +376,8 @@ func TestPickCompactionDensityTrigger(t *testing.T) {
 		s.mu.RUnlock()
 
 		// Count trigger alone still stalls; the density trigger fires.
-		assert.Equal(t, -1, s.pickCompaction(4, 0, 0, true), "count trigger stalls")
-		assert.Equal(t, 0, s.pickCompaction(4, bytes, 0, true),
+		assert.Equal(t, -1, s.pickCompaction(4, 0, 0, true, 0), "count trigger stalls")
+		assert.Equal(t, 0, s.pickCompaction(4, bytes, 0, true, 0),
 			"density trigger picks the tier once its bytes reach the threshold")
 	})
 
@@ -385,7 +385,7 @@ func TestPickCompactionDensityTrigger(t *testing.T) {
 		s := newTestEngine(t, 1<<30)
 		flushSingle(t, s, 1, "a", "1")
 		flushSingle(t, s, 2, "b", "2") // two tiny tables, well under any real trigger
-		assert.Equal(t, -1, s.pickCompaction(4, 1<<30, 0, true),
+		assert.Equal(t, -1, s.pickCompaction(4, 1<<30, 0, true, 0),
 			"a couple of tiny tables are below the byte trigger")
 	})
 
@@ -395,7 +395,7 @@ func TestPickCompactionDensityTrigger(t *testing.T) {
 		s.mu.RLock()
 		bytes := s.tables[0].size
 		s.mu.RUnlock()
-		assert.Equal(t, -1, s.pickCompaction(4, bytes, 0, true),
+		assert.Equal(t, -1, s.pickCompaction(4, bytes, 0, true, 0),
 			"byte trigger requires >= 2 tables, so a lone table is left")
 	})
 }
@@ -876,7 +876,7 @@ func BenchmarkPickCompaction(b *testing.B) {
 	}
 	b.ResetTimer()
 	for n := 0; n < b.N; n++ {
-		_ = s.pickCompaction(4, 128<<20, 0.5, true)
+		_ = s.pickCompaction(4, 128<<20, 0.5, true, 0)
 	}
 }
 
@@ -957,126 +957,67 @@ func TestCompactionByteCapDrainsTierOverRounds(t *testing.T) {
 	}
 }
 
-// smallRollCompactionConfig rolls output into tiny tables so a modest amount of data
-// produces several disjoint depth-1 tables without writing megabytes (keeping the
-// test fast). ForceMerge bypasses the throttles during setup.
-func smallRollCompactionConfig() compactionConfigT {
-	cc := testCompactionConfig()
-	cc.FileSizeBase = 4 << 10 // 4 KiB target: output rolls every few keys
-	cc.FileSizeMax = 4 << 10
-	cc.FileSizeMultiplier = 1
-	cc.ForceMerge = true
-	return cc
-}
-
-// buildDepth1Tables creates an engine whose depth-1 tier holds several disjoint
-// tables. It flushes two L0 tables of disjoint, contiguous key ranges and force-
-// merges them to depth 1 with a tiny roll size, so the output splits into multiple
-// tables. n scales the key count. Returns the engine and the actual depth-1 count.
-func buildDepth1Tables(t *testing.T) (*engineT, int) {
-	t.Helper()
-	s := newTestEngine(t, 1<<30)
-	val := make([]byte, 256)
-	const rows = 80 // enough that the 4 KiB roll splits the merge into several tables
-	var seq uint64
-	for half := 0; half < 2; half++ {
-		for i := 0; i < rows/2; i++ {
-			seq++
-			k := fmt.Sprintf("k%08d", half*(rows/2)+i)
-			s.Put(seq, []byte(k), val)
-		}
-		require.NoError(t, s.Flush())
+// disjointTierStub builds n metadata-only disjoint tables at the given depth, with
+// contiguous non-overlapping key ranges and no tombstones.
+func disjointTierStub(depth, n int) []*tableMeta {
+	tbls := make([]*tableMeta, n)
+	for i := 0; i < n; i++ {
+		lo := fmt.Sprintf("k%04da", i)
+		hi := fmt.Sprintf("k%04dz", i)
+		tbls[i] = &tableMeta{depth: depth, size: 1 << 20, entries: 1000, minKey: []byte(lo), maxKey: []byte(hi)}
 	}
-	cc := smallRollCompactionConfig()
-	require.NoError(t, s.Compact(0, ^uint64(0), cc)) // one forced L0->L1 move
-	require.Zero(t, s.depth0Count(), "L0 drained")
-	got := s.tierTableCount(1)
-	require.GreaterOrEqual(t, got, 2, "setup produced multiple disjoint depth-1 tables")
-	return s, got
+	return tbls
 }
 
-func TestMinCompactionTablesFloor(t *testing.T) {
+// TestPickCompactionMinTablesFloor covers the min-tables floor, applied in the
+// picker: a non-L0 tier below the floor is never selected, so the compactor never
+// disagrees with the picker (which would spin).
+func TestPickCompactionMinTablesFloor(t *testing.T) {
 	t.Parallel()
+	s := newTestEngine(t, 1<<30)
+	t.Cleanup(func() { s.mu.Lock(); s.setTables(nil); s.mu.Unlock() })
 
-	t.Run("defers a non-L0 merge below the floor", func(t *testing.T) {
-		t.Parallel()
-		s, n := buildDepth1Tables(t)
-		defer s.Close()
+	// Three overlapping depth-1 tables: real work, but below a floor of 4.
+	over := []*tableMeta{
+		{depth: 1, size: 1 << 20, entries: 1000, minKey: []byte("a"), maxKey: []byte("m")},
+		{depth: 1, size: 1 << 20, entries: 1000, minKey: []byte("h"), maxKey: []byte("t")},
+		{depth: 1, size: 1 << 20, entries: 1000, minKey: []byte("p"), maxKey: []byte("z")},
+	}
+	s.mu.Lock()
+	s.setTables(over)
+	s.mu.Unlock()
 
-		cc := testCompactionConfig()
-		cc.MinCompactionTables = n + 1 // floor above the actual count
-		require.NoError(t, s.Compact(1, ^uint64(0), cc))
-		assert.False(t, s.takeLastCompaction().Done, "below the floor, the merge is skipped")
-		assert.Equal(t, n, s.tierTableCount(1), "tables stay put")
-	})
-
-	// ForceMerge's bypass of the floor is covered by buildDepth1Tables (its setup move
-	// runs under ForceMerge past the throttle) and by TestCompactTieredCascadesAcrossTiers.
+	assert.Equal(t, -1, s.pickCompaction(2, 0, 0, true, 4),
+		"three tables are below the floor of 4, so the tier is not picked")
+	assert.Equal(t, 1, s.pickCompaction(2, 0, 0, true, 3),
+		"at the floor the overlapping tier is picked")
+	assert.Equal(t, 1, s.pickCompaction(2, 0, 0, true, 0),
+		"a zero floor disables the check")
 }
 
-func TestNoReclaimDisjointMergeSkipped(t *testing.T) {
+// TestPickCompactionCrowdedDisjointTierDescends covers the crowding escape: a
+// disjoint non-L0 tier is left alone while small (nothing to reclaim by merging in
+// place), but once it holds 2x the fan-out ratio it is picked so its tables descend
+// into the next, larger tier and the table count stops growing without bound.
+func TestPickCompactionCrowdedDisjointTierDescends(t *testing.T) {
 	t.Parallel()
+	s := newTestEngine(t, 1<<30)
+	t.Cleanup(func() { s.mu.Lock(); s.setTables(nil); s.mu.Unlock() })
 
-	t.Run("disjoint zero-reclaim non-L0 merge is skipped", func(t *testing.T) {
-		t.Parallel()
-		// Disjoint depth-1 tables, no tombstones, no filter: nothing to reclaim, so
-		// with a floor active the merge is skipped rather than relocating bytes, even
-		// though the table count meets the floor.
-		s, n := buildDepth1Tables(t)
-		defer s.Close()
+	const ratio = 4
+	// Below the crowding threshold (2*ratio): disjoint, so left alone.
+	s.mu.Lock()
+	s.setTables(disjointTierStub(1, ratio+1)) // 5 tables, < 2*ratio=8
+	s.mu.Unlock()
+	assert.Equal(t, -1, s.pickCompaction(ratio, 0, 0, true, 0),
+		"a lightly populated disjoint tier is not compacted")
 
-		cc := testCompactionConfig()
-		cc.MinCompactionTables = 2 // count meets floor, but no-reclaim skip still fires
-		require.NoError(t, s.Compact(1, ^uint64(0), cc))
-		assert.False(t, s.takeLastCompaction().Done, "disjoint no-reclaim merge skipped")
-		assert.Equal(t, n, s.tierTableCount(1))
-	})
-
-	t.Run("L0 always drains even when disjoint and zero-reclaim", func(t *testing.T) {
-		t.Parallel()
-		s := newTestEngine(t, 1<<30)
-		defer s.Close()
-		flushSingle(t, s, 1, "a", "1")
-		flushSingle(t, s, 2, "c", "2") // disjoint, no tombstones
-		require.Equal(t, 2, s.depth0Count())
-
-		cc := testCompactionConfig()
-		cc.MinCompactionTables = 4 // floor would block, but L0 is exempt
-		require.NoError(t, s.Compact(0, ^uint64(0), cc))
-		assert.True(t, s.takeLastCompaction().Done, "L0 drains regardless of the floor")
-		assert.Equal(t, 0, s.depth0Count())
-	})
-
-	t.Run("overlapping merge is not skipped", func(t *testing.T) {
-		t.Parallel()
-		// Two depth-1 tables that both span key "k": merging collapses the versions,
-		// a real benefit, so the no-reclaim skip must not fire. Each table is built by
-		// a separate 2-input L0->L1 compaction (one flush per key, as the other
-		// compaction tests do, so each Flush rolls its own L0 table).
-		s := newTestEngine(t, 1<<30)
-		defer s.Close()
-		cc := testCompactionConfig()
-		cc.ForceMerge = true
-
-		s.Put(1, []byte("a"), []byte("f")) // low filler
-		require.NoError(t, s.Flush())
-		s.Put(2, []byte("k"), []byte("old"))
-		require.NoError(t, s.Flush())
-		require.NoError(t, s.Compact(0, ^uint64(0), cc)) // table A spans a..k
-		require.Equal(t, 1, s.tierTableCount(1))
-
-		s.Put(3, []byte("k"), []byte("new"))
-		require.NoError(t, s.Flush())
-		s.Put(4, []byte("z"), []byte("f")) // high filler
-		require.NoError(t, s.Flush())
-		require.NoError(t, s.Compact(0, ^uint64(0), cc)) // table B spans k..z
-		require.Equal(t, 2, s.tierTableCount(1), "two depth-1 tables both covering k")
-
-		run := testCompactionConfig()
-		run.MinCompactionTables = 2
-		require.NoError(t, s.Compact(1, ^uint64(0), run))
-		assert.True(t, s.takeLastCompaction().Done, "an overlapping merge still runs")
-	})
+	// At the crowding threshold: picked so the tier consolidates into the next tier.
+	s.mu.Lock()
+	s.setTables(disjointTierStub(1, 2*ratio)) // 8 tables
+	s.mu.Unlock()
+	assert.Equal(t, 1, s.pickCompaction(ratio, 0, 0, true, 0),
+		"a crowded disjoint tier descends to bound table count")
 }
 
 func TestRangesMayContain(t *testing.T) {
@@ -1262,16 +1203,16 @@ func TestTombstoneRatioTriggersCompaction(t *testing.T) {
 
 	// 4 tombstones / 6 entries ~= 0.67. Below the count threshold, only the
 	// tombstone trigger can mark this tier ready.
-	assert.Equal(t, -1, s.pickCompaction(1000, 0, 0, true), "no trigger without tombstone ratio")
-	assert.Equal(t, -1, s.pickCompaction(1000, 0, 0.9, true), "ratio too high to trigger")
-	assert.Equal(t, 0, s.pickCompaction(1000, 0, 0.5, true), "delete-heavy tier triggers at 0.5")
+	assert.Equal(t, -1, s.pickCompaction(1000, 0, 0, true, 0), "no trigger without tombstone ratio")
+	assert.Equal(t, -1, s.pickCompaction(1000, 0, 0.9, true, 0), "ratio too high to trigger")
+	assert.Equal(t, 0, s.pickCompaction(1000, 0, 0.5, true, 0), "delete-heavy tier triggers at 0.5")
 
 	// A single table cannot compact alone even if delete-heavy (needs >= 2).
 	s2 := newTestEngine(t, 1<<20)
 	defer s2.Close()
 	s2.del(1, []byte("x"))
 	require.NoError(t, s2.Flush())
-	assert.Equal(t, -1, s2.pickCompaction(1000, 0, 0.1, true), "single table not compacted alone")
+	assert.Equal(t, -1, s2.pickCompaction(1000, 0, 0.1, true, 0), "single table not compacted alone")
 }
 
 func TestTombstoneCompactionReclaimsDeletedSpace(t *testing.T) {
@@ -1296,7 +1237,7 @@ func TestTombstoneCompactionReclaimsDeletedSpace(t *testing.T) {
 
 	// Count trigger off (high ratio), tombstone trigger on: the picker must select
 	// the delete-heavy depth-0 tier.
-	depth := s.pickCompaction(1000, 0, 0.5, true)
+	depth := s.pickCompaction(1000, 0, 0.5, true, 0)
 	require.Equal(t, 0, depth, "tombstone trigger must select the delete-heavy tier")
 
 	// Compact it to the bottom (retainSeq high so tombstones are reclaimable).

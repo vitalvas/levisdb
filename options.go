@@ -150,14 +150,14 @@ type Options struct {
 	// TierRatio is the size-tiered compaction fan-out.
 	TierRatio int
 
-	// MinCompactionTables is the fewest same-tier tables a non-bottom compaction will
-	// merge. After overlap scoping and the byte cap narrow the inputs, a merge with
-	// fewer than this many tables is skipped rather than rewritten, because relocating
-	// a few disjoint tables one tier deeper reclaims nothing and only burns CPU and
-	// I/O. A lone disjoint table is relocated by a trivial move (a metadata-only depth
-	// change, no rewrite) so the floor never strands data. Zero uses the default
-	// (TierRatio); a value below 2 is raised to 2. Bottom-tier merges ignore this:
-	// they must run for tombstone GC.
+	// MinCompactionTables is the fewest tables a non-L0 tier must hold before the
+	// compaction picker selects it, so each merge drains a substantial batch instead
+	// of shuffling a couple of tables a tier deeper for little gain. A disjoint tier
+	// (no key overlap, nothing to reclaim by merging in place) is otherwise left
+	// alone, but once it grows past twice the fan-out ratio it is compacted anyway so
+	// its tables descend into the next, larger tier and the table count stays bounded.
+	// L0 is exempt (fresh flushes must always drain), as is a manual full compaction.
+	// Zero uses the default (4); a value below 2 is raised to 2.
 	MinCompactionTables int
 
 	// TierByteTrigger compacts a tier once its aggregate on-disk size reaches this

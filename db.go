@@ -560,22 +560,21 @@ func maxCompactionBytes(v int64) int64 {
 
 func (db *DB) compactionConfig() compactionConfigT {
 	return compactionConfigT{
-		TierRatio:           db.opts.TierRatio,
-		TierByteTrigger:     db.opts.TierByteTrigger,
-		BloomBits:           db.opts.BloomBits,
-		BlockSize:           db.opts.BlockSize,
-		FreshCodecName:      db.opts.FreshCodec,
-		BottomCodecName:     db.opts.BottomCodec,
-		LevelCodecs:         db.opts.LevelCodecs,
-		FileSizeBase:        db.opts.FileSizeBase,
-		FileSizeMultiplier:  db.opts.FileSizeMultiplier,
-		FileSizeMax:         db.opts.FileSizeMax,
-		MaxLevels:           db.opts.MaxLevels,
-		ExpireBefore:        db.snaps.oldestIteratorTime(time.Now().Unix()),
-		Filter:              db.opts.CompactionFilter,
-		MaxCompactionBytes:  maxCompactionBytes(db.opts.MaxCompactionBytes),
-		OverlapSelection:    !db.opts.DisableOverlapSelection,
-		MinCompactionTables: db.opts.MinCompactionTables,
+		TierRatio:          db.opts.TierRatio,
+		TierByteTrigger:    db.opts.TierByteTrigger,
+		BloomBits:          db.opts.BloomBits,
+		BlockSize:          db.opts.BlockSize,
+		FreshCodecName:     db.opts.FreshCodec,
+		BottomCodecName:    db.opts.BottomCodec,
+		LevelCodecs:        db.opts.LevelCodecs,
+		FileSizeBase:       db.opts.FileSizeBase,
+		FileSizeMultiplier: db.opts.FileSizeMultiplier,
+		FileSizeMax:        db.opts.FileSizeMax,
+		MaxLevels:          db.opts.MaxLevels,
+		ExpireBefore:       db.snaps.oldestIteratorTime(time.Now().Unix()),
+		Filter:             db.opts.CompactionFilter,
+		MaxCompactionBytes: maxCompactionBytes(db.opts.MaxCompactionBytes),
+		OverlapSelection:   !db.opts.DisableOverlapSelection,
 	}
 }
 
@@ -1605,7 +1604,7 @@ func (db *DB) compactOnce(s *engineT) bool {
 	if db.snaps.oldest(db.readSeq.Load()) < db.readSeq.Load() {
 		tombstoneRatio = 0
 	}
-	depth := s.pickCompaction(db.opts.TierRatio, db.opts.TierByteTrigger, tombstoneRatio, !db.opts.DisableOverlapSelection)
+	depth := s.pickCompaction(db.opts.TierRatio, db.opts.TierByteTrigger, tombstoneRatio, !db.opts.DisableOverlapSelection, db.opts.MinCompactionTables)
 	if depth < 0 {
 		return false
 	}
@@ -1632,7 +1631,16 @@ func (db *DB) compactOnce(s *engineT) bool {
 		db.setBackgroundError(err)
 		return false
 	}
-	if res := s.takeLastCompaction(); logCompaction && res.Done {
+	res := s.takeLastCompaction()
+	// A throttled or no-reclaim merge leaves res.Done false and changes nothing.
+	// Report that so the scheduler loop stops instead of re-picking the identical
+	// tier forever: the picker would keep selecting it (its table count still trips
+	// the trigger) while the compactor keeps declining, a hot spin. Returning false
+	// parks the compactor until the next flush or write re-arms it.
+	if !res.Done {
+		return false
+	}
+	if logCompaction {
 		db.logCompactionOutputs(res.Outputs)
 		db.log.Debug("compaction done",
 			"op", "compaction", "depth", depth, "output_depth", res.OutputDepth,
@@ -1761,11 +1769,10 @@ func (db *DB) compactEngineFully() error {
 // (CollapseInPlace), and via RewriteSingle runs even after the cascade collapsed
 // the data to a single bottom table.
 func (db *DB) compactTiered(retain uint64, cc compactionConfigT) error {
-	// A manual full compaction must fully collapse the ladder to the bottom, so the
-	// automatic throttles that defer small or no-reclaim merges are disabled here: the
-	// min-tables floor and the no-reclaim-disjoint skip would otherwise strand data
-	// mid-ladder. Overlap scoping and the byte cap remain, keeping each hop bounded.
-	cc.ForceMerge = true
+	// A manual full compaction drives Compact directly per depth, bypassing the
+	// picker (where the min-tables floor lives), so every hop runs and the ladder
+	// fully collapses to the bottom. Overlap scoping and the byte cap still bound
+	// each hop.
 	bottom := db.eng.maxPopulatedDepth()
 	for depth := 0; depth < bottom; depth++ {
 		hop := cc
