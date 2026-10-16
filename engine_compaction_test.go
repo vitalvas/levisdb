@@ -957,6 +957,128 @@ func TestCompactionByteCapDrainsTierOverRounds(t *testing.T) {
 	}
 }
 
+// smallRollCompactionConfig rolls output into tiny tables so a modest amount of data
+// produces several disjoint depth-1 tables without writing megabytes (keeping the
+// test fast). ForceMerge bypasses the throttles during setup.
+func smallRollCompactionConfig() compactionConfigT {
+	cc := testCompactionConfig()
+	cc.FileSizeBase = 4 << 10 // 4 KiB target: output rolls every few keys
+	cc.FileSizeMax = 4 << 10
+	cc.FileSizeMultiplier = 1
+	cc.ForceMerge = true
+	return cc
+}
+
+// buildDepth1Tables creates an engine whose depth-1 tier holds several disjoint
+// tables. It flushes two L0 tables of disjoint, contiguous key ranges and force-
+// merges them to depth 1 with a tiny roll size, so the output splits into multiple
+// tables. n scales the key count. Returns the engine and the actual depth-1 count.
+func buildDepth1Tables(t *testing.T) (*engineT, int) {
+	t.Helper()
+	s := newTestEngine(t, 1<<30)
+	val := make([]byte, 256)
+	const rows = 80 // enough that the 4 KiB roll splits the merge into several tables
+	var seq uint64
+	for half := 0; half < 2; half++ {
+		for i := 0; i < rows/2; i++ {
+			seq++
+			k := fmt.Sprintf("k%08d", half*(rows/2)+i)
+			s.Put(seq, []byte(k), val)
+		}
+		require.NoError(t, s.Flush())
+	}
+	cc := smallRollCompactionConfig()
+	require.NoError(t, s.Compact(0, ^uint64(0), cc)) // one forced L0->L1 move
+	require.Zero(t, s.depth0Count(), "L0 drained")
+	got := s.tierTableCount(1)
+	require.GreaterOrEqual(t, got, 2, "setup produced multiple disjoint depth-1 tables")
+	return s, got
+}
+
+func TestMinCompactionTablesFloor(t *testing.T) {
+	t.Parallel()
+
+	t.Run("defers a non-L0 merge below the floor", func(t *testing.T) {
+		t.Parallel()
+		s, n := buildDepth1Tables(t)
+		defer s.Close()
+
+		cc := testCompactionConfig()
+		cc.MinCompactionTables = n + 1 // floor above the actual count
+		require.NoError(t, s.Compact(1, ^uint64(0), cc))
+		assert.False(t, s.takeLastCompaction().Done, "below the floor, the merge is skipped")
+		assert.Equal(t, n, s.tierTableCount(1), "tables stay put")
+	})
+
+	// ForceMerge's bypass of the floor is covered by buildDepth1Tables (its setup move
+	// runs under ForceMerge past the throttle) and by TestCompactTieredCascadesAcrossTiers.
+}
+
+func TestNoReclaimDisjointMergeSkipped(t *testing.T) {
+	t.Parallel()
+
+	t.Run("disjoint zero-reclaim non-L0 merge is skipped", func(t *testing.T) {
+		t.Parallel()
+		// Disjoint depth-1 tables, no tombstones, no filter: nothing to reclaim, so
+		// with a floor active the merge is skipped rather than relocating bytes, even
+		// though the table count meets the floor.
+		s, n := buildDepth1Tables(t)
+		defer s.Close()
+
+		cc := testCompactionConfig()
+		cc.MinCompactionTables = 2 // count meets floor, but no-reclaim skip still fires
+		require.NoError(t, s.Compact(1, ^uint64(0), cc))
+		assert.False(t, s.takeLastCompaction().Done, "disjoint no-reclaim merge skipped")
+		assert.Equal(t, n, s.tierTableCount(1))
+	})
+
+	t.Run("L0 always drains even when disjoint and zero-reclaim", func(t *testing.T) {
+		t.Parallel()
+		s := newTestEngine(t, 1<<30)
+		defer s.Close()
+		flushSingle(t, s, 1, "a", "1")
+		flushSingle(t, s, 2, "c", "2") // disjoint, no tombstones
+		require.Equal(t, 2, s.depth0Count())
+
+		cc := testCompactionConfig()
+		cc.MinCompactionTables = 4 // floor would block, but L0 is exempt
+		require.NoError(t, s.Compact(0, ^uint64(0), cc))
+		assert.True(t, s.takeLastCompaction().Done, "L0 drains regardless of the floor")
+		assert.Equal(t, 0, s.depth0Count())
+	})
+
+	t.Run("overlapping merge is not skipped", func(t *testing.T) {
+		t.Parallel()
+		// Two depth-1 tables that both span key "k": merging collapses the versions,
+		// a real benefit, so the no-reclaim skip must not fire. Each table is built by
+		// a separate 2-input L0->L1 compaction (one flush per key, as the other
+		// compaction tests do, so each Flush rolls its own L0 table).
+		s := newTestEngine(t, 1<<30)
+		defer s.Close()
+		cc := testCompactionConfig()
+		cc.ForceMerge = true
+
+		s.Put(1, []byte("a"), []byte("f")) // low filler
+		require.NoError(t, s.Flush())
+		s.Put(2, []byte("k"), []byte("old"))
+		require.NoError(t, s.Flush())
+		require.NoError(t, s.Compact(0, ^uint64(0), cc)) // table A spans a..k
+		require.Equal(t, 1, s.tierTableCount(1))
+
+		s.Put(3, []byte("k"), []byte("new"))
+		require.NoError(t, s.Flush())
+		s.Put(4, []byte("z"), []byte("f")) // high filler
+		require.NoError(t, s.Flush())
+		require.NoError(t, s.Compact(0, ^uint64(0), cc)) // table B spans k..z
+		require.Equal(t, 2, s.tierTableCount(1), "two depth-1 tables both covering k")
+
+		run := testCompactionConfig()
+		run.MinCompactionTables = 2
+		require.NoError(t, s.Compact(1, ^uint64(0), run))
+		assert.True(t, s.takeLastCompaction().Done, "an overlapping merge still runs")
+	})
+}
+
 func TestRangesMayContain(t *testing.T) {
 	t.Parallel()
 	ranges := [][2][]byte{

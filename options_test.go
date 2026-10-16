@@ -16,6 +16,7 @@ func TestDefaultOptions(t *testing.T) {
 	assert.Equal(t, "/tmp/db", o.Dir)
 	assert.Equal(t, int64(DefaultMemtableSize), o.MemtableSize)
 	assert.Equal(t, DefaultTierRatio, o.TierRatio)
+	assert.Equal(t, DefaultMinCompactionTables, o.MinCompactionTables)
 	assert.Equal(t, int64(DefaultFileSizeBase), o.FileSizeBase)
 	assert.Equal(t, DefaultFileSizeMultiplier, o.FileSizeMultiplier)
 	assert.Equal(t, int64(DefaultFileSizeMax), o.FileSizeMax)
@@ -84,6 +85,28 @@ func TestFillDefaultsTierByteTrigger(t *testing.T) {
 		o := Options{Dir: "/d", TierByteTrigger: 5 << 20}
 		o.fillDefaults()
 		assert.Equal(t, int64(5<<20), o.TierByteTrigger)
+	})
+}
+
+func TestFillDefaultsMinCompactionTables(t *testing.T) {
+	t.Parallel()
+
+	t.Run("zero takes the default", func(t *testing.T) {
+		o := Options{Dir: "/d"}
+		o.fillDefaults()
+		assert.Equal(t, DefaultMinCompactionTables, o.MinCompactionTables)
+	})
+
+	t.Run("below two is raised to two", func(t *testing.T) {
+		o := Options{Dir: "/d", MinCompactionTables: 1}
+		o.fillDefaults()
+		assert.Equal(t, 2, o.MinCompactionTables, "a merge needs at least two tables")
+	})
+
+	t.Run("explicit value preserved", func(t *testing.T) {
+		o := Options{Dir: "/d", MinCompactionTables: 6}
+		o.fillDefaults()
+		assert.Equal(t, 6, o.MinCompactionTables)
 	})
 }
 

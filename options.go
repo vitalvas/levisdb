@@ -65,6 +65,14 @@ const (
 	// memory and a larger buffer lengthens recovery replay.
 	DefaultMemtableSize = 8 << 20
 	DefaultTierRatio    = 4
+	// DefaultMinCompactionTables is the fewest same-tier tables a non-bottom
+	// compaction will merge. Below it the merge is skipped as not worth the read and
+	// rewrite: a pair of disjoint tables relocated one tier deeper reclaims nothing.
+	// Set to TierRatio so a tier that just reached the count trigger still merges,
+	// but overlap scoping and the byte cap never whittle a merge down to a wasteful
+	// two-table shuffle. A single disjoint table is relocated by a trivial move
+	// (metadata-only depth change) instead, so this floor does not strand data.
+	DefaultMinCompactionTables = 4
 	// DefaultTombstoneCompactionRatio compacts a tier once half its entries are
 	// tombstones, reclaiming delete-heavy data without waiting for the table-count
 	// trigger. A negative value in Options disables it.
@@ -141,6 +149,16 @@ type Options struct {
 	MemtableSize int64
 	// TierRatio is the size-tiered compaction fan-out.
 	TierRatio int
+
+	// MinCompactionTables is the fewest same-tier tables a non-bottom compaction will
+	// merge. After overlap scoping and the byte cap narrow the inputs, a merge with
+	// fewer than this many tables is skipped rather than rewritten, because relocating
+	// a few disjoint tables one tier deeper reclaims nothing and only burns CPU and
+	// I/O. A lone disjoint table is relocated by a trivial move (a metadata-only depth
+	// change, no rewrite) so the floor never strands data. Zero uses the default
+	// (TierRatio); a value below 2 is raised to 2. Bottom-tier merges ignore this:
+	// they must run for tombstone GC.
+	MinCompactionTables int
 
 	// TierByteTrigger compacts a tier once its aggregate on-disk size reaches this
 	// many bytes, even if it holds fewer than TierRatio tables. The count trigger
@@ -332,6 +350,12 @@ func DefaultOptions(dir string) Options {
 func (o *Options) fillDefaults() {
 	if o.TierRatio == 0 {
 		o.TierRatio = DefaultTierRatio
+	}
+	switch {
+	case o.MinCompactionTables == 0:
+		o.MinCompactionTables = DefaultMinCompactionTables
+	case o.MinCompactionTables < 2:
+		o.MinCompactionTables = 2 // a merge needs at least two tables to combine
 	}
 	switch {
 	case o.TombstoneCompactionRatio == 0:

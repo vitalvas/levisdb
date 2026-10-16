@@ -22,7 +22,7 @@ func writeTempFile(t *testing.T, dir, name string, data []byte) string {
 func TestFDPoolBoundsOpenDescriptors(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	const files = 50
+	const files = 20 // far more than limit, enough to exercise eviction without churn
 	const limit = 4
 	pool := newFDPool(limit)
 

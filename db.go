@@ -560,21 +560,22 @@ func maxCompactionBytes(v int64) int64 {
 
 func (db *DB) compactionConfig() compactionConfigT {
 	return compactionConfigT{
-		TierRatio:          db.opts.TierRatio,
-		TierByteTrigger:    db.opts.TierByteTrigger,
-		BloomBits:          db.opts.BloomBits,
-		BlockSize:          db.opts.BlockSize,
-		FreshCodecName:     db.opts.FreshCodec,
-		BottomCodecName:    db.opts.BottomCodec,
-		LevelCodecs:        db.opts.LevelCodecs,
-		FileSizeBase:       db.opts.FileSizeBase,
-		FileSizeMultiplier: db.opts.FileSizeMultiplier,
-		FileSizeMax:        db.opts.FileSizeMax,
-		MaxLevels:          db.opts.MaxLevels,
-		ExpireBefore:       db.snaps.oldestIteratorTime(time.Now().Unix()),
-		Filter:             db.opts.CompactionFilter,
-		MaxCompactionBytes: maxCompactionBytes(db.opts.MaxCompactionBytes),
-		OverlapSelection:   !db.opts.DisableOverlapSelection,
+		TierRatio:           db.opts.TierRatio,
+		TierByteTrigger:     db.opts.TierByteTrigger,
+		BloomBits:           db.opts.BloomBits,
+		BlockSize:           db.opts.BlockSize,
+		FreshCodecName:      db.opts.FreshCodec,
+		BottomCodecName:     db.opts.BottomCodec,
+		LevelCodecs:         db.opts.LevelCodecs,
+		FileSizeBase:        db.opts.FileSizeBase,
+		FileSizeMultiplier:  db.opts.FileSizeMultiplier,
+		FileSizeMax:         db.opts.FileSizeMax,
+		MaxLevels:           db.opts.MaxLevels,
+		ExpireBefore:        db.snaps.oldestIteratorTime(time.Now().Unix()),
+		Filter:              db.opts.CompactionFilter,
+		MaxCompactionBytes:  maxCompactionBytes(db.opts.MaxCompactionBytes),
+		OverlapSelection:    !db.opts.DisableOverlapSelection,
+		MinCompactionTables: db.opts.MinCompactionTables,
 	}
 }
 
@@ -1760,6 +1761,11 @@ func (db *DB) compactEngineFully() error {
 // (CollapseInPlace), and via RewriteSingle runs even after the cascade collapsed
 // the data to a single bottom table.
 func (db *DB) compactTiered(retain uint64, cc compactionConfigT) error {
+	// A manual full compaction must fully collapse the ladder to the bottom, so the
+	// automatic throttles that defer small or no-reclaim merges are disabled here: the
+	// min-tables floor and the no-reclaim-disjoint skip would otherwise strand data
+	// mid-ladder. Overlap scoping and the byte cap remain, keeping each hop bounded.
+	cc.ForceMerge = true
 	bottom := db.eng.maxPopulatedDepth()
 	for depth := 0; depth < bottom; depth++ {
 		hop := cc

@@ -169,6 +169,7 @@ target a single slow spinning disk.
 | `Dir` | (required) | Data directory. |
 | `MemtableSize` | `8 MiB` | Memtable flush threshold in bytes. |
 | `TierRatio` | `4` | Size-tiered compaction fan-out (tables per tier before merge). |
+| `MinCompactionTables` | `4` | Fewest tables a non-bottom merge runs with after scoping; a smaller or zero-reclaim disjoint merge is deferred. Below 2 is raised to 2. L0 and bottom merges are exempt. |
 | `TierByteTrigger` | `8 x FileSizeMax` | Tier bytes that trigger compaction below the count ratio; negative disables. |
 | `TombstoneCompactionRatio` | `0.5` | Delete fraction that triggers early compaction; negative disables. |
 | `L0SlowdownTables` | `16` | Fresh-tier table count that slows writers. |
@@ -379,6 +380,15 @@ populated tier merges the complete tier and every overlapping shallower table at
 once, which bottom tombstone GC requires so removing a tombstone cannot reveal an
 older value elsewhere. Set `DisableOverlapSelection` to always merge the whole tier
 instead.
+
+After scoping, a non-bottom merge runs only if it is worth the read and rewrite. A
+merge of fewer than `MinCompactionTables` tables, or one whose tables are mutually
+disjoint with nothing to reclaim (no filter, no tombstones, no overlap with the
+destination tier), is deferred: relocating such tables a tier deeper reclaims
+nothing. The tier is re-picked once it accumulates enough overlapping tables to
+amortize the work. L0 is exempt (fresh flushes always drain to bound read
+amplification), as are bottom-tier GC merges and a manual full compaction (which
+must fully collapse the ladder).
 
 Target `.sst` size grows with tier depth, so deep (cold) tiers hold fewer, larger
 files and shallow (hot) tiers hold small ones that flush and merge cheaply. As

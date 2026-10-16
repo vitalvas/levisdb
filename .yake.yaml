@@ -1,0 +1,4 @@
+policy:
+  test_duration:
+    max_duration: "20s"
+

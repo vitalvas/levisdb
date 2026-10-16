@@ -64,6 +64,15 @@ type compactionConfigT struct {
 	// whole tier, so a lookup touches at most one output table per non-overlapping
 	// group. The bottom tier still merges wholly (tombstone GC needs it).
 	OverlapSelection bool
+	// MinCompactionTables is the fewest same-tier tables a non-bottom merge runs with
+	// after scoping. Fewer inputs skip the merge. Zero or one means no floor (any
+	// input merges), as direct engine users leave it.
+	MinCompactionTables int
+	// ForceMerge disables the automatic throttles (the min-tables floor and the
+	// no-reclaim-disjoint skip) so a merge always proceeds. The manual full
+	// compaction sets it on every hop so the ladder fully collapses to the bottom
+	// instead of leaving small or disjoint tiers deferred.
+	ForceMerge bool
 	// RewriteSingle lets a bottom in-place merge proceed with a single input table,
 	// so a full (manual) compaction can apply the filter and drop tombstones even
 	// after the cascade has collapsed the data to one bottom table. Normal
@@ -285,10 +294,16 @@ func (s *engineT) Compact(depth int, retainSeq uint64, cc compactionConfigT) err
 	// Non-input tables at ANY depth can contain older versions: ingest puts
 	// fresh sequences at the bottom. Include all their bounds in the GC check.
 	var deeper [][2][]byte
+	// destTables are the tables already at the output tier, used to decide whether a
+	// relocation can be a trivial move (no overlap at the destination).
+	var destTables []*tableMeta
 	for _, t := range s.tables {
 		if t.depth == depth {
 			inputs = append(inputs, t)
 			continue
+		}
+		if t.depth == outDepth {
+			destTables = append(destTables, t)
 		}
 		deeper = append(deeper, [2][]byte{t.minKey, t.maxKey})
 	}
@@ -336,6 +351,33 @@ func (s *engineT) Compact(depth int, retainSeq uint64, cc compactionConfigT) err
 	// all inputs (its GC needs every overlap group at once).
 	if !wholeTierMerge {
 		inputs, deeper = scopeCompactionInputs(inputs, deeper, cc)
+	}
+
+	// Automatic throttles, applied only when the caller opted into a min-tables floor
+	// (the DB auto path) and never for a forced manual full compaction or a bottom GC
+	// merge. Direct engine users without a floor keep the always-merge behavior. L0 is
+	// exempt: fresh flushes must always drain to bound read amplification, overlap or
+	// not, exactly as the picker's L0 exemption intends.
+	if throttle := !wholeTierMerge && !cc.ForceMerge && depth > 0 && cc.MinCompactionTables >= 2; throttle {
+		// No-benefit skip: scoped inputs that are mutually disjoint and have nothing
+		// to reclaim (no filter, no tombstones, no overlap with the destination tier)
+		// would only be read and rewritten to relocate them a tier deeper. Leave them
+		// put. The picker's overlap gate already declines such a disjoint tier, so
+		// this does not loop; it guards the case where scoping left a few disjoint
+		// tables.
+		if noReclaimDisjointMerge(cc, inputs, destTables) {
+			s.setLastCompaction(compactionResult{})
+			return nil
+		}
+		// Min-tables floor: a merge with fewer than MinCompactionTables inputs after
+		// scoping shuffles a couple of tables a tier deeper for little gain. Defer so
+		// the tier accumulates more tables and the eventual merge amortizes its read
+		// and rewrite; the group is re-picked once the tier grows. A lone input is
+		// already handled by worthCompacting above.
+		if len(inputs) < cc.MinCompactionTables {
+			s.setLastCompaction(compactionResult{})
+			return nil
+		}
 	}
 
 	// Collect every range tombstone from the (final) input tables. The merge
@@ -574,6 +616,57 @@ func compareOptionalMin(a, b []byte) int {
 	default:
 		return bytes.Compare(a, b)
 	}
+}
+
+// noReclaimDisjointMerge reports whether merging inputs would reclaim nothing, so
+// the compaction can be skipped rather than rewriting the bytes to relocate them a
+// tier deeper. True when there is no filter and no tombstones to drop AND the inputs
+// neither overlap each other nor any table already at the destination tier: a merge
+// of such tables just reproduces them one level down. A filter, any tombstone, or
+// real key overlap (to collapse into one output per range) all make it worthwhile.
+func noReclaimDisjointMerge(cc compactionConfigT, inputs, destTables []*tableMeta) bool {
+	if cc.Filter != nil {
+		return false
+	}
+	for _, t := range inputs {
+		if t.tombstones > 0 {
+			return false
+		}
+	}
+	// Inputs overlapping each other collapse to fewer output tables, a real benefit.
+	if len(largestGroup(overlapSets(inputs))) >= 2 {
+		return false
+	}
+	// An input overlapping a destination table must merge with it, not relocate past.
+	destBounds := make([][2][]byte, len(destTables))
+	for i, t := range destTables {
+		destBounds[i] = [2][]byte{t.minKey, t.maxKey}
+	}
+	for _, t := range inputs {
+		if t.minKey == nil || t.maxKey == nil {
+			return false // unknown bounds: assume it could overlap, so merge
+		}
+		if rangesOverlap(destBounds, t.minKey, t.maxKey) {
+			return false
+		}
+	}
+	return true
+}
+
+// rangesOverlap reports whether [min,max] intersects any bound in ranges. A nil
+// bound is unknown and conservatively intersects everything.
+func rangesOverlap(ranges [][2][]byte, minKey, maxKey []byte) bool {
+	for _, r := range ranges {
+		rMin, rMax := r[0], r[1]
+		if rMax != nil && bytes.Compare(minKey, rMax) > 0 {
+			continue // this range ends before [min,max] starts
+		}
+		if rMin != nil && bytes.Compare(maxKey, rMin) < 0 {
+			continue // this range starts after [min,max] ends
+		}
+		return true // overlap, or an unknown bound covers it
+	}
+	return false
 }
 
 // scopeCompactionInputs narrows a non-whole-tier compaction's same-tier inputs and
