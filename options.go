@@ -92,10 +92,11 @@ const (
 	// DefaultValueThreshold is the value size at or above which a value is written to
 	// a separate blob file instead of inline in the SSTable, WHEN value separation is
 	// enabled. It is only a default for the threshold's magnitude; value separation
-	// itself is off unless Options.ValueThreshold is set non-zero. 1 KiB keeps small
-	// values inline (one seek on read) while separating larger ones so compaction
-	// moves a pointer rather than the value bytes.
-	DefaultValueThreshold = 1 << 10 // 1 KiB
+	// itself is off unless Options.ValueThreshold is set non-zero. 16 KiB keeps small
+	// and medium values inline (one seek on read, and they compress and compact well)
+	// while separating genuinely large values so compaction moves a pointer rather
+	// than the value bytes.
+	DefaultValueThreshold = 16 << 10 // 16 KiB
 	// DefaultBlobFileSize is the size at which an append-only blob file rolls to a new
 	// one. The blob file is the unit of value-separation garbage collection, so this
 	// trades file count against reclaim granularity: smaller means more files but
