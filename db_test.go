@@ -52,6 +52,44 @@ func TestGetMissing(t *testing.T) {
 	assert.ErrorIs(t, err, ErrNotFound)
 }
 
+// TestLazyTableMetadataReopen verifies that with LazyTableMetadata a reopened
+// database defers table metadata parsing yet still reads every key correctly (the
+// bloom/index build on first read).
+func TestLazyTableMetadataReopen(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	open := func(lazy bool) *DB {
+		o := DefaultOptions(dir)
+		o.LazyTableMetadata = lazy
+		o.FreshCodec = CodecNone
+		o.BottomCodec = CodecNone
+		db, err := Open(o)
+		require.NoError(t, err)
+		return db
+	}
+
+	db := open(false)
+	const n = 200
+	for i := 0; i < n; i++ {
+		k := fmt.Sprintf("key%04d", i)
+		require.NoError(t, db.Put(PutOptions{Key: []byte(k), Value: []byte(fmt.Sprintf("v%d", i))}))
+	}
+	require.NoError(t, db.eng.Flush()) // land the data in a table
+	require.NoError(t, db.Close())
+
+	// Reopen with lazy metadata: every key must still read back, proving the
+	// deferred bloom/index are built on demand.
+	db = open(true)
+	t.Cleanup(func() { db.Close() })
+	for i := 0; i < n; i++ {
+		got, err := db.Get([]byte(fmt.Sprintf("key%04d", i)))
+		require.NoError(t, err, "i=%d", i)
+		assert.Equal(t, fmt.Sprintf("v%d", i), string(got.Value))
+	}
+	_, err := db.Get([]byte("absent"))
+	assert.ErrorIs(t, err, ErrNotFound)
+}
+
 // TestCompactOnceStopsWhenNoWork guards the scheduler-spin regression: compactOnce
 // must return false once the picker has nothing ready, so the background loop (which
 // runs while flushOnce or compactOnce reports progress) parks instead of re-picking

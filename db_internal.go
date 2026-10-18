@@ -195,14 +195,15 @@ func (db *DB) restoreTables(state *manifestState) error {
 			return fmt.Errorf("manifest: table %d size mismatch: recorded %d, actual %d", t.Num, t.Size, info.Size())
 		}
 		if err := db.eng.openTableDeferred(tableSpec{
-			num:        t.Num,
-			depth:      t.Depth,
-			path:       path,
-			size:       t.Size,
-			minKey:     t.MinKey,
-			maxKey:     t.MaxKey,
-			entries:    t.Entries,
-			tombstones: t.Tombstones,
+			num:         t.Num,
+			depth:       t.Depth,
+			path:        path,
+			size:        t.Size,
+			minKey:      t.MinKey,
+			maxKey:      t.MaxKey,
+			entries:     t.Entries,
+			tombstones:  t.Tombstones,
+			restoreLazy: true,
 		}); err != nil {
 			return err
 		}

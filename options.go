@@ -250,6 +250,14 @@ type Options struct {
 	// separation. Zero uses the default; a negative value is rejected.
 	BlobFileSize int64
 
+	// LazyTableMetadata defers parsing each restored table's bloom filter and index
+	// to the table's first read instead of reading them all at open. For a store with
+	// very many tables this makes open much faster, at the cost of not detecting a
+	// corrupt metadata block in a never-read table until that table is first read
+	// (the footer is still validated at open). Off by default: open validates every
+	// table's metadata eagerly.
+	LazyTableMetadata bool
+
 	// BloomBits is the bloom filter bits per key.
 	BloomBits int
 	// BlockSize is the SSTable block size in bytes.

@@ -588,8 +588,9 @@ func (db *DB) engineConfig() engineConfigT {
 		Commit: func(inputs, outputs []*tableMeta, install func()) error {
 			return db.commitTableChange(inputs, outputs, install)
 		},
-		ValueThreshold: db.opts.ValueThreshold,
-		BlobFileSize:   db.opts.BlobFileSize,
+		LazyTableMetadata: db.opts.LazyTableMetadata,
+		ValueThreshold:    db.opts.ValueThreshold,
+		BlobFileSize:      db.opts.BlobFileSize,
 		blobPath: func() func(uint32) (string, error) {
 			if db.opts.ValueThreshold <= 0 {
 				return nil // feature off: no blob path, valueSeparationOn() stays false

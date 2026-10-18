@@ -126,6 +126,11 @@ type engineConfigT struct {
 	// durable. Tests and recovery leave it nil and install directly.
 	Commit func(inputs, outputs []*tableMeta, install func()) error
 
+	// LazyTableMetadata defers parsing a restored table's bloom and index to its
+	// first read instead of at open, so a store with very many tables opens without
+	// reading every table's metadata. Only consulted for tables opened during restore.
+	LazyTableMetadata bool
+
 	// ValueThreshold enables value separation when > 0: a flushed value at least this
 	// many bytes is written to a blob file and the table stores a pointer. Zero (the
 	// default) keeps every value inline, so the whole blob machinery stays dormant.
@@ -1017,12 +1022,23 @@ type tableSpec struct {
 	maxKey     []byte
 	entries    int // total entries; 0 means unknown
 	tombstones int // tombstone entries, for the density trigger
+	// restoreLazy marks a table being restored on open, which may defer its metadata
+	// parse when LazyTableMetadata is set. Fresh flush/compaction outputs leave it
+	// false so they always validate eagerly.
+	restoreLazy bool
 }
 
 // openTableMeta creates a pooled read handle for a table file and its reader.
 func (s *engineT) openTableMeta(spec tableSpec) (*tableMeta, error) {
 	handle := s.cfg.FDs.newHandle(spec.path)
-	r, err := newCachedTableReader(handle, spec.size, s.cfg.Cache, spec.num)
+	// Fresh flush/compaction outputs always validate eagerly (a just-written corrupt
+	// table must fail immediately). Only a restored table may open lazily, and only
+	// when LazyTableMetadata is set, deferring its bloom/index parse to first read.
+	newReader := newCachedTableReader
+	if spec.restoreLazy && s.cfg.LazyTableMetadata {
+		newReader = newCachedTableReaderLazy
+	}
+	r, err := newReader(handle, spec.size, s.cfg.Cache, spec.num)
 	if err != nil {
 		handle.close()
 		return nil, err

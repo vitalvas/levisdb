@@ -56,7 +56,22 @@ type indexEntry struct {
 
 // NewCachedReader opens a table and caches its decoded data blocks under
 // tableNum in the given cache. A nil cache disables caching.
+// newCachedTableReader validates the table footer and eagerly parses its metadata
+// (bloom + index) so a corrupt table fails fast at open. newCachedTableReaderLazy
+// is the same but defers the metadata parse to the first read.
 func newCachedTableReader(r io.ReaderAt, size int64, c *blockCacheT, tableNum uint32) (*tableReader, error) {
+	return newTableReaderOpt(r, size, c, tableNum, false)
+}
+
+// newCachedTableReaderLazy validates only the footer at open and builds the bloom
+// and index on first read. It trades eager corruption detection for a fast open
+// when a store has very many tables; a corrupt metadata block in a never-read table
+// surfaces on first read instead of at open. Used only when LazyTableMetadata is set.
+func newCachedTableReaderLazy(r io.ReaderAt, size int64, c *blockCacheT, tableNum uint32) (*tableReader, error) {
+	return newTableReaderOpt(r, size, c, tableNum, true)
+}
+
+func newTableReaderOpt(r io.ReaderAt, size int64, c *blockCacheT, tableNum uint32, lazyMeta bool) (*tableReader, error) {
 	if size < footerLen {
 		return nil, fmt.Errorf("table: file too small")
 	}
@@ -114,9 +129,13 @@ func newCachedTableReader(r io.ReaderAt, size int64, c *blockCacheT, tableNum ui
 
 	// Parse the metadata once up front to validate the table (bad filter/index
 	// bytes must fail Open), then keep it: the first eviction drops it and later
-	// reads rebuild it on demand.
-	if _, err := tr.ensureMeta(); err != nil {
-		return nil, err
+	// reads rebuild it on demand. Lazy open skips this so a store with very many
+	// tables opens without reading every table's bloom and index; the parse (and its
+	// validation) happens on the table's first read instead.
+	if !lazyMeta {
+		if _, err := tr.ensureMeta(); err != nil {
+			return nil, err
+		}
 	}
 	return tr, nil
 }

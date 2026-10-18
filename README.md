@@ -191,6 +191,7 @@ target a single slow spinning disk.
 | `BlockCacheSize` | `256 MiB` | Decoded-block cache capacity in bytes. |
 | `DisableBlockCache` | `false` | Turn off decoded-block caching. |
 | `MaxOpenFiles` | `1000` | Open table descriptors kept at once; negative keeps all open. |
+| `LazyTableMetadata` | `false` | Defer parsing each restored table's bloom and index to its first read, for faster open with very many tables; a corrupt metadata block in a never-read table is then detected on first read, not at open. |
 | `FDIdleTimeout` | `0` (off) | Close a table descriptor left unused this long, returning the fd to the OS; reopens on next read. |
 | `NoSync` | `false` | Skip the per-commit fsync. See [Write-ahead log](#write-ahead-log). |
 | `WALSyncInterval` | `1s` | Background fsync interval bounding the `NoSync` loss window. See [Write-ahead log](#write-ahead-log). |
