@@ -194,6 +194,14 @@ func (s *Snapshot) Has(key []byte) (bool, error) {
 	return s.db.hasAt(s.seq, key)
 }
 
+// GetMany reads many keys as of the snapshot and returns a map from key to value
+// for the keys that exist, omitting absent/deleted/expired keys. Like DB.GetMany it
+// resolves the batch in one sorted, block-cache-friendly sweep, but pinned to this
+// snapshot's sequence rather than the latest committed one.
+func (s *Snapshot) GetMany(keys [][]byte) (map[string]GetManyResult, error) {
+	return s.db.getManyAt(s.seq, keys)
+}
+
 // NewIterator returns an iterator over the whole keyspace as of the snapshot.
 func (s *Snapshot) NewIterator() (Iterator, error) {
 	return s.NewRangeIterator(nil, nil)

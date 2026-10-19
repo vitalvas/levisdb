@@ -567,6 +567,61 @@ func (s *engineT) getWithExpiry(seq uint64, key []byte) (value []byte, expiresAt
 	return append([]byte(nil), best.value...), best.expiresAt, true, nil
 }
 
+// batchKey is one entry of a batch lookup: the key to resolve and, after
+// getManyWithExpiry runs, its outcome. The caller sorts a slice of these by key so
+// the sweep below hits each data block in order.
+type batchKey struct {
+	key       []byte
+	value     []byte
+	expiresAt int64
+	found     bool
+}
+
+// getManyWithExpiry resolves a batch of keys at one sequence under a single read
+// lock. keys must be sorted ascending by key: resolving in sorted order means keys
+// that fall in the same data block hit the block cache warm on the second and later
+// accesses instead of re-reading from disk, turning the per-key random reads of a
+// Get loop into ordered per-table passes. Holding s.mu.RLock once (not per key)
+// also keeps the table set stable for the whole batch and removes N lock cycles.
+// Each entry's found/value/expiresAt are filled in; a read error aborts the batch.
+//
+// shortcut: resolves each key through pickVersion independently (same per-key index
+// search), relying on the block cache for intra-batch block reuse. A deeper
+// optimization would serve all batch keys falling in one decoded block without a
+// cache round-trip; add it if the cache-hit path proves insufficient.
+func (s *engineT) getManyWithExpiry(seq uint64, keys []batchKey) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	now := time.Now().Unix()
+	for i := range keys {
+		best, err := s.pickVersion(seq, keys[i].key, now)
+		if err != nil {
+			return err
+		}
+		if !best.found || best.deleted {
+			continue
+		}
+		rdSeq, rderr := s.maxCoveringRangeDelSeq(keys[i].key, seq)
+		if rderr != nil {
+			return rderr
+		}
+		if rdSeq > best.seq {
+			continue // shadowed by a newer range tombstone
+		}
+		if best.blobPtr != nil {
+			v, berr := s.resolveBlob(*best.blobPtr)
+			if berr != nil {
+				return berr
+			}
+			keys[i].value, keys[i].expiresAt, keys[i].found = v, best.expiresAt, true
+			continue
+		}
+		keys[i].value = append([]byte(nil), best.value...)
+		keys[i].expiresAt, keys[i].found = best.expiresAt, true
+	}
+	return nil
+}
+
 func (s *engineT) getAtTime(seq uint64, key []byte, now int64) (value []byte, found, deleted bool, err error) {
 	// Hold the read lock for the whole lookup so a concurrent compaction cannot
 	// close and remove a table file mid-read; the compaction swap runs under

@@ -291,6 +291,7 @@ Package-level:
 | `Delete(key []byte) error` | Remove a key. |
 | `DeleteRange(start, end []byte) error` | Remove every key in `[start, end)` in one record. |
 | `Get(key []byte) (GetResult, error)` | Read the latest value and its `ExpiresAt`, or `ErrNotFound`. |
+| `GetMany(keys [][]byte) (map[string]GetManyResult, error)` | Batch read at one consistent sequence; missing keys omitted. Faster than looping `Get` for large key sets. |
 | `Has(key []byte) (bool, error)` | Existence check without copying the value. |
 | `Write(*Batch) error` | Commit a batch atomically. |
 | `NewIterator() (Iterator, error)` | Ordered scan over all keys. |
@@ -315,8 +316,8 @@ Package-level:
 `Finish()`. Defer `Close()` to release an abandoned build; it removes unfinished
 output and preserves a successfully finished file.
 
-`*Snapshot`: `Get`, `Has`, `NewIterator`, `NewRangeIterator` (same signatures as
-the `*DB` reads, fixed to the snapshot's sequence), `WriteTo(path,
+`*Snapshot`: `Get`, `GetMany`, `Has`, `NewIterator`, `NewRangeIterator` (same
+signatures as the `*DB` reads, fixed to the snapshot's sequence), `WriteTo(path,
 SstWriterOptions) (uint64, error)` (write a single-file base image for follower
 bootstrap; returns the resume seq), `WriteToDir(dir, SstWriterOptions,
 maxFileBytes int64) ([]string, uint64, error)` (same, rolled into bounded files
