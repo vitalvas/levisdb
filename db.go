@@ -859,20 +859,27 @@ func (db *DB) Close() error {
 			firstErr = e
 		}
 	}
-	// Flush on clean shutdown so buffered writes persist to tables. WAL replay
-	// covers the crash case; this covers the graceful one. A background flush may
-	// already have sealed an immutable memtable, so the first pass drains it and
-	// the second captures the active memtable too.
-	if err := db.flushAndLog(); err != nil {
-		setErr(err)
-	} else if err := db.flushAndLog(); err != nil {
-		setErr(err)
+	// Durable mode flushes buffered writes to tables on clean shutdown so the WAL can
+	// be retired. NoSync already accepts a bounded, WAL-recoverable loss model, so its
+	// close skips the flush (and the table/manifest fsyncs it entails) and retains the
+	// WAL instead: walT.Close flushes the buffered records to the OS page cache, and
+	// the next Open replays them exactly as it would after a crash. This turns a
+	// data-carrying close from several fsyncs into none, which dominates a workload of
+	// many short-lived NoSync databases (tests). Durable mode is unchanged.
+	if !db.opts.NoSync {
+		// A background flush may already have sealed an immutable memtable, so the
+		// first pass drains it and the second captures the active memtable too.
+		if err := db.flushAndLog(); err != nil {
+			setErr(err)
+		} else if err := db.flushAndLog(); err != nil {
+			setErr(err)
+		}
+		// A manifest rotation can fail at the final directory sync after its
+		// rename. That failure is recorded asynchronously by commitTableChange even
+		// though the table installation itself succeeded. Re-read it before deciding
+		// whether WAL removal is safe; firstErr was captured before shutdown flushes.
+		setErr(db.backgroundError())
 	}
-	// A manifest rotation can fail at the final directory sync after its
-	// rename. That failure is recorded asynchronously by commitTableChange even
-	// though the table installation itself succeeded. Re-read it before deciding
-	// whether WAL removal is safe; firstErr was captured before shutdown flushes.
-	setErr(db.backgroundError())
 	// Close the fully-synced manifest before retiring its recovery WAL. Some
 	// filesystems report deferred writeback errors from Close; in that case the
 	// WAL must remain available even though every earlier Sync appeared to pass.
@@ -882,12 +889,15 @@ func (db *DB) Close() error {
 	if db.wal != nil {
 		setErr(db.wal.wal.Close())
 	}
-	if firstErr == nil && db.wal != nil {
-		// Flushed above; delete every WAL segment on disk. This covers the live and
-		// retired segments and any left on disk for replication retention (all now
-		// captured in tables). Retention is a live-process feature; a consumer
-		// re-bootstraps across a restart. Listing the directory is authoritative, so
-		// no orphan .log file is left behind.
+	// Retire the WAL only in durable mode, where the flush above captured every
+	// buffered write into a durable table. Under NoSync the WAL is the sole record of
+	// the not-yet-flushed tail, so it must survive for the next Open to replay.
+	if firstErr == nil && !db.opts.NoSync && db.wal != nil {
+		// Delete every WAL segment on disk. This covers the live and retired segments
+		// and any left on disk for replication retention (all now captured in tables).
+		// Retention is a live-process feature; a consumer re-bootstraps across a
+		// restart. Listing the directory is authoritative, so no orphan .log file is
+		// left behind.
 		nums, listErr := db.store.listLogs()
 		if listErr != nil {
 			// Fall back to the tracked numbers if the listing fails. Build a fresh

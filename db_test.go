@@ -351,6 +351,50 @@ func TestNoSyncStillReadsBack(t *testing.T) {
 	}
 }
 
+// TestNoSyncCloseSkipsFlushRetainsWAL verifies the NoSync fast-close: a clean close
+// writes no SSTable (data stays in the retained WAL, avoiding the flush fsyncs) yet
+// the next Open replays the WAL so every key survives.
+func TestNoSyncCloseSkipsFlushRetainsWAL(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	open := func() *DB {
+		o := DefaultOptions(dir)
+		o.NoSync = true
+		o.MemtableSize = 1 << 30 // never auto-flushes; only a close or explicit flush would
+		o.FreshCodec = CodecNone
+		o.BottomCodec = CodecNone
+		db, err := Open(o)
+		require.NoError(t, err)
+		return db
+	}
+
+	db := open()
+	for i := 0; i < 50; i++ {
+		require.NoError(t, db.Put(PutOptions{Key: []byte(fmt.Sprintf("k%03d", i)), Value: []byte("v")}))
+	}
+	require.NoError(t, db.Close())
+
+	// Fast close wrote no table and kept the WAL for replay.
+	s, err := openStorage(dir)
+	require.NoError(t, err)
+	tables, err := s.listTables()
+	require.NoError(t, err)
+	logs, err := s.listLogs()
+	require.NoError(t, err)
+	require.NoError(t, s.Close())
+	assert.Empty(t, tables, "NoSync close flushes nothing to a table")
+	assert.NotEmpty(t, logs, "NoSync close retains the WAL for replay")
+
+	// Reopen replays the WAL; every key is back.
+	db = open()
+	t.Cleanup(func() { db.Close() })
+	for i := 0; i < 50; i++ {
+		v, err := db.Get([]byte(fmt.Sprintf("k%03d", i)))
+		require.NoError(t, err, i)
+		assert.Equal(t, []byte("v"), v.Value)
+	}
+}
+
 func TestWALObserverReceivesWrites(t *testing.T) {
 	t.Parallel()
 	var mu sync.Mutex

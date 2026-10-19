@@ -282,9 +282,11 @@ func TestRestoreTablesMissingFileErrors(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 
-	// Write and flush data so at least one .sst table exists, then close cleanly.
+	// Write data and flush it explicitly so at least one .sst table exists (a NoSync
+	// close keeps data in the WAL rather than flushing), then close cleanly.
 	db := openAt(t, dir, 512)
 	require.NoError(t, db.Put(PutOptions{Key: []byte("key"), Value: []byte("v")}))
+	require.NoError(t, db.eng.Flush())
 	require.NoError(t, db.Close())
 
 	// Delete one .sst table the manifest references; reopen must fail because
@@ -525,6 +527,9 @@ func TestOpenCorruptTableFileErrors(t *testing.T) {
 	for i := 0; i < 20; i++ {
 		require.NoError(t, db.Put(PutOptions{Key: []byte{byte('a' + i)}, Value: []byte("v")}))
 	}
+	// Flush explicitly: a NoSync close keeps data in the WAL, so force a table to
+	// exist for the corruption below.
+	require.NoError(t, db.eng.Flush())
 	require.NoError(t, db.Close())
 
 	// Overwrite a live table with garbage so its footer is unreadable;
