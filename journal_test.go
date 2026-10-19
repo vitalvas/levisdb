@@ -56,6 +56,43 @@ func TestJournalRoundTrip(t *testing.T) {
 	}
 }
 
+// countingWriter counts Write calls to the underlying sink, so a test can assert
+// how many syscalls the journal's batching buffer collapses a large record into.
+type countingWriter struct {
+	w      io.Writer
+	writes int
+}
+
+func (c *countingWriter) Write(p []byte) (int, error) {
+	c.writes++
+	return c.w.Write(p)
+}
+
+// TestJournalBatchesBlockWrites proves the batching buffer coalesces a large
+// multi-block record into few underlying writes instead of one per 32 KiB block.
+func TestJournalBatchesBlockWrites(t *testing.T) {
+	t.Parallel()
+	var buf bytes.Buffer
+	cw := &countingWriter{w: &buf}
+	w := newJournalWriter(cw)
+
+	// A record far larger than a block and the 1 MiB batching buffer: ~4 MiB spans
+	// ~128 blocks, which unbuffered would be ~128 writes.
+	rec := bytes.Repeat([]byte("z"), 4<<20)
+	require.NoError(t, w.Write(rec))
+	require.NoError(t, w.Flush())
+
+	blocks := (4 << 20) / blockSize
+	assert.Less(t, cw.writes, blocks/4,
+		"batching must collapse ~%d block writes into far fewer syscalls, got %d", blocks, cw.writes)
+
+	// The record still reads back intact through the normal reader.
+	r := newJournalReader(&buf)
+	got, err := r.Next()
+	require.NoError(t, err)
+	assert.Equal(t, rec, got)
+}
+
 func TestJournalFlushEmpty(t *testing.T) {
 	t.Parallel()
 	var buf bytes.Buffer

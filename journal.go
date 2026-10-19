@@ -8,6 +8,7 @@
 package levisdb
 
 import (
+	"bufio"
 	"encoding/binary"
 	"errors"
 	"hash/crc32"
@@ -17,6 +18,12 @@ import (
 const (
 	blockSize  = 32 * 1024
 	headerSize = 7 // crc(4) + length(2) + type(1)
+	// journalBufSize batches framed 32 KiB blocks before they reach the underlying
+	// file. A large record (for example a batch of thousands of keys) spans many
+	// blocks; without this buffer each block boundary is its own write() syscall, so
+	// one big batch costs hundreds of syscalls. Buffering coalesces them into a few
+	// large writes. Flush drains it, so durability points are unchanged.
+	journalBufSize = 1 << 20 // 1 MiB (32 blocks)
 )
 
 // chunk types
@@ -34,7 +41,8 @@ var errJournalCorrupt = errors.New("journal: corrupt record")
 
 // Writer appends records to an underlying writer, framing them into blocks.
 type journalWriter struct {
-	w           io.Writer
+	dst         io.Writer     // the real sink (a file); bytes reach it only via buf
+	w           *bufio.Writer // batches block writes so a large record is few syscalls
 	block       [blockSize]byte
 	blockOffset int
 	// flushedOffset is the prefix of block already written to w. Flush may make
@@ -45,7 +53,7 @@ type journalWriter struct {
 
 // NewWriter returns a Writer over w.
 func newJournalWriter(w io.Writer) *journalWriter {
-	return &journalWriter{w: w}
+	return &journalWriter{dst: w, w: bufio.NewWriterSize(w, journalBufSize)}
 }
 
 // Write frames and writes a single record. It buffers within the current block
@@ -103,21 +111,24 @@ func (w *journalWriter) emitChunk(typ byte, data []byte) {
 	w.blockOffset += headerSize + len(data)
 }
 
-// Flush writes any buffered partial block to the underlying writer. Callers
-// fsync the underlying file separately.
+// Flush writes any buffered partial block into the batching buffer and then drains
+// that buffer to the underlying file, so after Flush every framed byte has reached
+// the file (callers fsync it separately). The batching buffer only defers the
+// write() syscalls of full blocks emitted during Write; Flush is still the point at
+// which data becomes durable to the file, so every existing caller is unchanged.
 func (w *journalWriter) Flush() error {
-	if w.flushedOffset == w.blockOffset {
-		return nil
+	if w.flushedOffset != w.blockOffset {
+		if err := writeAll(w.w, w.block[w.flushedOffset:w.blockOffset]); err != nil {
+			return err
+		}
+		w.flushedOffset = w.blockOffset
+		if w.blockOffset == blockSize {
+			w.blockOffset = 0
+			w.flushedOffset = 0
+		}
 	}
-	if err := writeAll(w.w, w.block[w.flushedOffset:w.blockOffset]); err != nil {
-		return err
-	}
-	w.flushedOffset = w.blockOffset
-	if w.blockOffset == blockSize {
-		w.blockOffset = 0
-		w.flushedOffset = 0
-	}
-	return nil
+	// Drain the batching buffer so the bytes reach the file, not just the buffer.
+	return w.w.Flush()
 }
 
 func (w *journalWriter) flushBlock() error {
