@@ -395,6 +395,39 @@ func TestNoSyncCloseSkipsFlushRetainsWAL(t *testing.T) {
 	}
 }
 
+// TestMemtableFlushInterval verifies the time-based flush: a write well under the
+// size threshold is flushed to a table on its own within about the interval, with no
+// explicit Flush call.
+func TestMemtableFlushInterval(t *testing.T) {
+	t.Parallel()
+	db := openTestDB(t, func(o *Options) {
+		o.MemtableSize = 1 << 30                         // never triggers a size flush
+		o.MemtableFlushInterval = 500 * time.Millisecond // but the timer does
+	})
+
+	require.NoError(t, db.Put(PutOptions{Key: []byte("k"), Value: []byte("v")}))
+	require.Empty(t, db.eng.Tables(), "no table yet: below the size threshold")
+
+	require.Eventually(t, func() bool {
+		return len(db.eng.Tables()) > 0
+	}, 5*time.Second, 50*time.Millisecond, "the time trigger flushes the memtable to a table")
+
+	// The data is still readable after the background flush.
+	v, err := db.Get([]byte("k"))
+	require.NoError(t, err)
+	assert.Equal(t, []byte("v"), v.Value)
+}
+
+// TestMemtableFlushIntervalOffByDefault verifies the timer is inert when unset: a
+// small write stays in the memtable with no table produced.
+func TestMemtableFlushIntervalOffByDefault(t *testing.T) {
+	t.Parallel()
+	db := openTestDB(t, func(o *Options) { o.MemtableSize = 1 << 30 }) // interval unset (0)
+	require.NoError(t, db.Put(PutOptions{Key: []byte("k"), Value: []byte("v")}))
+	time.Sleep(300 * time.Millisecond)
+	assert.Empty(t, db.eng.Tables(), "no time trigger: the write stays in the memtable")
+}
+
 func TestWALObserverReceivesWrites(t *testing.T) {
 	t.Parallel()
 	var mu sync.Mutex

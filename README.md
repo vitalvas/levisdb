@@ -169,6 +169,7 @@ target a single slow spinning disk.
 | --- | --- | --- |
 | `Dir` | (required) | Data directory. |
 | `MemtableSize` | `8 MiB` | Memtable flush threshold in bytes. |
+| `MemtableFlushInterval` | `0` (off) | Flush the memtable once it has held un-flushed data this long, even below `MemtableSize`; bounds the idle crash-recovery window and WAL footprint. Negative is rejected. |
 | `TierRatio` | `4` | Size-tiered compaction fan-out (tables per tier before merge). |
 | `MinCompactionTables` | `4` | Fewest tables a non-L0 tier must hold before the picker compacts it. A crowded disjoint tier descends anyway to bound table count. Below 2 is raised to 2. L0 and manual full compaction are exempt. |
 | `TierByteTrigger` | `8 x FileSizeMax` | Tier bytes that trigger compaction below the count ratio; negative disables. |

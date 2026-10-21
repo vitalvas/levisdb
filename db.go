@@ -96,6 +96,10 @@ type DB struct {
 	fdReapStop chan struct{}
 	fdReapWG   sync.WaitGroup
 
+	// memFlushStop stops the time-based memtable flush loop; memFlushWG awaits it.
+	memFlushStop chan struct{}
+	memFlushWG   sync.WaitGroup
+
 	// checkpointWG tracks the at-most-one background WAL checkpoint launched from
 	// the write path (maybeCheckpoint), so Close and crash can wait for it to
 	// finish before they touch the WAL fields it mutates. checkpointRunning is a
@@ -238,6 +242,7 @@ func Open(opts Options) (*DB, error) {
 	}
 	db.startWALSyncLoop()
 	db.startFDReapLoop()
+	db.startMemFlushLoop()
 	registerMetrics(db)
 	db.log.Info("database opened", "op", "open", "recovered_seq", db.readSeq.Load())
 	return db, nil
@@ -326,6 +331,72 @@ func (db *DB) stopFDReapLoop() {
 		db.fdReapStop = nil
 	}
 	db.fdReapWG.Wait()
+}
+
+// startMemFlushLoop runs a background timer that signals a flush once the active
+// memtable has held un-flushed data for at least MemtableFlushInterval, bounding the
+// idle crash-recovery window and WAL footprint below the size trigger. It tracks the
+// dirty age entirely in the goroutine (no write-path cost): an empty memtable resets
+// the clock, and a non-empty one that stays non-empty past the interval triggers a
+// flush. It is a no-op for read-only or disabled (zero/negative interval) configs.
+func (db *DB) startMemFlushLoop() {
+	if db.opts.ReadOnly || db.opts.MemtableFlushInterval <= 0 {
+		return
+	}
+	interval := db.opts.MemtableFlushInterval
+	// Tick at half the interval so dirty data is flushed within about 1.5 intervals
+	// of the first un-flushed write, mirroring the fd reaper's sampling.
+	tick := interval / 2
+	if tick < time.Second {
+		tick = time.Second
+	}
+	stop := make(chan struct{})
+	db.memFlushStop = stop
+	db.memFlushWG.Add(1)
+	go func() {
+		defer db.memFlushWG.Done()
+		t := time.NewTicker(tick)
+		defer t.Stop()
+		var dirtySince time.Time
+		for {
+			select {
+			case <-stop:
+				return
+			case now := <-t.C:
+				if db.eng.memEmpty() {
+					dirtySince = time.Time{} // clean: reset the clock
+					continue
+				}
+				if dirtySince.IsZero() {
+					dirtySince = now // first tick seeing un-flushed data
+					continue
+				}
+				if now.Sub(dirtySince) >= interval {
+					// The scheduler's flush is size-gated (needFlush), so a sub-threshold
+					// memtable is flushed directly here; flushAndLog serializes with any
+					// scheduler flush via flushMu. Then signal the scheduler to run any
+					// compaction the new L0 table may have made ready.
+					if err := db.flushAndLog(); err != nil {
+						db.setBackgroundError(err)
+						return
+					}
+					db.maybeCheckpoint()
+					db.sched.Signal()
+					dirtySince = time.Time{} // re-arm after flushing
+				}
+			}
+		}
+	}()
+}
+
+// stopMemFlushLoop signals the time-based flush loop and waits for it to exit. Safe
+// to call more than once and when the loop never started.
+func (db *DB) stopMemFlushLoop() {
+	if db.memFlushStop != nil {
+		close(db.memFlushStop)
+		db.memFlushStop = nil
+	}
+	db.memFlushWG.Wait()
 }
 
 // closeAfterOpenError releases resources created during a partial Open without
@@ -834,6 +905,8 @@ func (db *DB) Close() error {
 	// closed file. It holds no db locks, so this is safe here.
 	db.stopWALSyncLoop()
 	db.stopFDReapLoop()
+	// Stop the time-based flush loop before the scheduler it signals.
+	db.stopMemFlushLoop()
 	if db.sched != nil {
 		db.sched.Close()
 	}
@@ -946,6 +1019,7 @@ func (db *DB) crash() {
 	db.checkpointWG.Wait()
 	db.stopWALSyncLoop()
 	db.stopFDReapLoop()
+	db.stopMemFlushLoop()
 	if db.sched != nil {
 		db.sched.Close()
 	}

@@ -162,6 +162,15 @@ type Options struct {
 
 	// MemtableSize is the memtable flush threshold in bytes.
 	MemtableSize int64
+
+	// MemtableFlushInterval flushes the active memtable once it has held un-flushed
+	// data for at least this long, even below MemtableSize. Without it a low-traffic
+	// database can keep buffered writes in the memtable (and their WAL segments on
+	// disk) indefinitely, widening the crash-recovery window and WAL footprint during
+	// idle periods. The size trigger still flushes a full memtable sooner. Zero (the
+	// default) disables the time trigger, leaving size-only flushing; a negative value
+	// is rejected. Read-only opens never flush, so it is ignored there.
+	MemtableFlushInterval time.Duration
 	// TierRatio is the size-tiered compaction fan-out.
 	TierRatio int
 
@@ -532,22 +541,8 @@ func (o *Options) validate() error {
 	if o.BlockCacheSize < 0 {
 		return fmt.Errorf("levisdb: BlockCacheSize must be non-negative, got %d", o.BlockCacheSize)
 	}
-	// Value separation: both knobs are non-negative. Zero ValueThreshold means the
-	// feature is off; zero BlobFileSize means "use the default" (see fillDefaults).
-	if o.ValueThreshold < 0 {
-		return fmt.Errorf("levisdb: ValueThreshold must be non-negative, got %d", o.ValueThreshold)
-	}
-	if o.BlobFileSize < 0 {
-		return fmt.Errorf("levisdb: BlobFileSize must be non-negative, got %d", o.BlobFileSize)
-	}
-	// WALSyncInterval is never negative. Under NoSync it is the levisdb-owned
-	// blocking fsync window that bounds durability (never left to OS page-cache
-	// eviction), so disabling it would reintroduce unbounded, non-deterministic
-	// loss. Under durable mode group commit fsyncs per batch and the loop never
-	// runs, so a negative value is meaningless there too. Zero means "use the
-	// default" (see fillDefaults).
-	if o.WALSyncInterval < 0 {
-		return fmt.Errorf("levisdb: WALSyncInterval must not be negative, got %v", o.WALSyncInterval)
+	if err := o.validateNonNegative(); err != nil {
+		return err
 	}
 	if o.WALSegmentBytes < 1 {
 		return fmt.Errorf("levisdb: WALSegmentBytes must be positive, got %d", o.WALSegmentBytes)
@@ -562,6 +557,32 @@ func (o *Options) validate() error {
 		if name != "" && !validCodecs[name] {
 			return fmt.Errorf("levisdb: unknown LevelCodecs[%d] %q", d, name)
 		}
+	}
+	return nil
+}
+
+// validateNonNegative rejects the knobs that must not be negative, split out of
+// validate to keep its branch count within the complexity limit. For each, zero is a
+// valid "off" or "use the default" value (see fillDefaults); only a negative is an
+// error.
+func (o *Options) validateNonNegative() error {
+	// Value separation: zero ValueThreshold means the feature is off; zero
+	// BlobFileSize means "use the default".
+	if o.ValueThreshold < 0 {
+		return fmt.Errorf("levisdb: ValueThreshold must be non-negative, got %d", o.ValueThreshold)
+	}
+	if o.BlobFileSize < 0 {
+		return fmt.Errorf("levisdb: BlobFileSize must be non-negative, got %d", o.BlobFileSize)
+	}
+	// WALSyncInterval is never negative. Under NoSync it is the levisdb-owned blocking
+	// fsync window that bounds durability (never left to OS page-cache eviction), so
+	// disabling it would reintroduce unbounded loss. Under durable mode the loop never
+	// runs. Zero means "use the default".
+	if o.WALSyncInterval < 0 {
+		return fmt.Errorf("levisdb: WALSyncInterval must not be negative, got %v", o.WALSyncInterval)
+	}
+	if o.MemtableFlushInterval < 0 {
+		return fmt.Errorf("levisdb: MemtableFlushInterval must not be negative, got %v", o.MemtableFlushInterval)
 	}
 	return nil
 }
