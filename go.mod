@@ -3,7 +3,7 @@ module go.vitalvas.com/levisdb
 go 1.27
 
 require (
-	github.com/klauspost/compress v1.20.1
+	github.com/klauspost/compress v1.20.3
 	github.com/stretchr/testify v1.12.1
 )
 

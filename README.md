@@ -163,7 +163,10 @@ close iterators promptly so compaction can reclaim obsolete versions and files.
 ## Options reference
 
 Every field is optional except `Dir`; a zero value takes the default. Defaults
-target a single slow spinning disk.
+target a single slow spinning disk. Each default is also an exported constant
+(`DefaultMemtableSize`, `DefaultTierRatio`, … `DefaultWALSegmentBytes`), so a
+tuning can be expressed relative to it (for example
+`opts.MemtableSize = 2 * levisdb.DefaultMemtableSize`).
 
 | Option | Default | Purpose |
 | --- | --- | --- |
@@ -200,6 +203,7 @@ target a single slow spinning disk.
 | `StrictWALRecovery` | `false` | Fail open on any WAL corruption instead of salvaging the prefix. |
 | `ReadOnly` | `false` | Reject writes; make no filesystem changes. |
 | `WALObserver` | nil | Tap the committed stream for replication/CDC. |
+| `Logger` | nil | `*slog.Logger` for structured engine events (open, flush, compaction, WAL rotation/checkpoint, close). See [Monitoring](#monitoring). |
 | `WALRetention` | `0` | Keep flushed WAL for this long for `GetUpdatesSince` catch-up; `0` disables. See [Replication](#replication). |
 | `WALRetentionBytes` | `0` | Keep up to this many flushed WAL bytes for catch-up; `0` disables. See [Replication](#replication). |
 | `CompactionFilter` | nil | Drop values during compaction. See [Compaction filtering](#compaction-filtering). |
@@ -330,7 +334,15 @@ valid only until the next `Next`; copy to retain. `ExpiresAt` is the current
 entry's absolute deadline (Unix seconds), or 0 when it has no TTL.
 
 Codec constants `CodecNone`, `CodecS2`, `CodecZstd`, and `CodecFlate` name the
-built-in compression codecs in `Options`.
+built-in compression codecs in `Options`. `EntryKind` constants `EntryPut`,
+`EntryDelete`, and `EntryDeleteRange` identify the mutation a `WALEntry` carries
+(its `Kind` field).
+
+## Concurrency
+
+A `*DB` and a `*Snapshot` are safe for concurrent use by multiple goroutines,
+including concurrent reads and writes. A single `*Batch` or `Iterator` holds
+mutable state and must not be shared across goroutines; use one per goroutine.
 
 ## Size limits
 
@@ -542,11 +554,33 @@ the new setting.
 
 `Stats` returns a point-in-time snapshot: live table count and size, tables per
 depth, block-cache blocks/bytes/hits/misses, open file descriptors, cumulative
-compaction/flush/WAL byte counters, write stalls, and the background error.
+compaction/flush/WAL byte counters, write stalls, and the background error. It
+also exposes read- and write-amplification counters: `PointReads` and
+`TableProbes` (their ratio is the average structural read fan-out per lookup),
+`BloomFalsePositives` (bloom admitted the key but the table did not hold it, so
+the block read was wasted — a high rate relative to `CacheMisses` means raising
+`BloomBits` pays off), and `UserBytesWritten` (caller key+value bytes stored,
+the write-amplification denominator against the flush/compaction/WAL byte
+counters).
 
-`GetProperty` returns individual values by LevelDB-style name (for example
-`levisdb.num-tables`, `levisdb.cache-hits`, `levisdb.wal-bytes-written`,
-`levisdb.write-stalls`, `levisdb.background-error`).
+`GetProperty` returns individual values by LevelDB-style name:
+`levisdb.num-tables`, `levisdb.tables-size`, `levisdb.live-snapshots`,
+`levisdb.cache-blocks`, `levisdb.cache-bytes`, `levisdb.cache-hits`,
+`levisdb.cache-misses`, `levisdb.open-files`, `levisdb.tables-per-depth`,
+`levisdb.compaction-count`, `levisdb.compaction-bytes-read`,
+`levisdb.compaction-bytes-written`, `levisdb.flush-count`,
+`levisdb.flush-bytes-written`, `levisdb.wal-bytes-written`,
+`levisdb.write-stalls`, `levisdb.point-reads`, `levisdb.table-probes`,
+`levisdb.bloom-false-positives`, `levisdb.user-bytes-written`, and
+`levisdb.background-error`.
+
+Set the `Logger` option to a `*slog.Logger` to receive structured storage-engine
+events (open, flush, compaction, WAL rotation and checkpoint, close), mirroring
+what LevelDB writes to its `LOG` file. The engine logs only through this logger
+— never to stderr or a package global — so the caller controls level, format,
+and destination. Routine per-operation detail is emitted at `Debug`, lifecycle
+milestones at `Info`; each event carries a `component=levisdb` attribute plus an
+`op` and context such as table numbers.
 
 Opening a database also publishes a process-wide `expvar` named `levisdb`, a
 map of data directory to its stats, so a `net/http/pprof` or `expvar` HTTP
@@ -567,8 +601,9 @@ proactive rather than lazy.
 
 Sentinel errors returned by the API, all matchable with `errors.Is`:
 `ErrNotFound`, `ErrClosed`, `ErrReadOnly`, `ErrEmptyKey`, `ErrInvalidTTL`,
-`ErrInvalidRange`, `ErrEntryTooLarge`, `ErrBatchTooLarge`, `ErrRetentionExpired`,
-and `ErrFileNumberExhausted`.
+`ErrInvalidRange`, `ErrEntryTooLarge`, `ErrBatchTooLarge`, `ErrIngestRangeDeletes`
+(an ingested external file carries range tombstones, which ingest cannot
+reproduce), `ErrRetentionExpired`, and `ErrFileNumberExhausted`.
 
 ## Replication
 
