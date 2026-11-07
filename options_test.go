@@ -175,6 +175,14 @@ func TestResolveMaxDepth(t *testing.T) {
 	assert.Equal(t, maxTierDepth, resolveMaxDepth(DefaultMaxLevels))
 }
 
+func TestFillDefaultsSaturatesDerivedByteThresholds(t *testing.T) {
+	t.Parallel()
+	o := Options{Dir: "/d", FileSizeMax: math.MaxInt64}
+	o.fillDefaults()
+	assert.Equal(t, int64(math.MaxInt64), o.MaxCompactionBytes)
+	assert.Equal(t, int64(math.MaxInt64), o.TierByteTrigger)
+}
+
 func TestValidate(t *testing.T) {
 	t.Parallel()
 	tests := []struct {

@@ -3,6 +3,7 @@ package levisdb
 import (
 	"encoding/binary"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 )
@@ -51,12 +52,18 @@ func decodeBlobPointer(v []byte) (blobPointer, error) {
 	if len(v) != blobPointerLen {
 		return blobPointer{}, fmt.Errorf("blob: pointer length %d, want %d", len(v), blobPointerLen)
 	}
-	return blobPointer{
+	p := blobPointer{
 		num:       binary.LittleEndian.Uint32(v[0:]),
 		offset:    binary.LittleEndian.Uint64(v[4:]),
 		length:    binary.LittleEndian.Uint32(v[12:]),
 		expiresAt: int64(binary.LittleEndian.Uint64(v[16:])),
-	}, nil
+	}
+	end := p.offset + uint64(p.length)
+	if p.num == 0 || p.length == 0 || uint64(p.length) > uint64(maxEntrySize) ||
+		p.expiresAt < 0 || end < p.offset || end > math.MaxInt64 {
+		return blobPointer{}, fmt.Errorf("blob: invalid pointer")
+	}
+	return p, nil
 }
 
 // blobWriter appends values to blob files, rolling to a fresh file once one reaches

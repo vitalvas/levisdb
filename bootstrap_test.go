@@ -178,8 +178,13 @@ func TestSnapshotWriteTo(t *testing.T) {
 		snap, err := src.Snapshot()
 		require.NoError(t, err)
 		require.NoError(t, src.Close())
-		_, err = snap.WriteTo(bootstrapImagePath(t), SstWriterOptions{})
+		path := bootstrapImagePath(t)
+		require.NoError(t, os.WriteFile(path, []byte("keep"), 0o644))
+		_, err = snap.WriteTo(path, SstWriterOptions{})
 		assert.ErrorIs(t, err, ErrClosed)
+		contents, readErr := os.ReadFile(path)
+		require.NoError(t, readErr)
+		assert.Equal(t, []byte("keep"), contents, "failed export must not truncate the destination")
 	})
 }
 

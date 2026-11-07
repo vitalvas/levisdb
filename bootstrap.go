@@ -64,6 +64,15 @@ func writeEntry(w *SstFileWriter, src *engineIterator) error {
 // database use WriteToDir, which rolls bounded files a follower can ingest and
 // compact as normal-sized tables.
 func (s *Snapshot) WriteTo(path string, opts SstWriterOptions) (uint64, error) {
+	// Validate and pin the source before touching the destination. In particular,
+	// a snapshot whose database is already closed must not truncate an unrelated
+	// pre-existing path before returning ErrClosed.
+	src, release, err := s.openImageScan()
+	if err != nil {
+		return 0, err
+	}
+	defer release()
+
 	w, err := NewSstFileWriter(path, opts)
 	if err != nil {
 		return 0, err
@@ -74,12 +83,6 @@ func (s *Snapshot) WriteTo(path string, opts SstWriterOptions) (uint64, error) {
 			_ = w.Close()
 		}
 	}()
-
-	src, release, err := s.openImageScan()
-	if err != nil {
-		return 0, err
-	}
-	defer release()
 
 	n := 0
 	for src.Next() {

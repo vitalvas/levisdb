@@ -25,7 +25,7 @@ type snapshots struct {
 	mu            sync.Mutex
 	cond          *sync.Cond
 	count         map[uint64]int // seq -> number of live snapshots at that seq
-	iteratorTimes map[int64]int  // Unix nanos -> live iterators using that TTL view
+	iteratorTimes map[int64]int  // Unix seconds -> live iterators using that TTL view
 	filterRuns    int            // compactions currently allowed to filter values
 }
 

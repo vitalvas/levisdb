@@ -428,6 +428,26 @@ func TestMemtableFlushIntervalOffByDefault(t *testing.T) {
 	assert.Empty(t, db.eng.Tables(), "no time trigger: the write stays in the memtable")
 }
 
+func TestMemFlushTrackerResetsOnMemtableRotation(t *testing.T) {
+	t.Parallel()
+	var tracker memFlushTracker
+	first := newMemtable(1)
+	second := newMemtable(2)
+	start := time.Unix(100, 0)
+	interval := time.Minute
+
+	assert.False(t, tracker.ready(first, false, start, interval))
+	assert.True(t, tracker.ready(first, false, start.Add(interval), interval))
+	// A newly rotated active memtable starts its own dirty-age window even when
+	// the loop never observed an empty state between the two tables.
+	assert.False(t, tracker.ready(second, false, start.Add(interval), interval))
+	assert.False(t, tracker.ready(second, false, start.Add(2*interval-time.Nanosecond), interval))
+	assert.True(t, tracker.ready(second, false, start.Add(2*interval), interval))
+
+	assert.False(t, tracker.ready(second, true, start.Add(3*interval), interval))
+	assert.Nil(t, tracker.mem)
+}
+
 func TestWALObserverReceivesWrites(t *testing.T) {
 	t.Parallel()
 	var mu sync.Mutex

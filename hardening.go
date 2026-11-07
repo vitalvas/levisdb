@@ -19,8 +19,8 @@ package levisdb
 //
 // Group commit ordering:
 //   - Concurrent batches are assigned sequence numbers and applied to memtables
-//     in commit order; a batch's waiter is released only after it is durable and
-//     applied.
+//     in commit order; a batch's waiter is released only after it is committed
+//     and applied (and fsynced first unless NoSync is enabled).
 //
 // Background-error latching:
 //   - The first terminal WAL/flush/compaction failure is latched and rejects all

@@ -250,6 +250,21 @@ func TestReplayManifestRejectsImpossibleTableHistory(t *testing.T) {
 			wantErr: "delete of unknown table",
 		},
 		{
+			name:    "depth beyond supported tiers",
+			edits:   []manifestEdit{{Added: []manifestTableInfo{{Num: 7, Depth: maxTierDepth + 1, Size: 100}}}},
+			wantErr: "depth 8 out of range",
+		},
+		{
+			name:    "inverted key bounds",
+			edits:   []manifestEdit{{Added: []manifestTableInfo{{Num: 7, Size: 100, MinKey: []byte("z"), MaxKey: []byte("a")}}}},
+			wantErr: "invalid key bounds",
+		},
+		{
+			name:    "tombstones exceed entries",
+			edits:   []manifestEdit{{Added: []manifestTableInfo{{Num: 7, Size: 100, Entries: 1, Tombstones: 2}}}},
+			wantErr: "invalid tombstone count",
+		},
+		{
 			name: "reuse after delete",
 			edits: []manifestEdit{
 				{Added: []manifestTableInfo{{Num: 7, Size: 100}}},

@@ -3,6 +3,7 @@ package levisdb
 import (
 	"bytes"
 	"fmt"
+	"math"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -13,9 +14,9 @@ import (
 func TestBlobPointerRoundTrip(t *testing.T) {
 	t.Parallel()
 	for _, p := range []blobPointer{
-		{num: 1, offset: 0, length: 0, expiresAt: 0},
+		{num: 1, offset: 0, length: 1, expiresAt: 0},
 		{num: 42, offset: 1 << 40, length: 1 << 20, expiresAt: 1700000000},
-		{num: 0xffffffff, offset: 0xffffffffffff, length: 0xffffffff, expiresAt: -1},
+		{num: 0xffffffff, offset: 0xffffffffffff, length: 16, expiresAt: 1 << 40},
 	} {
 		got, err := decodeBlobPointer(encodeBlobPointer(nil, p))
 		require.NoError(t, err)
@@ -23,6 +24,16 @@ func TestBlobPointerRoundTrip(t *testing.T) {
 	}
 	_, err := decodeBlobPointer([]byte{1, 2, 3})
 	assert.Error(t, err, "a wrong-length pointer is rejected")
+	for _, p := range []blobPointer{
+		{num: 0, length: 1},
+		{num: 1, length: 0},
+		{num: 1, length: uint32(maxEntrySize + 1)},
+		{num: 1, length: 1, expiresAt: -1},
+		{num: 1, offset: math.MaxUint64, length: 1},
+	} {
+		_, err := decodeBlobPointer(encodeBlobPointer(nil, p))
+		assert.Error(t, err, "invalid pointer must not reach the allocation/read path: %+v", p)
+	}
 }
 
 // openBlobDB opens a DB with value separation enabled at a small threshold and a

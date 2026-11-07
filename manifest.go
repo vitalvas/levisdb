@@ -6,6 +6,7 @@
 package levisdb
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -277,6 +278,28 @@ func readTable(rec []byte) (manifestTableInfo, []byte, error) {
 	}, rec, nil
 }
 
+// validateManifestTable rejects table metadata that a writer could never
+// produce. Keep this separate from replayManifestFile so the history/state
+// checks there remain readable and within the complexity policy.
+func validateManifestTable(t manifestTableInfo) error {
+	if t.Num == 0 {
+		return fmt.Errorf("manifest: table file number 0 is reserved")
+	}
+	// Reject an impossible tier before buildLevelIndex sizes slices from Depth;
+	// a huge value in an otherwise well-framed manifest could exhaust memory.
+	if t.Depth < 0 || t.Depth > maxTierDepth {
+		return fmt.Errorf("manifest: table %d depth %d out of range", t.Num, t.Depth)
+	}
+	if t.Tombstones < 0 || t.Tombstones > t.Entries {
+		return fmt.Errorf("manifest: table %d has invalid tombstone count", t.Num)
+	}
+	if (t.MinKey == nil) != (t.MaxKey == nil) ||
+		(t.MinKey != nil && bytes.Compare(t.MinKey, t.MaxKey) > 0) {
+		return fmt.Errorf("manifest: table %d has invalid key bounds", t.Num)
+	}
+	return nil
+}
+
 // appendKeyBound and readKeyBound carry a length-prefixed key bound. A nil
 // slice encodes as length 0 and decodes back to nil, so unknown bounds round-
 // trip. readKeyBound returns an owned copy since the record buffer is transient.
@@ -420,8 +443,8 @@ func replayManifestFile(r io.Reader) (*manifestState, error) {
 			st.ReplayLogNum = edit.ReplayLogNum
 		}
 		for _, t := range edit.Added {
-			if t.Num == 0 {
-				return nil, fmt.Errorf("manifest: table file number 0 is reserved")
+			if err := validateManifestTable(t); err != nil {
+				return nil, err
 			}
 			if seenTableNums[t.Num] {
 				return nil, fmt.Errorf("manifest: table file number %d reused", t.Num)

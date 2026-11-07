@@ -1,6 +1,7 @@
 package levisdb
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
@@ -119,6 +120,20 @@ func TestSstIngestTTLAndDelete(t *testing.T) {
 
 	_, err = db.Get([]byte("zzz"))
 	assert.ErrorIs(t, err, ErrNotFound, "ingested tombstone hides the key")
+}
+
+func TestIngestRejectsSourceBlobReferences(t *testing.T) {
+	t.Parallel()
+	src := openBlobDB(t)
+	require.NoError(t, src.Put(PutOptions{Key: []byte("big"), Value: bytes.Repeat([]byte("x"), 512)}))
+	require.NoError(t, src.eng.Flush())
+	require.Len(t, src.eng.tables, 1)
+
+	dst := openTestDB(t, nil)
+	err := dst.IngestExternalFile(src.eng.tables[0].path)
+	assert.ErrorIs(t, err, ErrIngestBlobReferences)
+	_, getErr := dst.Get([]byte("big"))
+	assert.ErrorIs(t, getErr, ErrNotFound)
 }
 
 func TestSstIngestRejectsMemtableOverlap(t *testing.T) {
@@ -305,6 +320,38 @@ func TestSSTWriterClosePreservesOnlyFinishedFiles(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestSSTWriterRejectsInvalidOptionsBeforeCreatingFile(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name string
+		opts SstWriterOptions
+	}{
+		{name: "negative bloom bits", opts: SstWriterOptions{BloomBits: -1}},
+		{name: "negative block size", opts: SstWriterOptions{BlockSize: -1}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "output.sst")
+			w, err := NewSstFileWriter(path, tc.opts)
+			assert.Nil(t, w)
+			require.Error(t, err)
+			_, statErr := os.Stat(path)
+			assert.ErrorIs(t, statErr, os.ErrNotExist)
+		})
+	}
+}
+
+func TestSSTWriterRejectsOversizedEntry(t *testing.T) {
+	// Not parallel: maxEntrySize is a package-level test seam.
+	original := maxEntrySize
+	maxEntrySize = 32
+	t.Cleanup(func() { maxEntrySize = original })
+
+	w, err := NewSstFileWriter(filepath.Join(t.TempDir(), "output.sst"), SstWriterOptions{})
+	require.NoError(t, err)
+	defer w.Close()
+	assert.ErrorIs(t, w.Put([]byte("key"), make([]byte, maxEntrySize)), ErrEntryTooLarge)
 }
 
 func TestIngestedDeletionCompactionPreservesSnapshot(t *testing.T) {

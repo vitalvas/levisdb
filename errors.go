@@ -27,8 +27,8 @@ var (
 	// its uint32 offset limit even when each entry is small enough on its own.
 	ErrBatchTooLarge = errors.New("levisdb: batch too large")
 
-	// ErrInvalidTTL is returned when a put has a negative TTL or its absolute
-	// expiration cannot be represented as a Unix nanosecond timestamp.
+	// ErrInvalidTTL is returned when a put has a non-positive or already-past
+	// absolute expiration. Expirations use Unix seconds.
 	ErrInvalidTTL = errors.New("levisdb: invalid TTL")
 
 	// ErrInvalidRange is returned by DeleteRange when the end is empty or not
@@ -41,6 +41,11 @@ var (
 	// otherwise silently drop. Build ingest files with SstFileWriter, which does
 	// not produce range tombstones.
 	ErrIngestRangeDeletes = errors.New("levisdb: external file contains range tombstones")
+
+	// ErrIngestBlobReferences is returned by IngestExternalFile when the source
+	// table contains pointers into another database's blob files. Such pointers
+	// are not self-contained and cannot be copied safely into this database.
+	ErrIngestBlobReferences = errors.New("levisdb: external file contains blob references")
 
 	// ErrRetentionExpired is returned by GetUpdatesSince when the requested
 	// sequence is below the oldest retained WAL record, so the committed stream

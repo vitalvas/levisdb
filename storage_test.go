@@ -129,6 +129,13 @@ func TestStorageCurrent(t *testing.T) {
 		_, _, err := s.readCurrent()
 		assert.Error(t, err)
 	})
+
+	t.Run("non-canonical number", func(t *testing.T) {
+		require.NoError(t, os.WriteFile(filepath.Join(dir, currentName), []byte("MANIFEST-0000000A\n"), 0o644))
+		_, _, err := s.readCurrent()
+		require.Error(t, err)
+		assert.NotContains(t, err.Error(), "%!w")
+	})
 }
 
 func TestStorageCloseIdempotent(t *testing.T) {

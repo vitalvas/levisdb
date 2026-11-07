@@ -75,7 +75,7 @@ func (m *memtableT) Put(seq uint64, key, value []byte) {
 	m.add(seq, ikeyKindSet, key, value)
 }
 
-// putTTL buffers a set with an absolute Unix-nanosecond expiration.
+// putTTL buffers a set with an absolute Unix-second expiration.
 func (m *memtableT) putTTL(seq uint64, key, value []byte, expiresAt int64) {
 	m.add(seq, ikeyKindSetTTL, key, encodeExpiringValue(value, expiresAt))
 }

@@ -39,12 +39,18 @@ type SstFileWriter struct {
 // blocks); set fields to match the target database's read expectations.
 type SstWriterOptions struct {
 	Codec     string // block codec name; empty uses CodecS2
-	BloomBits int    // bloom bits per key; zero uses DefaultBloomBits
-	BlockSize int    // data block size in bytes; zero uses DefaultBlockSize
+	BloomBits int    // bloom bits per key; zero uses DefaultBloomBits; negative is invalid
+	BlockSize int    // data block size in bytes; zero uses DefaultBlockSize; negative is invalid
 }
 
 // NewSstFileWriter creates a table-file writer at path.
 func NewSstFileWriter(path string, opts SstWriterOptions) (*SstFileWriter, error) {
+	if opts.BloomBits < 0 {
+		return nil, fmt.Errorf("sst: BloomBits must be non-negative, got %d", opts.BloomBits)
+	}
+	if opts.BlockSize < 0 {
+		return nil, fmt.Errorf("sst: BlockSize must be non-negative, got %d", opts.BlockSize)
+	}
 	if opts.Codec == "" {
 		opts.Codec = CodecS2
 	}
@@ -82,7 +88,7 @@ func (w *SstFileWriter) Put(key, value []byte) error {
 // building a multi-file image can roll to a new file at a size target.
 func (w *SstFileWriter) bytesWritten() int64 { return w.tw.bytesWritten() }
 
-// PutWithExpiry adds a key/value pair with an absolute expiration (Unix nanos).
+// PutWithExpiry adds a key/value pair with an absolute expiration (Unix seconds).
 // expiresAt must be positive; use Put for a value without expiration. Keys must be
 // added in strictly ascending order. The stored deadline is exact, so ingesting a
 // value preserves the same expiry a put with that ExpiresAt would have (see
@@ -108,6 +114,12 @@ func (w *SstFileWriter) add(key, value []byte, kind ikeyKind) error {
 	}
 	if len(key) == 0 {
 		return ErrEmptyKey
+	}
+	// The table block format uses uint32 offsets. Match the database write
+	// boundary so an offline ingest file cannot encode an entry large enough to
+	// wrap those offsets and become unreadable.
+	if len(key) > maxEntrySize || len(value) > maxEntrySize-len(key) {
+		return ErrEntryTooLarge
 	}
 	if w.lastKey != nil && bytes.Compare(key, w.lastKey) <= 0 {
 		w.err = fmt.Errorf("sst: keys must be added in ascending order")
@@ -298,6 +310,10 @@ func openExternalTable(path string) (*externalTable, int64, error) {
 func externalKeyRange(r *tableReader) (minKey, maxKey []byte, err error) {
 	it := r.newIterator()
 	for it.Next() {
+		_, kind := ikeySeqKind(it.internalKey())
+		if kind == ikeyKindBlobRef {
+			return nil, nil, ErrIngestBlobReferences
+		}
 		uk := ikeyUserKey(it.internalKey())
 		if minKey == nil {
 			minKey = append([]byte(nil), uk...)

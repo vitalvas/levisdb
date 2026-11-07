@@ -293,8 +293,11 @@ func (s *storageT) readCurrent() (num uint32, ok bool, err error) {
 	}
 	stem := strings.TrimPrefix(name, prefix)
 	v, err := strconv.ParseUint(stem, 16, 32)
-	if err != nil || fmt.Sprintf("%08x", v) != stem {
+	if err != nil {
 		return 0, false, fmt.Errorf("storage: malformed CURRENT %q: %w", name, err)
+	}
+	if fmt.Sprintf("%08x", v) != stem {
+		return 0, false, fmt.Errorf("storage: malformed CURRENT %q: non-canonical file number", name)
 	}
 	return uint32(v), true, nil
 }

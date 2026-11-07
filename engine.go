@@ -253,7 +253,7 @@ func (s *engineT) Put(seq uint64, key, value []byte) {
 	s.mu.Unlock()
 }
 
-// putTTL buffers a set with an absolute Unix-nanosecond expiration.
+// putTTL buffers a set with an absolute Unix-second expiration.
 func (s *engineT) putTTL(seq uint64, key, value []byte, expiresAt int64) {
 	s.mu.Lock()
 	s.mem.putTTL(seq, key, value, expiresAt)
@@ -279,6 +279,15 @@ func (s *engineT) memEmpty() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.mem.empty()
+}
+
+// memState returns the identity and emptiness of the active memtable in one
+// snapshot. The time-based flush loop uses the identity to distinguish a newly
+// rotated memtable from the previous one even when writes keep both non-empty.
+func (s *engineT) memState() (*memtableT, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.mem, s.mem.empty()
 }
 
 // memSize returns the active memtable's approximate encoded size, for flush

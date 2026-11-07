@@ -36,7 +36,7 @@ type WALEntry struct {
 	ExpiresAt int64
 }
 
-// WALObserver taps the durable write stream so callers can build replication
+// WALObserver taps the committed write stream so callers can build replication
 // or change-data-capture without forking the engine.
 //
 // Observe is called synchronously after each configured WAL commit (after
@@ -139,7 +139,7 @@ const (
 	// nodes by uint32 offset and grows slightly faster than the tracked entry
 	// size (per-node header + level links), so the arena must never reach 2^32.
 	// 2 GiB leaves ample headroom below that boundary.
-	maxMemtableSize = 2 << 30 // 2 GiB
+	maxMemtableSize int64 = 2 << 30 // 2 GiB
 )
 
 // maxEntrySize caps a single key+value AND the cumulative bytes one batch may
@@ -442,11 +442,11 @@ func (o *Options) fillDefaults() {
 	if o.MaxCompactionBytes == 0 {
 		// Default to a few max-size files so normal tiers merge whole while a
 		// runaway tier is drained in bounded steps.
-		o.MaxCompactionBytes = o.FileSizeMax * defaultMaxCompactionFiles
+		o.MaxCompactionBytes = saturatingByteMultiple(o.FileSizeMax, defaultMaxCompactionFiles)
 	}
 	switch {
 	case o.TierByteTrigger == 0:
-		o.TierByteTrigger = o.FileSizeMax * defaultTierByteTriggerFiles
+		o.TierByteTrigger = saturatingByteMultiple(o.FileSizeMax, defaultTierByteTriggerFiles)
 	case o.TierByteTrigger < 0:
 		o.TierByteTrigger = 0 // caller disabled the density trigger
 	}
@@ -487,6 +487,20 @@ func (o *Options) fillDefaults() {
 	if o.BottomCodec == "" {
 		o.BottomCodec = DefaultBottomCodec
 	}
+}
+
+// saturatingByteMultiple multiplies a positive byte count by a small positive
+// factor without wrapping. Derived defaults use it so a very large FileSizeMax
+// remains a large safeguard instead of overflowing negative and silently
+// disabling the corresponding compaction limit or trigger.
+func saturatingByteMultiple(value int64, factor int64) int64 {
+	if value <= 0 || factor <= 0 {
+		return 0
+	}
+	if value > math.MaxInt64/factor {
+		return math.MaxInt64
+	}
+	return value * factor
 }
 
 // validCodecs are the codec names accepted for FreshCodec and BottomCodec.

@@ -701,16 +701,18 @@ stateDiagram-v2
     Reaped --> [*]
 ```
 
-Every mutation is first appended to the WAL, so a committed write survives a
-crash even before the memtable is flushed to a table.
+Every mutation is first appended to the WAL. In the default durable mode, a
+committed write survives a crash even before the memtable is flushed to a table;
+`NoSync` instead provides the bounded loss window described below.
 
 **Group commit.** Concurrent `Put`/`Delete`/`Write` calls are coalesced by a
-single committer into one grouped journal write and one fsync, so the WAL sees
-one sequential stream no matter how many goroutines write to it. Each call
-returns only after its batch is durable and any `WALObserver` has run.
+single committer into one grouped journal write and, in durable mode, one fsync,
+so the WAL sees one sequential stream no matter how many goroutines write to it.
+Each call returns only after its batch is committed and any `WALObserver` has run.
 
-**Batch atomicity.** A `Batch` is one record: all of its ops become durable
-together or none do, and it becomes visible to reads and snapshots atomically.
+**Batch atomicity.** A `Batch` is one record: all of its ops commit together or
+none do, and it becomes visible to reads and snapshots atomically (crash
+durability still follows the selected durability mode).
 A global sequence number is assigned to the batch as a contiguous range, and the
 read sequence advances past the batch only once it has applied, so a concurrent
 reader never sees a batch half-applied.

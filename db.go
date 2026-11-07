@@ -347,8 +347,8 @@ func (db *DB) startMemFlushLoop() {
 	// Tick at half the interval so dirty data is flushed within about 1.5 intervals
 	// of the first un-flushed write, mirroring the fd reaper's sampling.
 	tick := interval / 2
-	if tick < time.Second {
-		tick = time.Second
+	if tick < time.Millisecond {
+		tick = time.Millisecond
 	}
 	stop := make(chan struct{})
 	db.memFlushStop = stop
@@ -357,21 +357,14 @@ func (db *DB) startMemFlushLoop() {
 		defer db.memFlushWG.Done()
 		t := time.NewTicker(tick)
 		defer t.Stop()
-		var dirtySince time.Time
+		var tracker memFlushTracker
 		for {
 			select {
 			case <-stop:
 				return
 			case now := <-t.C:
-				if db.eng.memEmpty() {
-					dirtySince = time.Time{} // clean: reset the clock
-					continue
-				}
-				if dirtySince.IsZero() {
-					dirtySince = now // first tick seeing un-flushed data
-					continue
-				}
-				if now.Sub(dirtySince) >= interval {
+				mem, empty := db.eng.memState()
+				if tracker.ready(mem, empty, now, interval) {
 					// The scheduler's flush is size-gated (needFlush), so a sub-threshold
 					// memtable is flushed directly here; flushAndLog serializes with any
 					// scheduler flush via flushMu. Then signal the scheduler to run any
@@ -382,11 +375,39 @@ func (db *DB) startMemFlushLoop() {
 					}
 					db.maybeCheckpoint()
 					db.sched.Signal()
-					dirtySince = time.Time{} // re-arm after flushing
+					tracker.reset() // re-arm after flushing
 				}
 			}
 		}
 	}()
+}
+
+// memFlushTracker measures dirty age per active memtable. Tracking only whether
+// the engine is non-empty is insufficient: a size flush can rotate a dirty
+// memtable and a concurrent writer can immediately dirty the replacement, so
+// the loop may never observe an empty state and would inherit the old table's
+// age, flushing the replacement too early.
+type memFlushTracker struct {
+	mem   *memtableT
+	since time.Time
+}
+
+func (t *memFlushTracker) ready(mem *memtableT, empty bool, now time.Time, interval time.Duration) bool {
+	if empty {
+		t.reset()
+		return false
+	}
+	if t.mem != mem {
+		t.mem = mem
+		t.since = now
+		return false
+	}
+	return now.Sub(t.since) >= interval
+}
+
+func (t *memFlushTracker) reset() {
+	t.mem = nil
+	t.since = time.Time{}
 }
 
 // stopMemFlushLoop signals the time-based flush loop and waits for it to exit. Safe
@@ -1156,10 +1177,10 @@ func (db *DB) hasAt(seq uint64, key []byte) (bool, error) {
 }
 
 // LatestSeq returns the highest committed sequence number: every mutation with a
-// sequence at or below it is durable and visible to reads. It is the resume point
-// a WALObserver consumer records, and the sequence a replica has caught up to. A
-// closed database returns 0. Unlike Snapshot().Seq() it pins nothing, so it is a
-// cheap way to read the current write position.
+// sequence at or below it is visible to reads (and crash-durable unless NoSync is
+// enabled). It is the resume point a WALObserver consumer records, and the sequence
+// a replica has caught up to. A closed database returns 0. Unlike Snapshot().Seq()
+// it pins nothing, so it is a cheap way to read the current write position.
 func (db *DB) LatestSeq() uint64 {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
@@ -1435,7 +1456,8 @@ func (db *DB) maybeCheckpoint() {
 	// without bound. This bounds the live WAL (and crash-recovery cost) at roughly
 	// walCheckpointStallMultiple * WALSegmentBytes.
 	if !db.checkpointRunning.CompareAndSwap(false, true) {
-		for size >= segBytes*walCheckpointStallMultiple {
+		stallBytes := saturatingByteMultiple(segBytes, walCheckpointStallMultiple)
+		for size >= stallBytes {
 			db.mu.RLock()
 			closed := db.closed
 			db.mu.RUnlock()
@@ -1601,7 +1623,7 @@ func (db *DB) checkpointWALMode(force bool) (uint64, error) {
 	return safe, nil
 }
 
-// applyCommitted installs one durable WAL batch into the memtable and advances
+// applyCommitted installs one committed WAL batch into the memtable and advances
 // readSeq over it. The single WAL commits batches in seq order, so readSeq is a
 // simple forward store and a snapshot never observes a half-applied batch.
 func (db *DB) applyCommitted(entries []walEntry) {
