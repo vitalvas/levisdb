@@ -1,6 +1,7 @@
 package levisdb
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"hash/crc32"
@@ -305,6 +306,15 @@ type dataBlockIter struct {
 	key      []byte    // reconstructed full key (== bufs[which][:len])
 	value    []byte    // aliases entries
 	err      error
+
+	// Reverse-iteration state, materialized on the first prev() call. A data
+	// block is bounded by BlockSize (a single oversized entry aside), so decoding
+	// it once and indexing backward is cheaper and simpler than restart-anchored
+	// re-decode, at the cost of one block's keys/values held in memory.
+	revKeys   [][]byte
+	revVals   [][]byte
+	revIndex  int
+	revPrimed bool
 }
 
 // splitDataBlock separates a data-block payload into its entry region and its
@@ -343,6 +353,10 @@ func (it *dataBlockIter) resetEntries(entries []byte) {
 	it.key = nil
 	it.value = nil
 	it.err = nil
+	it.revKeys = it.revKeys[:0]
+	it.revVals = it.revVals[:0]
+	it.revIndex = 0
+	it.revPrimed = false
 }
 
 // restartOffset returns the entry offset recorded at restart index i, or -1 if
@@ -477,6 +491,43 @@ func (it *dataBlockIter) next() bool {
 	it.value = it.entries[it.pos : it.pos+int(valLen)]
 	it.pos += int(valLen)
 	return true
+}
+
+// prev advances to the previous entry in descending order and reports whether
+// one is available. The first call materializes the whole block by decoding it
+// forward once; subsequent calls index backward. After prev() the current key
+// and value are stable until the next prev() call.
+func (it *dataBlockIter) prev() bool {
+	if it.err != nil {
+		return false
+	}
+	if !it.revPrimed {
+		it.primeReverse()
+		if it.err != nil {
+			return false
+		}
+	}
+	if it.revIndex <= 0 {
+		return false
+	}
+	it.revIndex--
+	it.key = it.revKeys[it.revIndex]
+	it.value = it.revVals[it.revIndex]
+	return true
+}
+
+// primeReverse decodes every entry once (forward), copying full keys and values
+// so a later backward walk can hand out stable slices.
+func (it *dataBlockIter) primeReverse() {
+	it.revPrimed = true
+	it.pos = 0
+	it.key = nil
+	it.which = 0
+	for it.next() {
+		it.revKeys = append(it.revKeys, bytes.Clone(it.key))
+		it.revVals = append(it.revVals, bytes.Clone(it.value))
+	}
+	it.revIndex = len(it.revKeys)
 }
 
 func (it *dataBlockIter) Error() error { return it.err }

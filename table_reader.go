@@ -683,3 +683,102 @@ func (it *tableIterator) Value() []byte { return it.inner.value }
 
 // Error returns any error encountered during iteration.
 func (it *tableIterator) Error() error { return it.err }
+
+// reverseTableIterator yields a table's entries in descending internal-key
+// order. It walks data blocks from the last index entry down to the first, and
+// within each block uses dataBlockIter.prev(). Its Next() means "advance in
+// descending order", so it satisfies entrySource for the reverse merge.
+type reverseTableIterator struct {
+	tr      *tableIterator
+	blk     int
+	loaded  bool
+	started bool
+	lastKey []byte
+	err     error
+}
+
+func (tr *tableReader) newReverseIterator() *reverseTableIterator {
+	return &reverseTableIterator{tr: tr.newIterator()}
+}
+
+func (it *reverseTableIterator) Next() bool {
+	if it.err != nil {
+		return false
+	}
+	if it.tr.meta == nil {
+		m, err := it.tr.tr.ensureMeta()
+		if err != nil {
+			it.err = err
+			return false
+		}
+		it.tr.meta = m
+	}
+	if !it.started {
+		it.started = true
+		it.blk = len(it.tr.meta.indexEnt)
+	}
+	for {
+		if it.loaded {
+			if it.tr.inner.prev() {
+				if len(it.tr.inner.key) < trailerLen {
+					it.err = fmt.Errorf("table: short internal key")
+					return false
+				}
+				_, kind := ikeySeqKind(it.tr.inner.key)
+				if !validIKeyKind(kind) {
+					it.err = fmt.Errorf("table: unknown internal-key kind %d", kind)
+					return false
+				}
+				if it.lastKey != nil && ikeyCompare(it.lastKey, it.tr.inner.key) <= 0 {
+					it.err = fmt.Errorf("table: keys out of order")
+					return false
+				}
+				it.lastKey = append(it.lastKey[:0], it.tr.inner.key...)
+				return true
+			}
+			if err := it.tr.inner.Error(); err != nil {
+				it.err = err
+				return false
+			}
+		}
+		it.blk--
+		if it.blk < 0 {
+			return false
+		}
+		if !it.loadBlock() {
+			return false
+		}
+	}
+}
+
+// loadBlock reads and decodes the data block at it.blk into the inner iterator,
+// ready for prev(). It mirrors the block-load tail of tableIterator.Next.
+func (it *reverseTableIterator) loadBlock() bool {
+	raw, err := it.tr.blockRaw(it.tr.meta.blockHandleAt(it.blk))
+	if err != nil {
+		it.err = err
+		return false
+	}
+	payload, usedDst, err := decodeBlockInto(it.tr.decScratch, raw)
+	if err != nil {
+		it.err = err
+		return false
+	}
+	if usedDst {
+		it.tr.decScratch = payload
+	}
+	entries, _, _, splitErr := splitDataBlock(payload)
+	if splitErr != nil {
+		it.err = splitErr
+		return false
+	}
+	it.tr.inner.resetEntries(entries)
+	it.loaded = true
+	return true
+}
+
+func (it *reverseTableIterator) internalKey() []byte { return it.tr.inner.key }
+
+func (it *reverseTableIterator) Value() []byte { return it.tr.inner.value }
+
+func (it *reverseTableIterator) Error() error { return it.err }

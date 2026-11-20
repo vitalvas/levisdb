@@ -217,3 +217,21 @@ func (s *Snapshot) NewRangeIterator(start, end []byte) (Iterator, error) {
 	s.db.snaps.acquire(s.seq)
 	return s.db.newRangeIterator(s.seq, start, end)
 }
+
+// NewReverseIterator returns a descending iterator over the whole keyspace as of
+// the snapshot.
+func (s *Snapshot) NewReverseIterator() (Iterator, error) {
+	return s.NewReverseRangeIterator(nil, nil)
+}
+
+// NewReverseRangeIterator returns a descending iterator over [start, end) as of
+// the snapshot.
+func (s *Snapshot) NewReverseRangeIterator(start, end []byte) (Iterator, error) {
+	s.db.mu.RLock()
+	defer s.db.mu.RUnlock()
+	if s.db.closed {
+		return nil, ErrClosed
+	}
+	s.db.snaps.acquire(s.seq)
+	return s.db.newReverseRangeIterator(s.seq, start, end)
+}

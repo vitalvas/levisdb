@@ -42,55 +42,85 @@ func (s *engineT) NewRangeIterator(seq uint64, start, end []byte) *engineIterato
 	return s.newRangeIteratorAt(seq, start, end, time.Now().Unix())
 }
 
-func (s *engineT) newRangeIteratorAt(seq uint64, start, end []byte, readTime int64) *engineIterator {
+// iteratorSources is the set of merge inputs an iterator is built from, gathered
+// once under the engine lock so the forward and reverse constructors share the
+// source-collection logic.
+type iteratorSources struct {
+	sources []entrySource
+	refs    []*tableMeta
+	rts     []rangeTombstone
+	rtErr   error
+}
+
+// gatherSources collects the memtable, immutable, recovery, and overlapping-table
+// iterators for a scan over [start, end). descending selects the reverse source
+// of each so the merge receives descending internal keys. It acquires a ref on
+// each table it includes (released via the returned refs).
+func (s *engineT) gatherSources(start, end []byte, descending bool) iteratorSources {
 	s.mu.RLock()
-	sources := make([]entrySource, 0, len(s.tables)+len(s.recoveryMems)+2)
-	refs := make([]*tableMeta, 0, len(s.tables))
-	var rts []rangeTombstone
-	sources = append(sources, s.mem.newSnapshotIterator())
-	rts = append(rts, s.mem.rangeTombstones()...)
+	defer s.mu.RUnlock()
+	g := iteratorSources{
+		sources: make([]entrySource, 0, len(s.tables)+len(s.recoveryMems)+2),
+		refs:    make([]*tableMeta, 0, len(s.tables)),
+	}
+	memSource := func(m *memtableT) entrySource {
+		if descending {
+			return m.newReverseSnapshotIterator()
+		}
+		return m.newSnapshotIterator()
+	}
+	g.sources = append(g.sources, memSource(s.mem))
+	g.rts = append(g.rts, s.mem.rangeTombstones()...)
 	if s.imm != nil {
-		sources = append(sources, s.imm.newIterator())
-		rts = append(rts, s.imm.rangeTombstones()...)
+		g.sources = append(g.sources, memSource(s.imm))
+		g.rts = append(g.rts, s.imm.rangeTombstones()...)
 	}
 	for _, recovered := range s.recoveryMems {
-		sources = append(sources, recovered.newIterator())
-		rts = append(rts, recovered.rangeTombstones()...)
+		g.sources = append(g.sources, memSource(recovered))
+		g.rts = append(g.rts, recovered.rangeTombstones()...)
 	}
-	var rtErr error
 	for _, t := range s.tables {
 		// Skip a table whose key range does not intersect [start, end); end is
 		// treated inclusively here, which is conservative (never wrongly skipped).
 		if !t.overlapsRange(start, end) {
 			continue
 		}
-		if t.acquire() {
-			refs = append(refs, t)
-			sources = append(sources, t.reader.newIterator())
-			if trts, err := t.reader.rangeTombstones(); err != nil {
-				rtErr = err
-			} else {
-				rts = append(rts, trts...)
-			}
+		if !t.acquire() {
+			continue
+		}
+		g.refs = append(g.refs, t)
+		if descending {
+			g.sources = append(g.sources, t.reader.newReverseIterator())
+		} else {
+			g.sources = append(g.sources, t.reader.newIterator())
+		}
+		if trts, err := t.reader.rangeTombstones(); err != nil {
+			g.rtErr = err
+		} else {
+			g.rts = append(g.rts, trts...)
 		}
 	}
-	s.mu.RUnlock()
+	return g
+}
+
+func (s *engineT) newRangeIteratorAt(seq uint64, start, end []byte, readTime int64) *engineIterator {
+	g := s.gatherSources(start, end, false)
 	// bytes.Clone preserves the nil/non-nil distinction: a non-nil empty end
 	// bound stays non-nil (an exclusive upper bound of "" matching nothing),
 	// whereas append([]byte(nil), end...) would collapse it to nil (unbounded).
 	it := &engineIterator{
 		eng:      s,
-		merge:    newMergeIter(sources...),
+		merge:    newMergeIter(g.sources...),
 		seq:      seq,
 		readTime: readTime,
 		start:    bytes.Clone(start),
 		end:      bytes.Clone(end),
-		refs:     refs,
-		rts:      rts,
+		refs:     g.refs,
+		rts:      g.rts,
 	}
 	// Surface a range-del read error on the first Next rather than silently
 	// dropping tombstones (which could reveal a deleted key).
-	it.err = rtErr
+	it.err = g.rtErr
 	return it
 }
 

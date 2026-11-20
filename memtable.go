@@ -200,9 +200,10 @@ func (it *memtableIterator) Value() []byte { return it.list.value(it.n) }
 func (it *memtableIterator) Error() error { return nil }
 
 type memtableSnapshotIterator struct {
-	arena []byte   // arena backing array pinned at snapshot time
-	offs  []uint32 // node offsets present at snapshot, in ascending key order
-	index int
+	arena      []byte   // arena backing array pinned at snapshot time
+	offs       []uint32 // node offsets present at snapshot, in ascending key order
+	index      int
+	descending bool // walk offs from the tail toward the head (descending internal-key order)
 }
 
 // newSnapshotIterator captures a stable view of a (possibly still mutable)
@@ -230,7 +231,24 @@ func (m *memtableT) newSnapshotIterator() *memtableSnapshotIterator {
 	return &memtableSnapshotIterator{arena: pinned, offs: offs, index: -1}
 }
 
+// newReverseSnapshotIterator captures the same stable, lock-free view as
+// newSnapshotIterator but emits entries in descending internal-key order (user
+// key descending, newest version of a user key last). Internal keys sort newest
+// version first ascending, so a descending walk sees each user key's oldest
+// version first; the reverse engine iterator relies on that ordering to resolve
+// the newest visible version per key.
+func (m *memtableT) newReverseSnapshotIterator() *memtableSnapshotIterator {
+	it := m.newSnapshotIterator()
+	it.descending = true
+	it.index = len(it.offs)
+	return it
+}
+
 func (it *memtableSnapshotIterator) Next() bool {
+	if it.descending {
+		it.index--
+		return it.index >= 0
+	}
 	it.index++
 	return it.index < len(it.offs)
 }

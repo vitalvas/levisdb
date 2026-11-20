@@ -23,6 +23,16 @@ type mergeIter struct {
 	err    error
 }
 
+// newReverseMergeIter builds a merger that emits entries in descending
+// internal-key order over sources that each yield descending internal keys. It
+// is the mirror of newMergeIter for reverse (newest-first) iteration.
+func newReverseMergeIter(sources ...entrySource) *mergeIter {
+	m := newMergeIter(sources...)
+	m.h.descending = true
+	heap.Init(&m.h)
+	return m
+}
+
 type mergeSource struct {
 	src entrySource
 	key []byte
@@ -37,7 +47,7 @@ func newMergeIter(sources ...entrySource) *mergeIter {
 		if s.Next() {
 			ms.key = s.internalKey()
 			ms.val = s.Value()
-			m.h = append(m.h, ms)
+			m.h.sources = append(m.h.sources, ms)
 		} else if err := s.Error(); err != nil && m.err == nil {
 			m.err = err
 		}
@@ -48,7 +58,7 @@ func newMergeIter(sources ...entrySource) *mergeIter {
 
 // Next advances to the next smallest entry and reports whether one exists.
 func (m *mergeIter) Next() bool {
-	if m.err != nil || len(m.h) == 0 {
+	if m.err != nil || len(m.h.sources) == 0 {
 		return false
 	}
 	// Copy the current entry into our own buffers before advancing. The source's
@@ -56,7 +66,7 @@ func (m *mergeIter) Next() bool {
 	// across a block boundary when it advances (table iterators decompress into a
 	// reused scratch buffer), so holding the raw slices across top.src.Next would
 	// read overwritten bytes.
-	top := m.h[0]
+	top := m.h.sources[0]
 	m.curKey = append(m.curKey[:0], top.key...)
 	m.curVal = append(m.curVal[:0], top.val...)
 
@@ -80,17 +90,27 @@ func (m *mergeIter) internalKey() []byte { return m.curKey }
 func (m *mergeIter) Value() []byte       { return m.curVal }
 func (m *mergeIter) Error() error        { return m.err }
 
-// mergeHeap orders sources by internal key ascending.
-type mergeHeap []*mergeSource
+// mergeHeap orders sources by internal key: ascending by default, or descending
+// when descending is set (for reverse iteration).
+type mergeHeap struct {
+	sources    []*mergeSource
+	descending bool
+}
 
-func (h mergeHeap) Len() int           { return len(h) }
-func (h mergeHeap) Less(i, j int) bool { return ikeyCompare(h[i].key, h[j].key) < 0 }
-func (h mergeHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
-func (h *mergeHeap) Push(x any)        { *h = append(*h, x.(*mergeSource)) }
+func (h mergeHeap) Len() int { return len(h.sources) }
+func (h mergeHeap) Less(i, j int) bool {
+	c := ikeyCompare(h.sources[i].key, h.sources[j].key)
+	if h.descending {
+		return c > 0
+	}
+	return c < 0
+}
+func (h mergeHeap) Swap(i, j int) { h.sources[i], h.sources[j] = h.sources[j], h.sources[i] }
+func (h *mergeHeap) Push(x any)   { h.sources = append(h.sources, x.(*mergeSource)) }
 func (h *mergeHeap) Pop() any {
-	old := *h
+	old := h.sources
 	n := len(old)
 	item := old[n-1]
-	*h = old[:n-1]
+	h.sources = old[:n-1]
 	return item
 }

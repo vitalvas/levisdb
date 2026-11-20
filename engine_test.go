@@ -14,7 +14,7 @@ import (
 
 // newTestEngine builds a standalone engine rooted in a temp dir, with a small
 // memtable threshold so flushes are easy to trigger.
-func newTestEngine(t *testing.T, memSize int64) *engineT {
+func newTestEngine(t testing.TB, memSize int64) *engineT {
 	t.Helper()
 	dir := t.TempDir()
 	tablePath := func(num uint32) (string, error) {

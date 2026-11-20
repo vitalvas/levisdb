@@ -311,6 +311,91 @@ func TestTableReaderCache(t *testing.T) {
 	}
 }
 
+func TestTableReaderReverseIterator(t *testing.T) {
+	t.Parallel()
+	var entries []tableEntry
+	for i := 0; i < 60; i++ {
+		entries = append(entries, tableEntry{fmt.Sprintf("k%04d", i), 1, ikeyKindSet, fmt.Sprintf("v%d", i)})
+	}
+	// Small blocks force a multi-block table so reverse must cross block boundaries.
+	tr := buildTable(t, 64, nil, entries)
+
+	fwd := tr.newIterator()
+	var fKeys []string
+	for fwd.Next() {
+		fKeys = append(fKeys, string(ikeyUserKey(fwd.internalKey())))
+	}
+	require.NoError(t, fwd.Error())
+
+	rev := tr.newReverseIterator()
+	var rKeys []string
+	for rev.Next() {
+		require.NotNil(t, rev.Value())
+		rKeys = append(rKeys, string(ikeyUserKey(rev.internalKey())))
+	}
+	require.NoError(t, rev.Error())
+
+	require.Len(t, rKeys, len(fKeys))
+	for i := range fKeys {
+		assert.Equal(t, fKeys[i], rKeys[len(rKeys)-1-i], "reverse is forward reversed at %d", i)
+	}
+}
+
+func FuzzTableReaderReverseIterator(f *testing.F) {
+	f.Add(uint8(60), uint8(64))
+	f.Fuzz(func(t *testing.T, count, blockSize uint8) {
+		n := int(count)
+		var entries []tableEntry
+		for i := 0; i < n; i++ {
+			entries = append(entries, tableEntry{fmt.Sprintf("k%05d", i), 1, ikeyKindSet, "v"})
+		}
+		tr := buildTable(t, int(blockSize)+16, nil, entries)
+
+		fwd := tr.newIterator()
+		var fKeys []string
+		for fwd.Next() {
+			fKeys = append(fKeys, string(ikeyUserKey(fwd.internalKey())))
+		}
+		require.NoError(t, fwd.Error())
+
+		rev := tr.newReverseIterator()
+		var rKeys []string
+		for rev.Next() {
+			rKeys = append(rKeys, string(ikeyUserKey(rev.internalKey())))
+		}
+		require.NoError(t, rev.Error())
+
+		require.Len(t, rKeys, len(fKeys))
+		for i := range fKeys {
+			if fKeys[i] != rKeys[len(rKeys)-1-i] {
+				t.Fatalf("entry %d: forward %q != reverse %q", i, fKeys[i], rKeys[len(rKeys)-1-i])
+			}
+		}
+	})
+}
+
+func BenchmarkTableReaderReverseIterator(b *testing.B) {
+	c, err := codecFromName("none")
+	require.NoError(b, err)
+	var buf bytes.Buffer
+	tw := newTableWriter(&buf, tableWriterConfig{codec: c, bloomBits: 10, blockSize: 4096})
+	for i := 0; i < 5000; i++ {
+		ik := ikeyEncode(nil, []byte(fmt.Sprintf("k%08d", i)), 1, ikeyKindSet)
+		require.NoError(b, tw.Add(ik, []byte("v")))
+	}
+	size, err := tw.finish()
+	require.NoError(b, err)
+	tr, err := newCachedTableReader(bytes.NewReader(buf.Bytes()), size, nil, 1)
+	require.NoError(b, err)
+	b.ResetTimer()
+	for n := 0; n < b.N; n++ {
+		it := tr.newReverseIterator()
+		for it.Next() {
+			_ = it.internalKey()
+		}
+	}
+}
+
 func TestTableReaderIterator(t *testing.T) {
 	t.Parallel()
 	entries := []tableEntry{

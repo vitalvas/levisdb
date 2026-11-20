@@ -1977,3 +1977,25 @@ func (db *DB) NewRangeIterator(start, end []byte) (Iterator, error) {
 	seq := db.snaps.acquireCurrent(&db.readSeq)
 	return db.newRangeIterator(seq, start, end)
 }
+
+// NewReverseIterator returns a descending (newest-key-first) iterator over the
+// whole keyspace at the latest committed sequence. It is the efficient way to
+// read the latest N keys of a prefix: open over the range and read N entries,
+// rather than scanning the whole prefix forward.
+func (db *DB) NewReverseIterator() (Iterator, error) {
+	return db.NewReverseRangeIterator(nil, nil)
+}
+
+// NewReverseRangeIterator returns a descending iterator over [start, end) at the
+// latest committed sequence. It yields the same keys a forward range iterator
+// would, in reverse order: from the largest key below end down to the smallest
+// key at or above start. A nil bound is unbounded on that side.
+func (db *DB) NewReverseRangeIterator(start, end []byte) (Iterator, error) {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	if db.closed {
+		return nil, ErrClosed
+	}
+	seq := db.snaps.acquireCurrent(&db.readSeq)
+	return db.newReverseRangeIterator(seq, start, end)
+}

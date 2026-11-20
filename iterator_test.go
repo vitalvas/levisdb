@@ -1,6 +1,7 @@
 package levisdb
 
 import (
+	"bytes"
 	"fmt"
 	"sort"
 	"testing"
@@ -128,4 +129,151 @@ func TestDBRangeIteratorBoundsDistinguishNilAndEmpty(t *testing.T) {
 	require.NoError(t, err)
 	keys, _ = drainDBIter(t, it)
 	assert.Equal(t, []string{"a", "b", "c"}, keys, "nil end bound is unbounded")
+}
+
+// openReverseIterDB opens a DB whose data stays in the memtable (large memtable,
+// no flush), so the public reverse plumbing is tested without depending on the
+// descending table source wired in a later step.
+func openReverseIterDB(t *testing.T) *DB {
+	t.Helper()
+	o := DefaultOptions(t.TempDir())
+	o.MemtableSize = 1 << 30
+	o.NoSync = true
+	db, err := Open(o)
+	require.NoError(t, err)
+	t.Cleanup(func() { db.Close() })
+	return db
+}
+
+func TestDBReverseIterator(t *testing.T) {
+	t.Parallel()
+	db := openReverseIterDB(t)
+	for i := 0; i < 50; i++ {
+		k := fmt.Sprintf("key%03d", i)
+		require.NoError(t, db.Put(PutOptions{Key: []byte(k), Value: []byte(fmt.Sprintf("v%d", i))}))
+	}
+
+	t.Run("full descending scan", func(t *testing.T) {
+		it, err := db.NewReverseIterator()
+		require.NoError(t, err)
+		keys, _ := drainDBIter(t, it)
+		require.Len(t, keys, 50)
+		assert.Equal(t, "key049", keys[0])
+		assert.Equal(t, "key000", keys[49])
+		for i := 1; i < len(keys); i++ {
+			assert.Greater(t, keys[i-1], keys[i], "strictly descending")
+		}
+	})
+
+	t.Run("latest N via reverse range", func(t *testing.T) {
+		it, err := db.NewReverseRangeIterator(nil, nil)
+		require.NoError(t, err)
+		defer it.Close()
+		var latest []string
+		for it.Next() && len(latest) < 5 {
+			latest = append(latest, string(it.Key()))
+		}
+		require.NoError(t, it.Error())
+		assert.Equal(t, []string{"key049", "key048", "key047", "key046", "key045"}, latest)
+	})
+
+	t.Run("reverse range is half-open descending", func(t *testing.T) {
+		it, err := db.NewReverseRangeIterator([]byte("key010"), []byte("key013"))
+		require.NoError(t, err)
+		keys, _ := drainDBIter(t, it)
+		assert.Equal(t, []string{"key012", "key011", "key010"}, keys)
+	})
+}
+
+func TestDBReverseIteratorLatestOfPrefix(t *testing.T) {
+	t.Parallel()
+	// The run/<zero-padded uint32> use case: the newest job has the largest id and
+	// sorts last, so a reverse range over the prefix reads the latest jobs first.
+	// openIterDB has a tiny memtable, so these 1000 rows span several on-disk tables.
+	db := openIterDB(t)
+	for i := 0; i < 1000; i++ {
+		require.NoError(t, db.Put(PutOptions{Key: []byte(fmt.Sprintf("run/%010d", i)), Value: []byte(fmt.Sprintf("job%d", i))}))
+	}
+
+	it, err := db.NewReverseRangeIterator([]byte("run/"), []byte("run/:"))
+	require.NoError(t, err)
+	defer it.Close()
+	var keys, vals []string
+	for it.Next() && len(keys) < 10 {
+		keys = append(keys, string(it.Key()))
+		vals = append(vals, string(it.Value()))
+	}
+	require.NoError(t, it.Error())
+
+	want := make([]string, 10)
+	wantVals := make([]string, 10)
+	for n := 0; n < 10; n++ {
+		id := 999 - n
+		want[n] = fmt.Sprintf("run/%010d", id)
+		wantVals[n] = fmt.Sprintf("job%d", id)
+	}
+	assert.Equal(t, want, keys, "the 10 newest jobs, highest id first")
+	assert.Equal(t, wantVals, vals, "values resolved for the latest jobs")
+}
+
+func TestDBReverseIteratorClosedDB(t *testing.T) {
+	t.Parallel()
+	db := openReverseIterDB(t)
+	require.NoError(t, db.Close())
+	_, err := db.NewReverseIterator()
+	assert.ErrorIs(t, err, ErrClosed)
+}
+
+func TestReverseIteratorOverBlobs(t *testing.T) {
+	t.Parallel()
+	db := openTestDB(t, func(o *Options) {
+		o.ValueThreshold = 64
+		o.BlobFileSize = 4 << 10
+		o.MemtableSize = 1 << 30
+		o.FreshCodec = CodecNone
+		o.BottomCodec = CodecNone
+	})
+
+	big := func(k string) []byte { return []byte(fmt.Sprintf("%s-%s", k, string(bytes.Repeat([]byte("x"), 128)))) }
+	keys := []string{"k1", "k2", "k3"}
+	for _, k := range keys {
+		require.NoError(t, db.Put(PutOptions{Key: []byte(k), Value: big(k)}))
+	}
+	// Flush so large values separate into blobs; the reverse iterator must resolve
+	// each pointer through the blob file.
+	require.NoError(t, db.eng.Flush())
+
+	it, err := db.NewReverseIterator()
+	require.NoError(t, err)
+	var gotKeys []string
+	var gotVals [][]byte
+	for it.Next() {
+		gotKeys = append(gotKeys, string(it.Key()))
+		gotVals = append(gotVals, append([]byte(nil), it.Value()...))
+	}
+	require.NoError(t, it.Error())
+	require.NoError(t, it.Close())
+	assert.Equal(t, []string{"k3", "k2", "k1"}, gotKeys)
+	assert.Equal(t, big("k3"), gotVals[0], "blob-backed value resolved in reverse scan")
+	assert.Equal(t, big("k1"), gotVals[2])
+}
+
+func TestSnapshotReverseIterator(t *testing.T) {
+	t.Parallel()
+	db := openReverseIterDB(t)
+	for i := 0; i < 10; i++ {
+		require.NoError(t, db.Put(PutOptions{Key: []byte(fmt.Sprintf("k%d", i)), Value: []byte("v")}))
+	}
+	snap, err := db.Snapshot()
+	require.NoError(t, err)
+	defer snap.Release()
+
+	require.NoError(t, db.Put(PutOptions{Key: []byte("k9zzz"), Value: []byte("late")}))
+
+	it, err := snap.NewReverseIterator()
+	require.NoError(t, err)
+	keys, _ := drainDBIter(t, it)
+	require.Len(t, keys, 10)
+	assert.Equal(t, "k9", keys[0], "post-snapshot write not visible")
+	assert.Equal(t, "k0", keys[9])
 }

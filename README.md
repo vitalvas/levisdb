@@ -301,6 +301,8 @@ Package-level:
 | `Write(*Batch) error` | Commit a batch atomically. |
 | `NewIterator() (Iterator, error)` | Ordered scan over all keys. |
 | `NewRangeIterator(start, end []byte) (Iterator, error)` | Ordered scan over `[start, end)`; `nil` end is unbounded. |
+| `NewReverseIterator() (Iterator, error)` | Descending (newest-key-first) scan over all keys. See [Reverse iteration](#reverse-iteration). |
+| `NewReverseRangeIterator(start, end []byte) (Iterator, error)` | Descending scan over `[start, end)`; same keys as the forward range, reversed. |
 | `Snapshot() (*Snapshot, error)` | Pin a consistent read view. |
 | `CompactRange(start, end []byte) error` | Force compaction over a key range. |
 | `LatestSeq() uint64` | Highest committed sequence; the replication resume point. |
@@ -321,8 +323,9 @@ Package-level:
 `Finish()`. Defer `Close()` to release an abandoned build; it removes unfinished
 output and preserves a successfully finished file.
 
-`*Snapshot`: `Get`, `GetMany`, `Has`, `NewIterator`, `NewRangeIterator` (same
-signatures as the `*DB` reads, fixed to the snapshot's sequence), `WriteTo(path,
+`*Snapshot`: `Get`, `GetMany`, `Has`, `NewIterator`, `NewRangeIterator`,
+`NewReverseIterator`, `NewReverseRangeIterator` (same signatures as the `*DB`
+reads, fixed to the snapshot's sequence), `WriteTo(path,
 SstWriterOptions) (uint64, error)` (write a single-file base image for follower
 bootstrap; returns the resume seq), `WriteToDir(dir, SstWriterOptions,
 maxFileBytes int64) ([]string, uint64, error)` (same, rolled into bounded files
@@ -343,6 +346,40 @@ built-in compression codecs in `Options`. `EntryKind` constants `EntryPut`,
 A `*DB` and a `*Snapshot` are safe for concurrent use by multiple goroutines,
 including concurrent reads and writes. A single `*Batch` or `Iterator` holds
 mutable state and must not be shared across goroutines; use one per goroutine.
+
+## Reverse iteration
+
+`NewReverseIterator` and `NewReverseRangeIterator` scan in descending key order,
+newest key first. They return the same keys the forward iterators would, in
+reverse: a reverse scan of `[start, end)` starts at the largest key below `end`
+and ends at the smallest key at or above `start`. The `Iterator` surface is
+identical, so `Next` advances toward smaller keys. Keys sort ascending on disk;
+these methods walk that order backward rather than storing a second copy.
+
+Use a reverse iterator to read the latest entries of a prefix without scanning
+the whole prefix. A key like `run/0000000042` is a `run/` prefix followed by a
+zero-padded uint32 job id. The padding makes the keys sort lexically in numeric
+order, so the newest job sorts last. Open a reverse range over the prefix and
+read the first N entries to get the newest jobs:
+
+```go
+// '9'+1 == ':', so "run/:" is the exclusive bound just past the padded digits.
+it, err := db.NewReverseRangeIterator([]byte("run/"), []byte("run/:"))
+if err != nil {
+	log.Fatal(err)
+}
+defer it.Close()
+for n := 0; it.Next() && n < 20; n++ {
+	fmt.Printf("%s = %s\n", it.Key(), it.Value()) // the 20 newest jobs
+}
+if err := it.Error(); err != nil {
+	log.Fatal(err)
+}
+```
+
+A forward scan would read every job under the prefix to reach the newest ones; a
+reverse scan reads only the N it returns. A reverse iterator applies the same
+snapshot, TTL, range-tombstone, and value-separation rules as a forward one.
 
 ## Size limits
 

@@ -200,9 +200,13 @@
 // Snapshot pins a consistent read view at the current sequence; writes made after
 // it are invisible to its reads and iterators until Release. NewIterator and
 // NewRangeIterator return ordered scans over the whole keyspace or a [start, end)
-// range. Snapshots and iterators pin the table versions they read, so release and
-// close them promptly to let compaction reclaim obsolete files. Iterator key and
-// value slices are valid only until the next Next; copy to retain.
+// range. NewReverseIterator and NewReverseRangeIterator return the same keys in
+// descending order (newest key first), so reading the first N entries of a
+// reverse range yields the latest N keys of a prefix without scanning the whole
+// prefix forward. Snapshots and iterators pin the table versions they read, so
+// release and close them promptly to let compaction reclaim obsolete files.
+// Iterator key and value slices are valid only until the next Next; copy to
+// retain.
 //
 // # Replication
 //

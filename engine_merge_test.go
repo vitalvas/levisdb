@@ -99,7 +99,7 @@ func TestMergeHeapPush(t *testing.T) {
 	heap.Push(&h, &mergeSource{key: kb})
 	heap.Push(&h, &mergeSource{key: ka})
 	require.Equal(t, 2, h.Len())
-	assert.Equal(t, ka, h[0].key)
+	assert.Equal(t, ka, h.sources[0].key)
 	popped := heap.Pop(&h).(*mergeSource)
 	assert.Equal(t, ka, popped.key)
 }

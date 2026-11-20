@@ -92,6 +92,89 @@ func TestDataBlockRoundTrip(t *testing.T) {
 	}
 }
 
+func TestDataBlockIterReverse(t *testing.T) {
+	t.Parallel()
+	var entries [][2]string
+	for i := 0; i < 50; i++ {
+		entries = append(entries, [2]string{
+			fmt.Sprintf("user:%04d:name", i),
+			fmt.Sprintf("value-%d", i),
+		})
+	}
+	var b dataBlockBuilder
+	b.restartInterval = 8
+	for _, e := range entries {
+		b.add([]byte(e[0]), []byte(e[1]))
+	}
+	payload := b.finish()
+
+	t.Run("prev walks entries in descending order", func(t *testing.T) {
+		it := newDataBlockIter(payload)
+		var got [][2]string
+		for it.prev() {
+			got = append(got, [2]string{string(it.key), string(it.value)})
+		}
+		require.NoError(t, it.Error())
+		require.Len(t, got, len(entries))
+		for i, e := range entries {
+			assert.Equal(t, e, got[len(entries)-1-i], "entry %d round-trips in reverse", i)
+		}
+	})
+
+	t.Run("empty block yields nothing", func(t *testing.T) {
+		var eb dataBlockBuilder
+		it := newDataBlockIter(eb.finish())
+		assert.False(t, it.prev())
+		require.NoError(t, it.Error())
+	})
+}
+
+func FuzzDataBlockIterReverse(f *testing.F) {
+	f.Add(uint8(3), uint8(5))
+	f.Fuzz(func(t *testing.T, count, interval uint8) {
+		n := int(count)
+		var b dataBlockBuilder
+		b.restartInterval = int(interval)%16 + 1
+		want := make([]string, 0, n)
+		for i := 0; i < n; i++ {
+			k := fmt.Sprintf("k%05d", i)
+			b.add([]byte(k), []byte("v"))
+			want = append(want, k)
+		}
+		payload := b.finish()
+
+		it := newDataBlockIter(payload)
+		var got []string
+		for it.prev() {
+			got = append(got, string(it.key))
+		}
+		require.NoError(t, it.Error())
+		// prev yields the forward order reversed.
+		for i := range want {
+			if want[i] != got[len(got)-1-i] {
+				t.Fatalf("entry %d: forward %q != reverse %q", i, want[i], got[len(got)-1-i])
+			}
+		}
+		assert.Len(t, got, len(want))
+	})
+}
+
+func BenchmarkDataBlockIterReverse(b *testing.B) {
+	var bl dataBlockBuilder
+	bl.restartInterval = 16
+	for i := 0; i < 256; i++ {
+		bl.add([]byte(fmt.Sprintf("key%08d", i)), []byte("value"))
+	}
+	payload := bl.finish()
+	b.ResetTimer()
+	for n := 0; n < b.N; n++ {
+		it := newDataBlockIter(payload)
+		for it.prev() {
+			_ = it.key
+		}
+	}
+}
+
 // TestDataBlockIterKeyStableAcrossOneAdvance verifies the one-advance stability
 // contract mergeIter relies on: the key from before an advance stays valid
 // through the next next() call (double-buffering), even though keys are

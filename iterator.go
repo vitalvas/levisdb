@@ -8,8 +8,20 @@ import "time"
 // time lifecycle and to hand out stable key/value copies. TTL is evaluated at
 // iterator creation, so a long scan is internally consistent even if a value's
 // deadline passes while it runs.
+// engineIter is the method surface shared by the forward engineIterator and the
+// reverseEngineIterator, so DBIterator wraps either direction without
+// duplicating the pin/lifecycle management.
+type engineIter interface {
+	Next() bool
+	Key() []byte
+	Value() []byte
+	valueExpiresAt() int64
+	Error() error
+	Close() error
+}
+
 type DBIterator struct {
-	src         *engineIterator
+	src         engineIter
 	curK        []byte
 	curV        []byte
 	curExpiry   int64
@@ -24,6 +36,13 @@ func (db *DB) newRangeIterator(seq uint64, start, end []byte) (Iterator, error) 
 	readTime := time.Now().Unix()
 	db.snaps.acquireIteratorTime(readTime)
 	src := db.eng.newRangeIteratorAt(seq, start, end, readTime)
+	return &DBIterator{src: src, snaps: db.snaps, seq: seq, readTime: readTime}, nil
+}
+
+func (db *DB) newReverseRangeIterator(seq uint64, start, end []byte) (Iterator, error) {
+	readTime := time.Now().Unix()
+	db.snaps.acquireIteratorTime(readTime)
+	src := db.eng.newReverseRangeIteratorAt(seq, start, end, readTime)
 	return &DBIterator{src: src, snaps: db.snaps, seq: seq, readTime: readTime}, nil
 }
 
